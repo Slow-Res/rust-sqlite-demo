@@ -377,8 +377,9 @@ The same code handles the first run and recovery after a restore:
 
 1. **Read**, in one SQLite read transaction:
    - every row of the synced tables;
-   - the highest `seq` ever issued, `S`, from `sqlite_sequence` (0 if none);
-   - the `token` of row `S`.
+   - the `seq` and `token` of the newest change_log row: `S` and its token. If the log is
+     empty, `S` is 0 and there is no token. `S = 0` always passes the check in §6.4, so a
+     change log emptied by hand cannot cause a resync loop.
 2. **Write**, in one Postgres transaction:
    1. Copy the node's current mirror rows into `sync_archive`, if there are any, tagged
       with the old epoch.
