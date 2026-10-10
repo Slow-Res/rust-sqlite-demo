@@ -30,7 +30,7 @@
 
 ## Global Constraints
 
-- **Repo:** `~/rust/sqlite-production`.
+- **Repo:** `~/rust/rust-sqlite-demo`.
 - **Source app:** `~/rust/library-web-app` at commit `9d1405e`. Copy from that commit only, with `git archive`, never from its working tree.
 - **Pinned versions:**
   - Litestream `0.5.17` (`litestream/litestream:0.5.17`)
@@ -138,7 +138,7 @@ Write the number down. Step 9 must report the same total.
 - [ ] **Step 2: Copy the tracked files from commit 9d1405e**
 
 ```bash
-cd ~/rust/sqlite-production
+cd ~/rust/rust-sqlite-demo
 SRC=~/rust/library-web-app
 TMP=$(mktemp -d)
 git -C "$SRC" archive 9d1405e shared backend frontend-react Cargo.lock rust-toolchain.toml clippy.toml rustfmt.toml .gitignore .env.example | tar -x -C "$TMP"
@@ -220,7 +220,7 @@ sqlx = { workspace = true, features = ["chrono", "migrate", "macros"] }
 ```
 Then:
 ```bash
-cd ~/rust/sqlite-production
+cd ~/rust/rust-sqlite-demo
 grep -rl 'library_backend' apps/web | xargs sed -i 's/library_backend/library_web/g'
 grep -rl 'library-backend' apps/web | xargs sed -i 's/library-backend/library-web/g'
 sed -i 's|sqlx::migrate!()|sqlx::migrate!("../../migrations/sqlite")|' apps/web/src/db.rs
@@ -302,7 +302,7 @@ check: ## Every gate CI runs
 - [ ] **Step 7: Build offline and run the Rust tests**
 
 ```bash
-cd ~/rust/sqlite-production
+cd ~/rust/rust-sqlite-demo
 SQLX_OFFLINE=true cargo build -p library-web
 SQLX_OFFLINE=true cargo test --workspace 2>&1 | grep -E '^test result' | awk '{s+=$4} END {print "passed:", s}'
 ```
@@ -5697,7 +5697,7 @@ check: ## Every CI gate except the Docker end-to-end test (make e2e)
 - [ ] **Step 6: Check every link and line reference in the documents**
 
 ```bash
-cd ~/rust/sqlite-production
+cd ~/rust/rust-sqlite-demo
 # Every relative link points at a file that exists, and every #L<n> is within the file.
 grep -oE '\]\(\.{0,2}/?[^)#: ]+(#L[0-9]+)?\)' README.md docs/*.md docs/decisions/*.md | while IFS= read -r hit; do
   doc=${hit%%:*}; link=${hit#*](}; link=${link%)}

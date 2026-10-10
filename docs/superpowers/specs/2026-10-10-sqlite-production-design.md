@@ -40,7 +40,7 @@ protect each node's data.
 
 | # | Assumption | Why |
 |---|---|---|
-| A1 | The project lives at `~/rust/sqlite-production`, a new git repo. | Separate from the library app, as you asked. |
+| A1 | The project lives at `~/rust/rust-sqlite-demo`, a new git repo. | Separate from the library app, as you asked. |
 | A2 | The example app is the library app (Axum backend + React frontend), copied in. Leptos is left out. | A real app with real tables makes the sync meaningful. React is the version we ship in Docker. |
 | A3 | **Each node is one library branch**: its own books, members, loans and staff accounts. | Sticky users only work if a node owns its data. Shared data across nodes would need two-way sync, which you ruled out. |
 | A4 | Books, members and loans go to Postgres. User accounts and sessions do not. | Password hashes and session tokens should not be copied to a central database. Litestream already backs them up. |
