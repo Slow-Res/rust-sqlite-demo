@@ -195,6 +195,18 @@ Shared crates: [crates/sqlite](../crates/sqlite/src/lib.rs) (package `sqlite-set
 is the one place SQLite is opened and configured. [crates/shared](../crates/shared/src/lib.rs)
 holds the API types and `is_valid_node_id`.
 
+## Book search
+
+Book search uses an FTS5 trigram index, `books_fts`
+([migration](../migrations/sqlite/20261012000000_perf_indexes.sql)). It is an
+external-content table over `books`; three triggers keep it in sync, with no `WHEN`
+condition, so every write to `books` updates it. A query of 3 or more characters
+(`q`, and `q` without spaces and hyphens, which is matched against the ISBN) goes
+through the index. A shorter query falls back to a `LIKE` scan, because a trigram
+index cannot match text shorter than 3 characters. The same `REPLACE` warning as
+below applies: use `INSERT ... ON CONFLICT DO UPDATE`, or the old row stays in the
+index. Member search keeps `LIKE`: the table is small.
+
 ## Adding a synced table
 
 Three steps. The [contract test](../apps/sync-worker/tests/contract.rs#L28) fails and

@@ -81,6 +81,12 @@ impl TryFrom<BookRow> for BookRecord {
     }
 }
 
+/// `text` as an FTS5 phrase: quoted, with `"` doubled. Inside a phrase `%`, `_`,
+/// `*`, `:`, `(` and `-` have no special meaning, so the text is matched as is.
+fn fts_phrase(text: &str) -> String {
+    format!("\"{}\"", text.replace('"', "\"\""))
+}
+
 /// Append the `WHERE` clause for `filter`. Used for both the page query and the
 /// count query so they can never disagree.
 ///
@@ -91,23 +97,41 @@ impl TryFrom<BookRow> for BookRecord {
 fn push_filter(builder: &mut QueryBuilder<Sqlite>, filter: &BookFilter) {
     builder.push(" WHERE 1 = 1");
     if let Some(q) = &filter.q {
-        let pattern = format!("%{}%", escape_like(q));
-        builder.push(" AND (b.title LIKE ");
-        builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR b.author LIKE ");
-        builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR b.isbn LIKE ");
-        builder.push_bind(pattern);
-        builder.push(" ESCAPE '\\'");
         // ISBNs are stored without spaces or hyphens, so also match `q` with
-        // those removed. Skipped when nothing is left, or `%%` would match all.
+        // those removed.
         let digits: String = q.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
-        if !digits.is_empty() {
-            builder.push(" OR b.isbn LIKE ");
-            builder.push_bind(format!("%{}%", escape_like(&digits)));
+        // The trigram index cannot match text shorter than 3 characters, so
+        // those searches keep the scan. (`chars()`, not bytes: "é" is 1.)
+        let too_short = q.chars().count() < 3
+            || (!digits.is_empty() && digits != *q && digits.chars().count() < 3);
+        if too_short {
+            let pattern = format!("%{}%", escape_like(q));
+            builder.push(" AND (b.title LIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" ESCAPE '\\' OR b.author LIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" ESCAPE '\\' OR b.isbn LIKE ");
+            builder.push_bind(pattern);
             builder.push(" ESCAPE '\\'");
+            // Skipped when nothing is left, or `%%` would match all.
+            if !digits.is_empty() {
+                builder.push(" OR b.isbn LIKE ");
+                builder.push_bind(format!("%{}%", escape_like(&digits)));
+                builder.push(" ESCAPE '\\'");
+            }
+            builder.push(")");
+        } else {
+            // Same meaning as the scan above, through the `books_fts` trigram
+            // index. One difference: trigram folds the case of all Unicode,
+            // `LIKE` only ASCII.
+            let mut expr = format!("{{title author isbn}} : {}", fts_phrase(q));
+            if !digits.is_empty() && digits != *q {
+                expr.push_str(&format!(" OR isbn : {}", fts_phrase(&digits)));
+            }
+            builder.push(" AND b.id IN (SELECT rowid FROM books_fts WHERE books_fts MATCH ");
+            builder.push_bind(expr);
+            builder.push(")");
         }
-        builder.push(")");
     }
     match filter.availability {
         Availability::All => {}

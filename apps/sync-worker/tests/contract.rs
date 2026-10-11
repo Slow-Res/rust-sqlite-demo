@@ -103,8 +103,9 @@ async fn synced_tables_match_in_sqlite_postgres_and_the_table_list() {
             table.name
         );
 
+        // Only the change-log triggers: `books` also has search-index triggers.
         let triggers: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? AND name LIKE '%_logged_%' ORDER BY name",
         )
         .bind(table.name)
         .fetch_all(&sqlite.pool)
