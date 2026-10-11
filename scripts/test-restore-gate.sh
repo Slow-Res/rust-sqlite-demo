@@ -5,7 +5,7 @@ set -euo pipefail
 IMAGE="${LITESTREAM_IMAGE:-sqlite-production/litestream:dev}"
 VOLUMES=()
 PASSED=0
-cleanup() { for v in "${VOLUMES[@]}"; do docker volume rm -f "$v" >/dev/null; done; }
+cleanup() { for v in "${VOLUMES[@]}"; do docker volume rm -f "$v" >/dev/null || true; done; }
 trap cleanup EXIT
 
 # new_volume <var>: create a scratch volume and store its name in <var>.
@@ -40,7 +40,7 @@ gate() {
 }
 
 new_volume empty
-for bad in "" "Node1" "node_1" "-node" "a/b" "../x" $'node1\nx' "$(printf 'a%.0s' {1..41})"; do
+for bad in "" "Node1" "node_1" "-node" "a/b" "../x" $'node1\nx' $'node1\n' "$(printf 'a%.0s' {1..41})"; do
   gate "$empty" 1 "must be 1-40 characters" -e "NODE_ID=$bad"
 done
 
@@ -48,9 +48,12 @@ new_volume present
 in_volume "$present" "sqlite3 /data/library.db 'CREATE TABLE t (x)'"
 gate "$present" 0 "database present" -e NODE_ID=node1
 
-new_volume leftover
-in_volume "$leftover" "touch /data/library.db-wal"
-gate "$leftover" 1 "part of the database was deleted" -e NODE_ID=node1
+# Each leftover file must be refused on its own.
+for name in library.db-wal library.db-shm .library.db-litestream; do
+  new_volume leftover
+  in_volume "$leftover" "touch /data/$name"
+  gate "$leftover" 1 "part of the database was deleted" -e NODE_ID=node1
+done
 
 # The most important case: S3 unreachable must never become an empty start,
 # not even for a node that is allowed to start fresh.
