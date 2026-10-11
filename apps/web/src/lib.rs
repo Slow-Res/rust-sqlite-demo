@@ -6,6 +6,7 @@
 pub mod app;
 pub mod auth;
 pub mod books;
+pub mod checkpoint;
 pub mod cli;
 pub mod clock;
 pub mod commands;

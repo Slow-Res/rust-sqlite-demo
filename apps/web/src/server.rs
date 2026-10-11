@@ -1,6 +1,7 @@
 //! Binding the listener and running the server until a shutdown signal.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
@@ -8,12 +9,25 @@ use tokio::net::TcpListener;
 use crate::clock::SystemClock;
 use crate::config::Config;
 use crate::state::AppState;
-use crate::{build_router, db};
+use crate::{build_router, checkpoint, db};
 
 /// Run the HTTP server: connect, migrate, serve, and shut down gracefully.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let database = db::connect(&config).await?;
     db::migrate(&database).await?;
+
+    // SQLite only; Postgres checkpoints itself.
+    let checkpoints = match &database {
+        db::Database::Sqlite(pool) if config.sqlite_checkpoint_interval_ms > 0 => {
+            let every = Duration::from_millis(config.sqlite_checkpoint_interval_ms);
+            tracing::info!(
+                every_ms = config.sqlite_checkpoint_interval_ms,
+                "WAL checkpoint task on"
+            );
+            Some(checkpoint::spawn(pool.clone(), every))
+        }
+        _ => None,
+    };
 
     let bind_addr = config.bind_addr;
     let state = AppState::new(database.clone(), Arc::new(config), Arc::new(SystemClock));
@@ -29,6 +43,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .await
         .context("server error")?;
 
+    if let Some(task) = checkpoints {
+        task.abort();
+    }
     database.close().await;
     tracing::info!("shut down cleanly");
     Ok(())

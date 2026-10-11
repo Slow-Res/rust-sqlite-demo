@@ -29,6 +29,9 @@ pub struct Config {
     /// How long the total of an unfiltered list page may be reused, in ms; 0
     /// counts on every request (see `count_cache`).
     pub list_count_ttl_ms: u64,
+    /// SQLite only: how often, in ms, to checkpoint and truncate the WAL in the
+    /// background (see `checkpoint`); 0 leaves it to SQLite (and Litestream).
+    pub sqlite_checkpoint_interval_ms: u64,
 }
 
 impl Config {
@@ -74,6 +77,7 @@ impl Config {
             log_format,
             node_id,
             list_count_ttl_ms: parse_or(&get, "LIST_COUNT_TTL_MS", 1000)?,
+            sqlite_checkpoint_interval_ms: parse_or(&get, "SQLITE_CHECKPOINT_INTERVAL_MS", 0)?,
         })
     }
 }
@@ -115,6 +119,19 @@ mod tests {
         assert_eq!(config.session_ttl_hours, 168);
         assert_eq!(config.log_format, LogFormat::Pretty);
         assert_eq!(config.list_count_ttl_ms, 1000);
+        assert_eq!(config.sqlite_checkpoint_interval_ms, 0);
+    }
+
+    #[test]
+    fn checkpoint_interval_is_configurable() {
+        let interval =
+            |v: &str| Config::from_lookup(lookup(&[("SQLITE_CHECKPOINT_INTERVAL_MS", v)]));
+        assert_eq!(
+            interval("1000").unwrap().sqlite_checkpoint_interval_ms,
+            1000
+        );
+        let err = interval("-1").unwrap_err();
+        assert!(err.to_string().contains("SQLITE_CHECKPOINT_INTERVAL_MS"));
     }
 
     #[test]
