@@ -66,6 +66,7 @@
   - Garage rpc secret `6761726167652d7270632d6c6f63616c2d6465762d6f6e6c792d736563726574`
   - Garage admin token `6761726167652d61646d696e2d6c6f63616c2d6465762d6f6e6c792d746f6b6e`
   - Postgres user `sync`, password `local-dev-only`, database `library`
+- **Formatting:** the code blocks in this plan are not rustfmt-formatted. Run `cargo fmt` after writing Rust code and before every gate that runs `cargo fmt --check` (`make check` included). Formatting changes are expected; never change behaviour to satisfy fmt.
 - **Lints:** workspace lints `unsafe_code = "forbid"`, `clippy::unwrap_used`/`expect_used = "warn"`. Tests may unwrap (`clippy.toml`). `cargo clippy --workspace --all-targets -- -D warnings` must stay clean, and so must `cargo fmt --check`.
 - **Style:** match the copied library code. Module doc comments say what the module is for. Comments explain *why*. Plain words.
 - **Commits:** commit at the end of every task with a conventional prefix (`feat:`, `test:`, `build:`, `docs:`, `chore:`). Do not push; there is no remote.
@@ -119,7 +120,7 @@ Move the library app into the new layout with no behaviour change. Every copied 
 **Files:**
 - Create: `Cargo.toml`, `.cargo/config.toml`, `Makefile`
 - Create (copied): `apps/web/**`, `apps/frontend/**`, `crates/shared/**`, `migrations/sqlite/20261010000000_init.sql`, `Cargo.lock`, `rust-toolchain.toml`, `clippy.toml`, `rustfmt.toml`, `.gitignore`, `.env.example`
-- Modify (after copy): `apps/web/Cargo.toml`, `apps/web/src/db.rs`, every file under `apps/web` that says `library_backend` or `library-backend`, every `#[sqlx::test]` in `apps/web`, `crates/shared/src/lib.rs`
+- Modify (after copy): `apps/web/Cargo.toml`, `apps/web/src/db.rs`, every file under `apps/web` that says `library_backend` or `library-backend`, every `#[sqlx::test]` in `apps/web`, `crates/shared/src/lib.rs`, `crates/shared/Cargo.toml` (feature comment), `.env.example` (log filter and paths)
 
 **Interfaces:**
 - Produces:
@@ -223,6 +224,7 @@ Then:
 cd ~/rust/rust-sqlite-demo
 grep -rl 'library_backend' apps/web | xargs sed -i 's/library_backend/library_web/g'
 grep -rl 'library-backend' apps/web | xargs sed -i 's/library-backend/library-web/g'
+sed -i 's/library_backend/library_web/g' .env.example   # the RUST_LOG filter names the crate
 sed -i 's|sqlx::migrate!()|sqlx::migrate!("../../migrations/sqlite")|' apps/web/src/db.rs
 # Only attribute lines, not comments that mention the attribute:
 grep -rlE '^\s*#\[sqlx::test\]$' apps/web | xargs sed -i -E 's|^(\s*)#\[sqlx::test\]$|\1#[sqlx::test(migrations = "../../migrations/sqlite")]|'
@@ -320,6 +322,7 @@ Expected: `git status` prints nothing, which means the types are unchanged, and 
 - [ ] **Step 9: Run the full gate and amend the commit**
 
 ```bash
+cargo fmt   # the renames change line lengths in apps/web/src/cli.rs
 make check
 cargo clippy --workspace --all-targets -- -D warnings
 git add -A && git commit -q --amend -m "chore: copy the library app into the new layout (unchanged behaviour)"
@@ -620,7 +623,7 @@ Expected: all tests pass. The total is the Task 1 number plus 5.
 Spec §6.1.
 
 **Files:**
-- Create: `migrations/sqlite/20261011000000_change_log.sql`
+- Create: `migrations/sqlite/20261011000000_change_log.sql`, `apps/web/build.rs`
 - Test: `apps/web/tests/change_log.rs`
 
 **Interfaces:**
@@ -779,7 +782,18 @@ async fn creating_a_book_through_the_api_logs_one_insert(pool: SqlitePool) {
 Run: `SQLX_OFFLINE=true cargo test -p library-web --test change_log`
 Expected: FAIL with `no such table: change_log`.
 
-- [ ] **Step 3: Write the migration**
+- [ ] **Step 3: Write the migration, and make new migration files trigger a rebuild**
+
+On stable Rust, `sqlx::migrate!` and `#[sqlx::test(migrations = ...)]` do not notice a *new* file in the migrations folder, so the already-built test binary would keep the old migration list. A build script that watches the folder fixes that for this task and every later migration (this is what `sqlx migrate build-script` generates).
+
+`apps/web/build.rs`:
+```rust
+//! Rebuild when a migration is added: `sqlx::migrate!` embeds the folder at
+//! compile time but does not watch it for new files on stable Rust.
+fn main() {
+    println!("cargo:rerun-if-changed=../../migrations/sqlite");
+}
+```
 
 `migrations/sqlite/20261011000000_change_log.sql`:
 ```sql
@@ -843,7 +857,7 @@ Expected: 8 passed.
 
 - [ ] **Step 5: Run the whole suite and commit**
 
-Migrations are embedded at compile time, so the web tests rebuild automatically. No `query!` macro changed, so `.sqlx` stays as it is.
+Migrations are embedded at compile time; `apps/web/build.rs` makes the web crate rebuild when the folder changes. No `query!` macro changed, so `.sqlx` stays as it is.
 ```bash
 SQLX_OFFLINE=true cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --check
 git add -A && git commit -qm "feat: change log written by triggers on books, members and loans"
@@ -875,7 +889,7 @@ Spec §8 (health), §5 S15 (check), §7.3 (drill uses `check-db`).
   - `library_shared::is_valid_node_id(id: &str) -> bool`, used by Task 5;
   - `Health { status, node_id, version }`;
   - `Config.node_id: String`;
-  - CLI `library-web check-db`, used by Task 12. It prints `integrity: ok`, `foreign keys: ok`, then `books: N`, `members: N`, `loans: N`, `users: N`, and exits non-zero on problems. It never creates or migrates the file.
+  - CLI `library-web check-db`, used by Task 12. It prints `database: <url>`, `integrity: ok`, `foreign keys: ok`, then `books: N`, `members: N`, `loans: N`, `users: N`, and exits non-zero on problems. It never creates or migrates the file.
 
 - [ ] **Step 1: Write the failing shared and config tests**
 
@@ -1148,6 +1162,7 @@ Spec §6.2, §6.9, §9, §10 (test Postgres). This task also adds the contract t
 **Files:**
 - Create:
   - `apps/sync-worker/Cargo.toml`
+  - `apps/sync-worker/build.rs` (same idea as `apps/web/build.rs`, watching both `../../migrations/sqlite` and `../../migrations/postgres`, one `cargo:rerun-if-changed` line each)
   - `apps/sync-worker/src/lib.rs`
   - `apps/sync-worker/src/config.rs`
   - `apps/sync-worker/src/tables.rs`
@@ -1466,6 +1481,7 @@ mod tests {
     #[test]
     fn table_and_column_names_are_unique() {
         let mut names: Vec<_> = TABLES.iter().map(|t| t.name).collect();
+        names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), TABLES.len());
         for table in TABLES {
@@ -1688,6 +1704,7 @@ pub mod tables;
 /// The SQLite migrations, embedded so the worker can check that `library-web`
 /// has applied them all before it ships anything (spec §6.7). The worker never
 /// runs them: `library-web` is the only program that migrates SQLite.
+// apps/sync-worker/build.rs rebuilds this crate when either folder changes.
 pub static SQLITE_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/sqlite");
 
 /// The Postgres migrations. The worker runs these when it connects.
@@ -2552,6 +2569,16 @@ fn books_changes(upserts: Vec<Row>, deletes: Vec<i64>) -> TableChanges {
 async fn connecting_creates_the_schema_and_takes_the_node_lock() {
     let pg = TestPg::new().await;
     let first = Mirror::connect(&pg.options, "node1").await.unwrap();
+    let mut conn = pg.connect().await;
+    for table in ["books", "members", "loans", "sync_checkpoints", "sync_archive"] {
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(table)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(found.as_deref(), Some(table), "connect should have created {table}");
+    }
+    drop(conn);
     match Mirror::connect(&pg.options, "node1").await {
         Err(ConnectError::Locked(node)) => assert_eq!(node, "node1"),
         other => panic!("expected Locked, got {:?}", other.err()),
@@ -2732,7 +2759,7 @@ Expected: compile errors, because `sync_worker::mirror` is missing.
 //! connection drops, Postgres releases the lock *and* our writes fail, so a
 //! worker can never write without holding the lock.
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use sqlx::postgres::{PgConnectOptions, PgRow};
 use sqlx::{AssertSqlSafe, Connection, PgConnection, Postgres, Row as _, Transaction};
 
@@ -2771,8 +2798,10 @@ impl Mirror {
     /// Connect, run the Postgres migrations, and take the node's lock.
     pub async fn connect(options: &PgConnectOptions, node_id: &str) -> Result<Self, ConnectError> {
         let mut conn = PgConnection::connect_with(options).await.context("connecting to Postgres")?;
+        // run_direct, not run: `run` goes through `Acquire`, which makes the
+        // worker's future fail the `Send` check when it is `tokio::spawn`ed.
         crate::POSTGRES_MIGRATIONS
-            .run(&mut conn)
+            .run_direct(None, &mut conn, false)
             .await
             .context("running the Postgres migrations")?;
         let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
@@ -2920,13 +2949,15 @@ async fn upsert(tx: &mut Transaction<'_, Postgres>, node_id: &str, table: &Table
     }
     // One array per column; NOT NULL columns are enforced by Postgres itself.
     let mut query = sqlx::query(AssertSqlSafe(upsert_sql(table))).bind(node_id.to_owned());
+    // A fn, not a closure: a closure cannot tie its returned reference to its argument.
+    fn cell<'a>(row: &'a Row, i: usize, table: &Table) -> anyhow::Result<&'a Value> {
+        row.get(i)
+            .with_context(|| format!("{} row is missing column {}", table.name, table.columns[i].name))
+    }
     for (i, column) in table.columns.iter().enumerate() {
-        let cell = |row: &Row| -> anyhow::Result<&Value> {
-            row.get(i).with_context(|| format!("{} row is missing column {}", table.name, column.name))
-        };
         query = match column.kind {
-            Kind::Int => query.bind(rows.iter().map(|r| cell(r)?.as_int()).collect::<anyhow::Result<Vec<_>>>()?),
-            Kind::Text => query.bind(rows.iter().map(|r| cell(r)?.as_text()).collect::<anyhow::Result<Vec<_>>>()?),
+            Kind::Int => query.bind(rows.iter().map(|r| cell(r, i, table)?.as_int()).collect::<anyhow::Result<Vec<_>>>()?),
+            Kind::Text => query.bind(rows.iter().map(|r| cell(r, i, table)?.as_text()).collect::<anyhow::Result<Vec<_>>>()?),
         };
     }
     query
@@ -2989,7 +3020,7 @@ mod tests {
     }
 }
 ```
-Add `pub mod mirror;` to `lib.rs`. If `bail` ends up unused, remove it from the imports.
+Add `pub mod mirror;` to `lib.rs`.
 
 - [ ] **Step 5: Run the tests to see them pass**
 
@@ -3301,6 +3332,40 @@ async fn a_reused_row_id_ends_with_the_new_values() {
 }
 
 #[tokio::test]
+async fn postgres_restored_to_an_older_point_gets_a_full_copy() {
+    let (db, pg) = (TestSqlite::new().await, TestPg::new().await);
+    let mut s = syncer(&db.pool, &pg, 500).await;
+    s.cycle().await.unwrap();
+    insert_book(&db.pool, "a").await;
+    s.cycle().await.unwrap();
+    // Postgres's checkpoint now: the point its backup will go back to.
+    let mut conn = pg.connect().await;
+    let old = mirror::load_checkpoint(&mut conn, NODE).await.unwrap().unwrap();
+    insert_book(&db.pool, "b").await;
+    s.cycle().await.unwrap(); // ships "b" and prunes the change_log row `old` names
+    s.into_mirror().close().await;
+    // Postgres is restored from that backup: old checkpoint, no "b".
+    sqlx::query("UPDATE sync_checkpoints SET last_seq = $2, last_token = $3 WHERE node_id = $1")
+        .bind(NODE)
+        .bind(old.last_seq)
+        .bind(old.last_token.clone())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM books WHERE node_id = $1 AND title = 'b'")
+        .bind(NODE)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    drop(conn);
+    let mut s = syncer(&db.pool, &pg, 500).await;
+    assert_eq!(s.cycle().await.unwrap(), Outcome::Copied { resync: true, epoch: 2, archived: 1, copied: 2 });
+    assert_in_sync(&db.pool, &pg, NODE).await;
+    s.into_mirror().close().await;
+    pg.cleanup().await;
+}
+
+#[tokio::test]
 async fn an_unknown_table_stops_the_cycle_without_moving_the_checkpoint() {
     let (db, pg) = (TestSqlite::new().await, TestPg::new().await);
     let mut s = syncer(&db.pool, &pg, 500).await;
@@ -3448,7 +3513,7 @@ Add `pub mod sync;` to `lib.rs`.
 - [ ] **Step 5: Run the tests to see them pass**
 
 Run: `TEST_POSTGRES_URL=$(./scripts/test-postgres.sh) cargo test -p sync-worker --test sync`
-Expected: 11 passed. If `VACUUM INTO ?` is rejected with a bound parameter, inline the path as a quoted SQL string with `'` doubled. Do not change any assertion.
+Expected: 12 passed. If `VACUUM INTO ?` is rejected with a bound parameter, inline the path as a quoted SQL string with `'` doubled. Do not change any assertion.
 
 - [ ] **Step 6: Run the full gate and commit**
 
@@ -4025,7 +4090,7 @@ mod tests {
 `apps/sync-worker/tests/run.rs`:
 ```rust
 //! The whole worker loop against a real SQLite file and Postgres (spec §6.6–6.8).
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 
@@ -4075,6 +4140,16 @@ fn start(config: Config) -> (JoinHandle<anyhow::Result<()>>, Arc<Metrics>, Cance
     (task, metrics, token)
 }
 
+/// A COUNT on a table the worker has not created yet is 0 (Postgres error
+/// 42P01, undefined_table); any other error fails the test.
+fn zero_if_no_table(result: Result<i64, sqlx::Error>) -> i64 {
+    match result {
+        Ok(count) => count,
+        Err(sqlx::Error::Database(err)) if err.code().as_deref() == Some("42P01") => 0,
+        Err(err) => panic!("querying Postgres: {err}"),
+    }
+}
+
 async fn stop(task: JoinHandle<anyhow::Result<()>>, token: CancellationToken) {
     token.cancel();
     tokio::time::timeout(Duration::from_secs(5), task)
@@ -4088,13 +4163,13 @@ async fn stop(task: JoinHandle<anyhow::Result<()>>, token: CancellationToken) {
 async fn wait_for_title(pg: &TestPg, title: &str) {
     let mut conn = pg.connect().await;
     for _ in 0..200 {
-        // Before the worker's first connection the table does not exist; count that as 0.
-        let found: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM books WHERE node_id = $1 AND title = $2")
-            .bind(NODE)
-            .bind(title)
-            .fetch_one(&mut conn)
-            .await
-            .unwrap_or(0);
+        let found = zero_if_no_table(
+            sqlx::query_scalar("SELECT COUNT(*) FROM books WHERE node_id = $1 AND title = $2")
+                .bind(NODE)
+                .bind(title)
+                .fetch_one(&mut conn)
+                .await,
+        );
         if found == 1 {
             return;
         }
@@ -4168,7 +4243,7 @@ async fn waits_until_web_has_applied_every_migration() {
     insert_book(&db.pool, "waiting").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut conn = pg.connect().await;
-    let shipped: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM books").fetch_one(&mut conn).await.unwrap_or(0);
+    let shipped = zero_if_no_table(sqlx::query_scalar("SELECT COUNT(*) FROM books").fetch_one(&mut conn).await);
     assert_eq!(shipped, 0, "nothing ships before the schema is complete");
     // library-web finishes migrating.
     sqlx::query("INSERT INTO _sqlx_migrations SELECT * FROM saved_migration").execute(&db.pool).await.unwrap();
@@ -4376,7 +4451,9 @@ Add `pub mod cli; pub mod status; pub mod telemetry;` to `lib.rs`. Keep the modu
 
 ```bash
 export TEST_POSTGRES_URL=$(./scripts/test-postgres.sh)
-mkdir -p data && cargo run -q -p library-web -- seed
+# A throwaway database file, so the seed never meets an existing dev database.
+rm -f data/manual-check.db data/manual-check.db-wal data/manual-check.db-shm
+mkdir -p data && DATABASE_URL=sqlite://data/manual-check.db cargo run -q -p library-web -- seed
 cargo build -q -p sync-worker   # build first, so the 5 s timeout below only covers running
 docker exec sqlite-production-test-pg psql -U postgres -c 'CREATE DATABASE manual_check' 2>/dev/null || true
 NODE_ID=dev POSTGRES_URL=postgres://postgres:test@127.0.0.1:55432/manual_check DATABASE_URL=sqlite://data/dev.db \
@@ -4636,8 +4713,9 @@ images: ## Build the three images (tag :dev)
 ```
 In `check`, after the `SQLX_OFFLINE=true cargo build` line, add:
 ```make
-	@! cargo tree -q -p library-web -i sqlx-postgres >/dev/null 2>&1 || { echo "library-web must not depend on a Postgres driver"; exit 1; }
+	@test -z "$$(cargo tree -q -p library-web -i sqlx-postgres 2>/dev/null)" || { echo "library-web must not depend on a Postgres driver"; exit 1; }
 ```
+`cargo tree -i` prints nothing and exits 0 when the crate is not in `library-web`'s tree, so the check tests for empty output, not the exit code.
 
 - [ ] **Step 3: Write the restore gate test**
 
@@ -4653,11 +4731,14 @@ PASSED=0
 cleanup() { for v in "${VOLUMES[@]}"; do docker volume rm -f "$v" >/dev/null; done; }
 trap cleanup EXIT
 
+# new_volume <var>: create a scratch volume and store its name in <var>.
+# Not `var=$(new_volume)`: a subshell would lose the VOLUMES entry, so every
+# volume would get the same name and cleanup would miss them.
 new_volume() {
   local v="restore-gate-test-$$-${#VOLUMES[@]}"
   docker volume create "$v" >/dev/null
   VOLUMES+=("$v")
-  echo "$v"
+  printf -v "$1" '%s' "$v"
 }
 
 # Run a shell command as uid 10001 inside a volume.
@@ -4680,16 +4761,16 @@ gate() {
   PASSED=$((PASSED + 1))
 }
 
-empty=$(new_volume)
+new_volume empty
 for bad in "" "Node1" "node_1" "-node" "a/b" "../x" $'node1\nx' "$(printf 'a%.0s' {1..41})"; do
   gate "$empty" 1 "must be 1-40 characters" -e "NODE_ID=$bad"
 done
 
-present=$(new_volume)
+new_volume present
 in_volume "$present" "sqlite3 /data/library.db 'CREATE TABLE t (x)'"
 gate "$present" 0 "database present" -e NODE_ID=node1
 
-leftover=$(new_volume)
+new_volume leftover
 in_volume "$leftover" "touch /data/library.db-wal"
 gate "$leftover" 1 "part of the database was deleted" -e NODE_ID=node1
 
@@ -4708,7 +4789,7 @@ echo "restore gate: $PASSED checks passed"
 make images
 scripts/test-restore-gate.sh
 ```
-Expected: `restore gate: 13 checks passed`.
+Expected: `restore gate: 12 checks passed`. It takes several minutes: in each of the two unreachable-S3 cases, `litestream restore` retries for about 4 minutes before failing. That is the real behaviour, not a hang. If adding `-e AWS_MAX_ATTEMPTS=1` to the `gate` docker run shortens those cases and they still end with "litestream restore failed", keep it, with a comment saying why.
 
 If the two "litestream restore failed" checks fail because `litestream restore -if-replica-exists` exits 0 when S3 is unreachable, do not weaken the test. Fix the gate instead. Add a step before step 4 of `restore.sh` that fails when S3 cannot be reached but succeeds when the prefix is merely empty. Try `litestream ltx -config "$CONFIG" "$DB"`, and confirm its behaviour against both an unreachable endpoint and an empty Garage prefix; Task 11 has Garage running, so finish the check there if needed. Write what you found in a comment in `restore.sh`.
 
@@ -5405,7 +5486,7 @@ step "2. VM lost: delete node2's disk and start it again"
 node_compose node2 down -v # a clean stop: Litestream uploads the last changes first
 node_compose node2 up -d   # ALLOW_FRESH_DB=false: it must restore from S3
 wait_until 120 "node2 healthy after the restore" healthy node2
-node_compose node2 logs restore | grep -q "restored /data/library.db" || fail "node2 was not restored from S3"
+node_compose node2 logs restore | grep "restored /data/library.db" >/dev/null || fail "node2 was not restored from S3"
 curl -fsS -b "$WORK/node2.cookies" "http://127.0.0.1:$(port node2)/api/books?q=E2E" | jq -e '.total == 1' >/dev/null ||
   fail "node2's book (and its login session) should be back"
 wait_until 120 "node2's worker healthy" worker_healthy node2
@@ -5415,8 +5496,8 @@ wait_until 30 "node2's new book in Postgres" in_postgres node2 "E2E node2 after 
 
 step "3. an empty disk with no backup refuses to start"
 ALLOW_FRESH_DB=false node9_compose up -d >/dev/null 2>&1 || true
-node9_compose logs restore 2>&1 | grep -q "No database and no backup for node 'node9'" || fail "the restore gate should refuse node9"
-if node9_compose ps --status running --services 2>/dev/null | grep -qx web; then
+node9_compose logs restore 2>&1 | grep "No database and no backup for node 'node9'" >/dev/null || fail "the restore gate should refuse node9"
+if node9_compose ps --status running --services 2>/dev/null | grep -x web >/dev/null; then
   fail "web must not start when the restore gate refuses"
 fi
 
@@ -5446,7 +5527,7 @@ e2e: images ## End-to-end test on a separate, throwaway cluster
 
 Run: `make e2e`
 Expected:
-- `restore gate: 13 checks passed`;
+- `restore gate: 12 checks passed`;
 - then five `==>` steps;
 - `DRILL PASSED`;
 - `E2E PASSED`.
@@ -5513,7 +5594,7 @@ Sections, in order:
 1. **The picture.** The diagram from spec §2, and what each of the two backups is for.
 2. **One write, step by step.** Link each step to its code:
    - `POST /api/books` (`apps/web/src/books/routes.rs`);
-   - the write in a `BEGIN IMMEDIATE` transaction (`apps/web/src/books/sqlite.rs`);
+   - the write: a single `INSERT` for a new book; updates and deletes run in a `BEGIN IMMEDIATE` transaction (`apps/web/src/books/sqlite.rs`);
    - the trigger adds a change_log row (`migrations/sqlite/20261011000000_change_log.sql`);
    - commit;
    - Litestream uploads the WAL within about 1 s;
@@ -5643,7 +5724,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build -p library-web -p sync-worker
       - name: The web app has no Postgres driver
-        run: "! cargo tree -q -p library-web -i sqlx-postgres"
+        run: test -z "$(cargo tree -q -p library-web -i sqlx-postgres 2>/dev/null)"
 
   types:
     name: Generated TypeScript types are up to date
@@ -5689,7 +5770,7 @@ check: ## Every CI gate except the Docker end-to-end test (make e2e)
 	cargo clippy --workspace --all-targets -- -D warnings
 	$(MAKE) test
 	SQLX_OFFLINE=true cargo build -p library-web -p sync-worker
-	@! cargo tree -q -p library-web -i sqlx-postgres >/dev/null 2>&1 || { echo "library-web must not depend on a Postgres driver"; exit 1; }
+	@test -z "$$(cargo tree -q -p library-web -i sqlx-postgres 2>/dev/null)" || { echo "library-web must not depend on a Postgres driver"; exit 1; }
 	cargo test -q -p library-shared --features ts && git diff --exit-code -- apps/frontend/src/generated
 	cd apps/frontend && npm run lint && npm run typecheck && npm test
 ```
