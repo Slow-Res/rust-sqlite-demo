@@ -1,7 +1,7 @@
 # One level's result. Inputs (--arg/--argjson/--slurpfile): k6 (summary), samples
 # (JSON lines of scripts/loadtest.sh), kind, value, ramp, hold, start_s (epoch
 # seconds when k6's scenario started), drain, the p95/p99/err/drop limits,
-# mode (web|node), ncont (node containers), setup (the LT_SETUP_DONE data), events (docker die/oom events), before/after (container restart state), rows_before, rows_after.
+# mode (web|node), ncont (node or box containers), nginx_log (access-log line counts, web mode), setup (the LT_SETUP_DONE data), events (docker die/oom events), before/after (container restart state), rows_before, rows_after.
 # Everything is computed from phase:hold only.
 def r1: if . == null then null else (. * 10 | round) / 10 end;
 def r2: if . == null then null else (. * 100 | round) / 100 end;
@@ -50,6 +50,9 @@ $k6[0].metrics as $m
 # The load generator's CPU (k6 has 4 cores: 400%).
 | ([$hs[] | .stats[] | select(.Name | startswith("lt-k6-")) | .CPUPerc | rtrimstr("%") | tonumber]) as $k6cpu
 | ([$hs[].stats[] | select(.Name | startswith("lt-node1-") or startswith("lt-web-"))] | group_by(.Name) | map({key: .[0].Name, value: ([.[].MemUsage | split(" / ")[0] | mib] | max | r1)}) | from_entries) as $mem
+# Per container CPU, and the box's memory: the per-sample sum, then its peak.
+| ([$hs[].stats[] | select(.Name | startswith("lt-node1-") or startswith("lt-web-"))] | group_by(.Name) | map({key: .[0].Name, value: ([.[].CPUPerc | rtrimstr("%") | tonumber] | {avg: (add / length | r1), max: (max | r1)})}) | from_entries) as $cpu_by
+| ([$hs[] | .stats |= map(select(.Name | startswith("lt-node1-") or startswith("lt-web-"))) | select((.stats | length) == $ncont) | [.stats[].MemUsage | split(" / ")[0] | mib] | add] | max | r1) as $box_mem
 | ([$hs[] | select(.puts != null)] | group_by(((.t - $t0) / 15) | floor) | map(map(.puts) | max)) as $put_buckets
 | (if ($put_buckets | length) < 2 then null else [range(1; $put_buckets | length) | select($put_buckets[.] <= $put_buckets[. - 1])] | length end) as $flat_buckets
 | ([$hs[] | select(.puts != null)] | if length > 0 then (last.puts > first.puts) else null end) as $puts_rose
@@ -83,8 +86,12 @@ $k6[0].metrics as $m
     error_pct: ($err_pct | r2),
     error_count: $err_count,
     latency_by_kind_ms: ([("read", "write", "auth") as $k | {key: $k, value: trend("http_req_duration{phase:hold,kind:\($k)}")}] | from_entries),
-    node_cpu_pct_of_200: {avg: (if ($cpu | length) > 0 then ($cpu | add / length | r1) else null end), max: ($cpu | max | r1), samples: ($cpu | length)},
+    # In web mode the box is nginx + web (+ Postgres): the sum of their CPU%.
+    (if $mode == "web" then "box_cpu_pct_of_200" else "node_cpu_pct_of_200" end): {avg: (if ($cpu | length) > 0 then ($cpu | add / length | r1) else null end), max: ($cpu | max | r1), samples: ($cpu | length)},
     peak_memory_mib: $mem,
+    cpu_by_container_pct: $cpu_by,
+    box_peak_memory_mib: (if $mode == "web" then $box_mem else null end),
+    nginx_access_log: $nginx_log,
     max_sync_pending: ([$hs[].pending | select(. != null)] | max),
     max_sync_lag_s: ([$hs[].lag | select(. != null)] | max | r1),
     load_generator_cpu_pct_of_400: {avg: (if ($k6cpu | length) > 0 then ($k6cpu | add / length | r1) else null end), max: ($k6max | r1), samples: ($k6cpu | length)},
