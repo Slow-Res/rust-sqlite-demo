@@ -2,6 +2,11 @@
 # and Prometheus run, under names Prometheus scrapes (node1-litestream, ...).
 # On a real VM, node.yml reaches S3 and Postgres over the network instead.
 services:
+  # The local cluster has committed credentials and COOKIE_SECURE=false, so
+  # keep the web port off the LAN. node.yml stays public for real VMs.
+  web:
+    ports: !override
+      - "127.0.0.1:${HTTP_PORT:-4000}:4000"
   restore:
     networks: [default, shared]
   litestream:

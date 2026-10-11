@@ -8,7 +8,7 @@ groups:
         expr: sync_lag_seconds > 60
         for: 5m
         annotations:
-          summary: "{{ $labels.instance }}: Postgres is {{ $value }}s behind this node"
+          summary: "{{ $labels.instance }}: Postgres is {{ $value | humanizeDuration }} behind this node"
           runbook: "docs/RUNBOOK.md#postgres-down"
       - alert: SyncResync
         expr: increase(sync_resyncs_total[1h]) > 0
@@ -30,10 +30,22 @@ groups:
       # Both rules use the metrics Litestream 0.5.17 exposes. A stalled replica
       # means S3 uploads stopped while the database kept getting new
       # transactions. The PUT counter has no db label, so match on instance.
+      # The second branch covers a Litestream that restarted while S3 was down:
+      # a labelled counter has no series until its first success, so the first
+      # branch would be empty there. litestream_txid jumps from 0 to the current
+      # value when Litestream starts, so require more than one change to tell
+      # real writes from that start-up jump.
       - alert: LitestreamStalled
         expr: >-
-          increase(litestream_replica_operation_total{operation="PUT"}[5m]) == 0
-          and on (instance) delta(litestream_txid[5m]) > 0
+          (
+            increase(litestream_replica_operation_total{operation="PUT"}[5m]) == 0
+            and on (instance) changes(litestream_txid[5m]) > 1
+          )
+          or
+          (
+            changes(litestream_txid[5m]) > 1
+            unless on (instance) litestream_replica_operation_total{operation="PUT"}
+          )
         for: 5m
         annotations:
           summary: "{{ $labels.instance }}: Litestream stopped uploading to S3 while the database keeps changing"
@@ -42,5 +54,5 @@ groups:
         expr: litestream_wal_size > 256 * 1024 * 1024
         for: 15m
         annotations:
-          summary: "{{ $labels.instance }}: the SQLite WAL is {{ $value }} bytes; checkpoints are blocked and the disk may fill"
+          summary: "{{ $labels.instance }}: the SQLite WAL is {{ $value | humanize1024 }}B; checkpoints are blocked and the disk may fill"
           runbook: "docs/RUNBOOK.md#disk-filling-up"
