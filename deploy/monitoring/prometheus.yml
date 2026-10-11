@@ -1,0 +1,16 @@
+# Scrapes every local node's Litestream and sync-worker (spec §8). On real
+# VMs, list each VM's address instead, and keep these ports off the internet.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: litestream
+    static_configs:
+      - targets: [node1-litestream:9090, node2-litestream:9090, node3-litestream:9090]
+  - job_name: sync-worker
+    static_configs:
+      - targets: [node1-worker:9100, node2-worker:9100, node3-worker:9100]

@@ -1,4 +1,4 @@
-.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images
+.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user
 
 # One-time developer setup. Tools are not installed for you: missing ones are reported.
 setup: ## Check tools, install npm deps, create the dev database
@@ -54,3 +54,27 @@ images: ## Build the three images (tag :dev)
 	docker build -f deploy/docker/Dockerfile --target web -t sqlite-production/web:dev .
 	docker build -f deploy/docker/Dockerfile --target sync-worker -t sqlite-production/sync-worker:dev .
 	docker build -f deploy/docker/litestream.Dockerfile -t sqlite-production/litestream:dev .
+
+up: images ## Start Postgres, Garage, Prometheus and nodes 1-3 (ports 4001-4003)
+	scripts/cluster.sh up
+
+down: ## Stop the cluster; its data is kept
+	scripts/cluster.sh down
+
+reset: ## Stop the cluster and delete all its data (asks first)
+	scripts/cluster.sh reset
+
+ps: ## Show the cluster's containers
+	scripts/cluster.sh ps
+
+logs: ## Follow one node's logs: make logs NODE=node2
+	scripts/cluster.sh logs $(or $(NODE),node1)
+
+psql: ## psql on the cluster's Postgres
+	docker compose -p central -f deploy/compose/central.yml exec postgres psql -U sync -d library
+
+seed: ## Sample data on a cluster node: make seed NODE=node1
+	scripts/cluster.sh exec $(or $(NODE),node1) web library-web seed
+
+user: ## Staff account on a cluster node: make user NODE=node1 NAME=alice
+	scripts/cluster.sh exec $(or $(NODE),node1) web library-web create-user $(or $(NAME),admin)

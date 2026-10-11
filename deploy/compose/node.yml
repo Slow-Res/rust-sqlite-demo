@@ -1,0 +1,86 @@
+# One node = one VM (spec §3). Copy this file and an env file (start from
+# node.env.example) to the VM, then:
+#   docker compose -p <node-id> -f node.yml --env-file node.env up -d
+# The local cluster runs this same file three times (scripts/cluster.sh).
+
+x-litestream-env: &litestream-env
+  NODE_ID: ${NODE_ID:?set NODE_ID}
+  LITESTREAM_BUCKET: ${LITESTREAM_BUCKET:?set LITESTREAM_BUCKET}
+  LITESTREAM_ENDPOINT: ${LITESTREAM_ENDPOINT:-}
+  LITESTREAM_REGION: ${LITESTREAM_REGION:-us-east-1}
+  LITESTREAM_ACCESS_KEY_ID: ${LITESTREAM_ACCESS_KEY_ID:?set LITESTREAM_ACCESS_KEY_ID}
+  LITESTREAM_SECRET_ACCESS_KEY: ${LITESTREAM_SECRET_ACCESS_KEY:?set LITESTREAM_SECRET_ACCESS_KEY}
+
+services:
+  # One-shot: restore the database from S3 if this disk has none (spec §7.2).
+  restore:
+    image: ${LITESTREAM_IMAGE:-sqlite-production/litestream:dev}
+    entrypoint: ["restore.sh"]
+    environment:
+      <<: *litestream-env
+      ALLOW_FRESH_DB: ${ALLOW_FRESH_DB:-false}
+    volumes: [data:/data]
+    restart: "no"
+
+  # Streams every change to s3://<bucket>/<node-id>/ (spec §7.1).
+  litestream:
+    image: ${LITESTREAM_IMAGE:-sqlite-production/litestream:dev}
+    environment: *litestream-env
+    volumes: [data:/data]
+    depends_on:
+      restore: { condition: service_completed_successfully }
+    restart: unless-stopped
+    # Time to upload the last changes when stopping.
+    stop_grace_period: 30s
+
+  web:
+    image: ${WEB_IMAGE:-sqlite-production/web:dev}
+    environment:
+      NODE_ID: ${NODE_ID:?set NODE_ID}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-168}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${HTTP_PORT:-4000}:4000"
+    volumes: [data:/data]
+    # Starting after litestream means stopping before it, so Litestream
+    # uploads the web app's last writes before it stops.
+    depends_on:
+      restore: { condition: service_completed_successfully }
+      litestream: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:4000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  sync-worker:
+    image: ${WORKER_IMAGE:-sqlite-production/sync-worker:dev}
+    environment:
+      NODE_ID: ${NODE_ID:?set NODE_ID}
+      # The only container with Postgres credentials (spec §3).
+      POSTGRES_URL: ${POSTGRES_URL:?set POSTGRES_URL}
+      BATCH_SIZE: ${BATCH_SIZE:-500}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes: [data:/data]
+    depends_on:
+      web: { condition: service_healthy }
+    # /health stays 503 until the first successful sync cycle, so a slow first
+    # full copy or an unreachable Postgres shows as unhealthy.
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9100/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+      start_interval: 1s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  # A named volume on the VM's local disk. Never NFS or EFS (spec S1).
+  data: {}

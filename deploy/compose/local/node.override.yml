@@ -1,0 +1,21 @@
+# Local cluster only: join the shared Docker network where Postgres, Garage
+# and Prometheus run, under names Prometheus scrapes (node1-litestream, ...).
+# On a real VM, node.yml reaches S3 and Postgres over the network instead.
+services:
+  restore:
+    networks: [default, shared]
+  litestream:
+    networks:
+      default: {}
+      shared:
+        aliases: ["${NODE_ID}-litestream"]
+  sync-worker:
+    networks:
+      default: {}
+      shared:
+        aliases: ["${NODE_ID}-worker"]
+
+networks:
+  shared:
+    external: true
+    name: ${SHARED_NETWORK:-sqlite-prod}

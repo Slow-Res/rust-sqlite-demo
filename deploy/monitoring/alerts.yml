@@ -1,0 +1,46 @@
+# Alert rules (spec §8). There is no Alertmanager in the local cluster: see
+# firing alerts at http://127.0.0.1:9090/alerts. Each rule names the RUNBOOK
+# section to follow.
+groups:
+  - name: sqlite-production
+    rules:
+      - alert: SyncLagHigh
+        expr: sync_lag_seconds > 60
+        for: 5m
+        annotations:
+          summary: "{{ $labels.instance }}: Postgres is {{ $value }}s behind this node"
+          runbook: "docs/RUNBOOK.md#postgres-down"
+      - alert: SyncResync
+        expr: increase(sync_resyncs_total[1h]) > 0
+        annotations:
+          summary: "{{ $labels.instance }} was restored from an older backup and may have lost writes; check sync_archive"
+          runbook: "docs/RUNBOOK.md#after-a-resync"
+      - alert: SyncWorkerDown
+        expr: up{job="sync-worker"} == 0
+        for: 2m
+        annotations:
+          summary: "{{ $labels.instance }}: sync-worker is down; Postgres is not receiving changes"
+          runbook: "docs/RUNBOOK.md#postgres-down"
+      - alert: LitestreamDown
+        expr: up{job="litestream"} == 0
+        for: 2m
+        annotations:
+          summary: "{{ $labels.instance }}: Litestream is down; the S3 backup has stopped"
+          runbook: "docs/RUNBOOK.md#s3-down"
+      # Both rules use the metrics Litestream 0.5.17 exposes. A stalled replica
+      # means S3 uploads stopped while the database kept getting new
+      # transactions. The PUT counter has no db label, so match on instance.
+      - alert: LitestreamStalled
+        expr: >-
+          increase(litestream_replica_operation_total{operation="PUT"}[5m]) == 0
+          and on (instance) delta(litestream_txid[5m]) > 0
+        for: 5m
+        annotations:
+          summary: "{{ $labels.instance }}: Litestream stopped uploading to S3 while the database keeps changing"
+          runbook: "docs/RUNBOOK.md#s3-down"
+      - alert: WalTooLarge
+        expr: litestream_wal_size > 256 * 1024 * 1024
+        for: 15m
+        annotations:
+          summary: "{{ $labels.instance }}: the SQLite WAL is {{ $value }} bytes; checkpoints are blocked and the disk may fill"
+          runbook: "docs/RUNBOOK.md#disk-filling-up"
