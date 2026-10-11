@@ -12,14 +12,15 @@ export POSTGRES_HOST_PORT=5434
 export PROMETHEUS_HOST_PORT=9091
 export HTTP_PORT_BASE=4100
 NODE_FILES=(-f deploy/compose/node.yml -f deploy/compose/local/node.override.yml)
-WORK=$(mktemp -d)
-
+WORK=
 cleanup() {
   NODE_ID=node9 docker compose -p e2e-node9 "${NODE_FILES[@]}" --env-file deploy/compose/local/node2.env down -v >/dev/null 2>&1 || true
   scripts/cluster.sh reset --yes >/dev/null 2>&1 || true
-  rm -rf "$WORK"
+  [ -z "$WORK" ] || rm -rf "$WORK"
 }
 trap cleanup EXIT
+cleanup # volumes left by a crashed earlier run would make the nodes look non-fresh
+WORK=$(mktemp -d)
 
 step() { printf '\n==> %s\n' "$*"; }
 fail() { echo "E2E FAILED: $*" >&2; exit 1; }
@@ -48,6 +49,13 @@ worker_healthy() { node_compose "$1" exec -T sync-worker curl -fsS http://127.0.
 metric() { node_compose "$1" exec -T sync-worker curl -fsS http://127.0.0.1:9100/metrics | awk -v name="$2" '$1 == name { print $2 }'; }
 in_postgres() { [ "$(sql "SELECT count(*) FROM books WHERE node_id = '$1' AND title = '$2'")" = 1 ]; }
 count_is() { [ "$(sql "SELECT count(*) FROM $2 WHERE node_id = '$1'")" = "$3" ]; }
+# Successful Litestream uploads of a node so far, as Prometheus last saw them.
+put_count() {
+  curl -fsS -G "http://127.0.0.1:$PROMETHEUS_HOST_PORT/api/v1/query" \
+    --data-urlencode "query=sum(litestream_replica_operation_total{operation=\"PUT\",instance=\"$1-litestream:9090\"})" |
+    jq -r '.data.result | map(.value[1] | tonumber) | add // 0'
+}
+put_above() { [ "$(put_count "$1")" -gt "$2" ]; }
 targets_up() {
   curl -fsS "http://127.0.0.1:$PROMETHEUS_HOST_PORT/api/v1/targets" |
     jq -e '[.data.activeTargets[] | select(.health == "up")] | length == 6'
@@ -88,9 +96,10 @@ node_compose node2 logs restore | grep "restored /data/library.db" >/dev/null ||
 curl -fsS -b "$WORK/node2.cookies" "http://127.0.0.1:$(port node2)/api/books?q=E2E" | jq -e '.total == 1' >/dev/null ||
   fail "node2's book (and its login session) should be back"
 wait_until 120 "node2's worker healthy" worker_healthy node2
-[ "$(metric node2 sync_resyncs_total)" = 0 ] || fail "a clean restore must not need a resync"
 add_book node2 "E2E node2 after restore"
 wait_until 30 "node2's new book in Postgres" in_postgres node2 "E2E node2 after restore"
+# Read only now: at least one full cycle has run since the restore.
+[ "$(metric node2 sync_resyncs_total)" = 0 ] || fail "a clean restore must not need a resync"
 
 step "3. an empty disk with no backup refuses to start"
 ALLOW_FRESH_DB=false node9_compose up -d >/dev/null 2>&1 || true
@@ -101,12 +110,18 @@ fi
 
 step "4. Postgres down: the app keeps working and the worker catches up"
 central stop postgres
+puts_before=$(put_count node1)
 add_book node1 "E2E during outage" # succeeds: the app never needs Postgres
 sleep 5
 central start postgres
 wait_until 120 "the outage book in Postgres" in_postgres node1 "E2E during outage"
 
 step "5. restore drill"
-scripts/restore-drill.sh node1
+# The drill reads from S3, so the outage book must be uploaded first. A
+# rising PUT counter (successful uploads only) shows that; Prometheus sees
+# it within one 5s scrape.
+wait_until 60 "Litestream to upload node1's outage book" put_above node1 "$puts_before"
+sleep 6 # the last upload may still be in flight after the counter first rises
+scripts/restore-drill.sh node1 --strict
 
 printf '\nE2E PASSED\n'
