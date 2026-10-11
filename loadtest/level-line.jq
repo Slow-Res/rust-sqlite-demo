@@ -1,7 +1,12 @@
 # One block per level for the terminal.
+def short: sub("^lt-(node1|web)-"; "") | sub("-1$"; "");
+def gib: . / 1024 | if . < 0.1 then (. * 100 | round) / 100 else (. * 10 | round) / 10 end;
+def split_cpu: [.cpu_by_container_pct | to_entries | sort_by(-.value.avg)[] | "\(.key | short) \(.value.avg | round)"] | join(", ");
+def split_mem: [.peak_memory_mib | to_entries | sort_by(-.value)[] | "\(.key | short) \(.value | gib)"] | join(", ");
 def unit: if .kind == "rps" then "actions/s" else "users" end;
 "\(.kind) \(.level): \(if .pass then "PASS" else "FAIL" end) (\(.level) \(unit) = \(.req_per_s) req/s)\(if .pass then "" else " (" + (.reasons | join("; ")) + ")" end)\n"
-+ "  p50 \(.latency_ms.p50) / p95 \(.latency_ms.p95) / p99 \(.latency_ms.p99) ms  errors \(.error_pct)%  \(if .mode == "web" then "web" else "node" end) CPU avg \(.node_cpu_pct_of_200.avg)% max \(.node_cpu_pct_of_200.max)% of 200%\n"
++ "  p50 \(.latency_ms.p50) / p95 \(.latency_ms.p95) / p99 \(.latency_ms.p99) ms  errors \(.error_pct)%\n  \(if .mode == "web" then "cpu box avg \(.box_cpu_pct_of_200.avg | round)% max \(.box_cpu_pct_of_200.max | round)% of 200% (\(split_cpu))" else "node CPU avg \(.node_cpu_pct_of_200.avg)% max \(.node_cpu_pct_of_200.max)% of 200%" end)\n"
++ (if .mode == "web" then "  mem box peak \(.box_peak_memory_mib | gib) GiB (\(split_mem))  nginx access log +\(.nginx_access_log.lines) lines\n" else "" end)
 + "  load generator (k6) CPU avg \(.load_generator_cpu_pct_of_400.avg)% max \(.load_generator_cpu_pct_of_400.max)% of 400%\n"
 + (if .mode == "web" then "  sync worker, Litestream, drain: n/a (web only)  dropped \(.dropped_iterations)\n"
    else "  max sync pending \(.max_sync_pending) lag \(.max_sync_lag_s) s  Litestream PUTs rose: \(.litestream.puts_rose) (flat 15 s buckets \(.litestream.flat_15s_buckets)/\(.litestream.buckets_15s))  drain \(.drain_s) s  dropped \(.dropped_iterations)\n" end)

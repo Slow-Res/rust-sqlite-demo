@@ -1,0 +1,50 @@
+# LOAD TEST ONLY (scripts/loadtest.sh, LT_DB=postgres): layered on
+# loadtest.web.yml. Runs Postgres inside the same 2 CPU / 4 GB box as nginx and
+# the web app, and points the web app at it. Memory split: nginx 256m + web
+# 2048m + Postgres 1792m = 4096 MiB. LOCAL ONLY credentials.
+services:
+  postgres:
+    image: postgres:18.6
+    environment:
+      POSTGRES_USER: library # local only
+      POSTGRES_PASSWORD: library # local only
+      POSTGRES_DB: library
+    # Only the memory settings differ from the defaults: synchronous_commit=on
+    # and fsync=on stay, so a commit is durable on power loss.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - max_connections=50
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=128MB
+    # On disk, not tmpfs: the SQLite file is on disk too. The volume is the
+    # parent of PGDATA (as in central.yml).
+    volumes: [pgdata:/var/lib/postgresql]
+    cpuset: "${NODE_CPUS:-6,7}"
+    mem_limit: 1792m
+    memswap_limit: 1792m
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "library", "-d", "library"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  web:
+    environment:
+      DATABASE_URL: postgres://library:library@postgres:5432/library # local only
+    mem_limit: 2048m
+    memswap_limit: 2048m
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata: {}

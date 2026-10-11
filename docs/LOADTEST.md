@@ -9,21 +9,70 @@ it, runs k6 against it, and searches for the highest passing level.
 
 `LT_MODE` picks what runs under the limit:
 
-- **`web`** (the default) measures the app alone: the Rust web app with SQLite inside it,
-  project `lt-web`, one container on cores `NODE_CPUS` with 4g of memory (`memswap_limit`
-  4g). There is no Litestream, sync worker, restore gate, Postgres, Garage or Prometheus.
-  There is no sync or Litestream data and no drain wait, and those fields read `n/a`.
-  Sampling is `docker stats` of web and k6 only.
+- **`web`** (the default) measures one box: nginx in front of the Rust web app, with SQLite
+  inside the app (or Postgres in the same box, see `LT_DB`). Project `lt-web`, every
+  container on cores `NODE_CPUS`. There is no Litestream, sync worker, restore gate,
+  Garage or Prometheus, so sync, Litestream and drain fields read `n/a`. Sampling is
+  `docker stats` of all box containers and k6 in one call.
 - **`node`** adds Litestream and the sync worker on the same 2 cores (the limits and the
-  topology below), with Postgres, S3 (Garage) and Prometheus outside the limit.
+  topology below), with Postgres, S3 (Garage) and Prometheus outside the limit. No nginx
+  here: k6 aims at web directly, as before.
+
+### nginx in front (web mode)
+
+k6 talks to nginx (`http://nginx:80`), and nginx proxies to web over keep-alive
+connections. That is a real deployment shape (nginx, app, database on one machine), and
+the shape of the video this test is compared with. nginx shares the 2 cores with the app
+and takes its slice of the memory. Its config is `deploy/compose/local/loadtest-nginx.conf`
+(2 workers, gzip level 1 for JSON, the access log buffered to a file inside the container,
+not to docker logs, so dockerd does no logging work outside the box). Seeding goes through
+nginx too. The runner counts the access-log lines before and after each level and prints
+the delta (`nginx_access_log` in `level.json`), which proves the traffic went through
+nginx; nginx's own health check is not logged.
+
+### `LT_DB`: SQLite or Postgres (web mode only)
+
+`LT_DB=sqlite` (the default) or `LT_DB=postgres`. `LT_DB=postgres` with `LT_MODE=node`
+exits with a usage error. With Postgres, `loadtest.web-pg.yml` is layered on
+`loadtest.web.yml` and adds a `postgres` container (`postgres:18.6`, data in a named volume
+on disk, because the SQLite file is on disk too) to the same box, and points web at it
+with `DATABASE_URL`. The project is still `lt-web`, so one `down` removes either variant.
+The app image must have been built with the `postgres` feature: `make loadtest-image`
+builds `sqlite-production/web:lt`, the image web mode uses (`WEB_IMAGE` overrides it), and
+`up` dies with "run make loadtest-image" when it is missing.
+
+The memory is split per container, so each variant adds up to exactly 4096 MiB and `up`
+checks that sum. Limits are per container because a shared pool would let one process
+starve the others invisibly; this way a container that runs out is OOM-killed and named.
+
+| Variant | nginx | web | postgres | total |
+|---|---|---|---|---|
+| sqlite | 256m | 3840m | | 4096 MiB |
+| postgres | 256m | 2048m | 1792m | 4096 MiB |
+
+Postgres runs with defaults except for memory: `shared_buffers=512MB`,
+`effective_cache_size=1GB`, `max_connections=50`, `work_mem=4MB`,
+`maintenance_work_mem=128MB` (and `shm_size` 256m). `synchronous_commit=on` and `fsync=on`
+stay, so a Postgres commit is durable on power loss. That is stronger than SQLite's
+`synchronous=NORMAL` (WAL), which can lose the last commits on power loss. Weigh this when
+you compare the two variants: Postgres pays for a durability SQLite does not give here.
+The credentials (`library` / `library`) are local only.
+
+In web mode `level.json` and the level line show the box CPU (the sum over the box
+containers, out of 200%) and its split, for example
+`cpu box avg 172% max 199% (web 118, postgres 47, nginx 9)`, and the box memory peak
+(the highest per-sample sum) with each container's peak, for example
+`mem box peak 1.9 GiB (web 1.1, postgres 0.7, nginx 0.02)`. Restart and OOM checks cover
+every box container. The results directory is named `<UTC timestamp>-<db>`, and
+`summary.json` carries `db`.
 
 Note for `web`: nothing prunes `change_log`, so it grows by one row per synced write during
-a run. This is a small extra cost, and real nodes do not have it once the worker runs.
-The compose file is `deploy/compose/local/loadtest.web.yml`, standalone: no restore
+a run on SQLite. This is a small extra cost, and real nodes do not have it once the worker
+runs. The compose files are `deploy/compose/local/loadtest.web.yml` (standalone: no restore
 service is needed, because a new named volume takes over the ownership of `/data` (the
-app user, uid 10001) from the image, and web creates the empty database itself. Nothing
-is published on the host; the runner reaches web through the container's address, and
-k6 joins `lt-web_default`. `scripts/loadtest.sh down` removes the projects of both modes.
+app user, uid 10001) from the image) and `loadtest.web-pg.yml`. Nothing is published on the
+host; the runner reaches web through the container's address, and k6 joins
+`lt-web_default`. `scripts/loadtest.sh down` removes the projects of both modes.
 
 The sections below describe `node` mode unless they say otherwise; the workload, data,
 error rule and pass rule are the same in both.
@@ -202,7 +251,7 @@ req/s)`, because one action is more than one request.
 
 ## How to run it
 
-Needs Docker, `curl`, `jq` and `make images` (the images must exist). Nothing outside the
+Needs Docker, `curl`, `jq` and `make images` (node mode) or `make loadtest-image` (web mode). Nothing outside the
 `lt-` prefix is touched: not your `make up` cluster, not `e2e-`.
 
 ```bash
@@ -235,12 +284,14 @@ Environment overrides (defaults in brackets):
 | `SESSION_POOL` (50) | sessions logged in at setup in the rps model |
 | `NODE_CPUS` (6,7), `CENTRAL_CPUS` (8-13), `K6_CPUS` (0-3) | core sets; they may not overlap or include 14-15 |
 | `LT_MODE` (`web`) | `web` or `node`, see Modes |
-| `K6_IMAGE` (`grafana/k6:1.3.0`), `BASE_URL` (`http://web:4000`) | the k6 image, and where k6 aims, as seen from its container |
+| `LT_DB` (`sqlite`) | `sqlite` or `postgres`, web mode only |
+| `WEB_IMAGE` (`sqlite-production/web:lt`) | the web image of web mode (build it with `make loadtest-image`) |
+| `K6_IMAGE` (`grafana/k6:1.3.0`), `BASE_URL` (`http://nginx:80` in web mode, `http://web:4000` in node mode) | the k6 image, and where k6 aims, as seen from its container |
 | `PAUSE_S` (30) | pause between levels of a search, after the drain |
 | `MAX_LEVEL` (100000) | the search gives up above this level |
 | `SAMPLE_S` (5) | sampling tick during a level |
 | `DRAIN_TIMEOUT_S` (900) | longest wait for the sync worker to drain |
-| `RESULTS_DIR` | results directory (default `loadtest/results/<UTC timestamp>`) |
+| `RESULTS_DIR` | results directory (default `loadtest/results/<UTC timestamp>`, with `-sqlite` or `-postgres` appended in web mode) |
 | `LT_ADMIN_PASSWORD` (`loadtest-local-only`) | password of the local-only `admin` account |
 
 A harness failure (a query or jq program fails, k6 dies, Postgres cannot be read) ends the

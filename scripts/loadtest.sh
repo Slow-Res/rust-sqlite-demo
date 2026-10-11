@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Load test of the web app, or of a whole node, limited to 2 CPUs and 4 GB
-# (docs/LOADTEST.md). LT_MODE=web (default) starts the web app alone (project
-# lt-web); LT_MODE=node starts a node with Litestream and the sync worker
+# (docs/LOADTEST.md). LT_MODE=web (default) starts nginx and the web app (project
+# lt-web), with SQLite inside the app, or with Postgres in the same box when
+# LT_DB=postgres; LT_MODE=node starts a node with Litestream and the sync worker
 # (projects lt-central and lt-node1, web on port 4201). Either way it seeds
 # the database through the API, drives it with k6 in Docker and finds the highest load
 # that still meets the pass rule. Your own `make up` cluster and the e2e
@@ -22,14 +23,22 @@ export NODE_CPUS="${NODE_CPUS:-6,7}"          # the node: 2 efficiency cores (4.
 export CENTRAL_CPUS="${CENTRAL_CPUS:-8-13}"   # Postgres, Garage, Prometheus
 K6_CPUS="${K6_CPUS:-0-3}"                     # k6: performance cores (5.1 GHz)
 K6_IMAGE="${K6_IMAGE:-grafana/k6:1.3.0}"
-BASE_URL="${BASE_URL:-http://web:4000}"       # as seen from the k6 container
 LT_MODE="${LT_MODE:-web}"
 [[ $LT_MODE == web || $LT_MODE == node ]] || { echo "LOADTEST: LT_MODE must be web or node" >&2; exit 2; }
+LT_DB="${LT_DB:-sqlite}"
+[[ $LT_DB == sqlite || $LT_DB == postgres ]] || { echo "LOADTEST: LT_DB must be sqlite or postgres" >&2; exit 2; }
+[[ $LT_MODE == web || $LT_DB == sqlite ]] || { echo "LOADTEST: usage: LT_DB=postgres works only with LT_MODE=web (node mode has its own Postgres)" >&2; exit 2; }
+# As seen from the k6 container: through nginx in web mode, as a client would.
+if [ "$LT_MODE" = web ]; then BASE_URL="${BASE_URL:-http://nginx:80}"; else BASE_URL="${BASE_URL:-http://web:4000}"; fi
 HTTP_PORT=$((HTTP_PORT_BASE + 1))
 PROM_URL="http://127.0.0.1:$PROMETHEUS_HOST_PORT"
 if [ "$LT_MODE" = web ]; then
   K6_NETWORK="${PREFIX}web_default"
-  NODE_CONTAINERS=("${PREFIX}web-web-1")
+  # web first: WEB is NODE_CONTAINERS[0].
+  NODE_CONTAINERS=("${PREFIX}web-web-1" "${PREFIX}web-nginx-1")
+  [ "$LT_DB" = sqlite ] || NODE_CONTAINERS+=("${PREFIX}web-postgres-1")
+  # The app image built by `make loadtest-image` (it has the postgres feature).
+  export WEB_IMAGE="${WEB_IMAGE:-sqlite-production/web:lt}"
 else
   K6_NETWORK="${PREFIX}node1_default"
   NODE_CONTAINERS=("${PREFIX}node1-web-1" "${PREFIX}node1-litestream-1" "${PREFIX}node1-sync-worker-1")
@@ -93,7 +102,9 @@ wait_until() {
   done
 }
 
-web_compose() { docker compose -p "${PREFIX}web" -f deploy/compose/local/loadtest.web.yml "$@"; }
+WEB_FILES=(-f deploy/compose/local/loadtest.web.yml)
+[ "$LT_DB" = sqlite ] || WEB_FILES+=(-f deploy/compose/local/loadtest.web-pg.yml)
+web_compose() { docker compose -p "${PREFIX}web" "${WEB_FILES[@]}" "$@"; }
 node_compose() { HTTP_PORT=$HTTP_PORT docker compose -p "${PREFIX}node1" "${NODE_FILES[@]}" --env-file deploy/compose/local/node1.env "$@"; }
 central() { docker compose -p "${PREFIX}central" -f deploy/compose/central.yml -f deploy/compose/local/loadtest.central.yml "$@"; }
 
@@ -125,6 +136,14 @@ host_url() {
   echo "http://$ip:4000"
 }
 healthy() { curl -fsS "$(host_url)/api/health"; }
+
+# Lines in nginx's access log (web mode), or JSON null. nginx flushes its
+# buffered log every 5 s, so wait that long first.
+nginx_log_lines() {
+  if [ "$LT_MODE" != web ]; then echo null; return; fi
+  sleep 6
+  docker exec "${PREFIX}web-nginx-1" sh -c 'wc -l </var/log/nginx/lt-access.log' | tr -d ' \r\n'
+}
 
 worker_metric() { docker exec "$WORKER" curl -fsS http://127.0.0.1:9100/metrics | awk -v name="$1" '$1 == name { print $2 }'; }
 # A value from Prometheus (up to one 5 s scrape old), or "null".
@@ -219,36 +238,49 @@ node_limits_proof() {
   [ "$(docker exec "${NODE_CONTAINERS[0]}" nproc)" = "$expected_cpus" ] || die "nproc in the web container is not $expected_cpus"
 }
 
-# The web-only proof: cpuset, memory and swap of the one container, and nproc.
+# The web-mode proof: cpuset, memory and swap of every box container, the sum of
+# the memory limits (4096 MiB), and nproc.
 web_limits_proof() {
-  local expected_cpus
+  local name expected_cpus total
   echo "container                cpuset  memory   memswap  restart"
-  docker inspect -f '{{.Name}} {{.HostConfig.CpusetCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.RestartPolicy.Name}}' "$WEB" |
-    awk '{ printf "%-24s %-7s %-8s %-8s %s\n", substr($1, 2), $2, $3 / 1048576 "m", $4 / 1048576 "m", $5 }'
+  for name in "${NODE_CONTAINERS[@]}"; do
+    docker inspect -f '{{.Name}} {{.HostConfig.CpusetCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.RestartPolicy.Name}}' "$name" |
+      awk '{ printf "%-24s %-7s %-8s %-8s %s\n", substr($1, 2), $2, $3 / 1048576 "m", $4 / 1048576 "m", $5 }'
+  done
+  total=$(for name in "${NODE_CONTAINERS[@]}"; do docker inspect -f '{{.HostConfig.Memory}}' "$name"; done | awk '{ s += $1 } END { print s / 1048576 }')
+  echo "memory limits of the box add up to ${total} MiB (expected 4096)"
   expected_cpus=$(expand_cpus "$NODE_CPUS" | wc -l)
   echo "nproc in the web container: $(docker exec "$WEB" nproc) (expected $expected_cpus)"
-  [ "$(docker inspect -f '{{.HostConfig.CpusetCpus}}' "$WEB")" = "$NODE_CPUS" ] || die "$WEB has the wrong cpuset"
-  [ "$(docker inspect -f '{{.HostConfig.Memory}}' "$WEB")" = "$(docker inspect -f '{{.HostConfig.MemorySwap}}' "$WEB")" ] || die "$WEB may use swap"
+  for name in "${NODE_CONTAINERS[@]}"; do
+    [ "$(docker inspect -f '{{.HostConfig.CpusetCpus}}' "$name")" = "$NODE_CPUS" ] || die "$name has the wrong cpuset"
+    [ "$(docker inspect -f '{{.HostConfig.Memory}}' "$name")" = "$(docker inspect -f '{{.HostConfig.MemorySwap}}' "$name")" ] || die "$name may use swap"
+  done
+  [ "$total" = 4096 ] || die "the box's memory limits add up to ${total} MiB, not 4096"
   [ "$(docker exec "$WEB" nproc)" = "$expected_cpus" ] || die "nproc in the web container is not $expected_cpus"
 }
 
 cmd_up() {
   check_cpus
   local img images=(web sync-worker litestream)
-  [ "$LT_MODE" = node ] || images=(web)
-  for img in "${images[@]}"; do
-    docker image inspect "sqlite-production/$img:dev" >/dev/null 2>&1 || die "image sqlite-production/$img:dev is missing: run make images"
-  done
+  if [ "$LT_MODE" = node ]; then
+    for img in "${images[@]}"; do
+      docker image inspect "sqlite-production/$img:dev" >/dev/null 2>&1 || die "image sqlite-production/$img:dev is missing: run make images"
+    done
+  else
+    docker image inspect "$WEB_IMAGE" >/dev/null 2>&1 || die "image $WEB_IMAGE is missing: run make loadtest-image"
+  fi
   docker image inspect "$K6_IMAGE" >/dev/null 2>&1 || docker pull "$K6_IMAGE" >/dev/null || die "cannot pull $K6_IMAGE"
-  if docker volume inspect "${PREFIX}node1_data" >/dev/null 2>&1 || docker volume inspect "${PREFIX}web_data" >/dev/null 2>&1 || [ -f "$STATE_DIR/seed.env" ]; then
+  if docker volume inspect "${PREFIX}node1_data" >/dev/null 2>&1 || docker volume inspect "${PREFIX}web_data" >/dev/null 2>&1 || docker volume inspect "${PREFIX}web_pgdata" >/dev/null 2>&1 || [ -f "$STATE_DIR/seed.env" ]; then
     die "a load-test cluster already exists: scripts/loadtest.sh down first"
   fi
   ((LOANS <= BOOKS)) || die "LOANS ($LOANS) must not exceed BOOKS ($BOOKS)"
 
   local create_admin="printf '%s\n' \"\$PW\" | library-web create-user $LT_ADMIN_USER --password-stdin"
   if [ "$LT_MODE" = web ]; then
-    step "start the web app alone (cores $NODE_CPUS, 4 GB)"
-    web_compose up -d --wait
+    step "start nginx and the web app ($LT_DB) in one box (cores $NODE_CPUS, 4 GB)"
+    # A web that cannot start (for example an image without the postgres
+    # feature) restarts forever, so bound the wait and show why.
+    web_compose up -d --wait --wait-timeout 180 || { web_compose logs --tail 20 web >&2 || true; die "the box did not become healthy (web logs above)"; }
     # Local-only test credentials, like the e2e test.
     web_compose exec -T -e PW="$LT_ADMIN_PASSWORD" web sh -c "$create_admin" >/dev/null
   else
@@ -296,7 +328,7 @@ cmd_up() {
   step "limit proof"
   if [ "$LT_MODE" = web ]; then
     web_limits_proof
-    printf '\nload-test web app ready (mode web): %s\n' "$(host_url)"
+    printf '\nload-test box ready (mode web, %s): k6 target %s, web %s\n' "$LT_DB" "$BASE_URL" "$(host_url)"
   else
     node_limits_proof
     printf '\nload-test cluster ready: web http://127.0.0.1:%s, Prometheus %s, Postgres 127.0.0.1:%s\n' "$HTTP_PORT" "$PROM_URL" "$POSTGRES_HOST_PORT"
@@ -306,7 +338,7 @@ cmd_up() {
 cmd_down() {
   # Every step runs, even if an earlier one fails.
   # One down cleans whatever exists, whichever mode made it.
-  web_compose down -v || echo "warning: could not remove the lt-web project" >&2
+  docker compose -p "${PREFIX}web" -f deploy/compose/local/loadtest.web.yml -f deploy/compose/local/loadtest.web-pg.yml down -v || echo "warning: could not remove the lt-web project" >&2
   node_compose down -v || echo "warning: could not remove the lt-node1 project" >&2
   central down -v || echo "warning: could not remove the lt-central project" >&2
   docker rm -f $(docker ps -aq --filter "name=^lt-k6-") >/dev/null 2>&1 || true
@@ -360,7 +392,7 @@ restart_state() {
 # the test from measuring (k6 died, no summary, a failed query or jq program)
 # ends the script with `die`, never as a failed level.
 run_level() {
-  local kind=$1 value=$2 dir=$3 env_args started finished rc=0 drain restarts_before restarts_after rows_before rows_after setup_ms setup_json
+  local kind=$1 value=$2 dir=$3 env_args started finished rc=0 nginx_before nginx_after nginx_log drain restarts_before restarts_after rows_before rows_after setup_ms setup_json
   mkdir -p "$dir"
   # shellcheck disable=SC1091
   . "$STATE_DIR/seed.env" 2>/dev/null || die "no seeded cluster: scripts/loadtest.sh up first"
@@ -372,6 +404,7 @@ run_level() {
   # level for a restart that is not its own.
   wait_until 180 "web healthy" healthy
   restarts_before=$(restart_state) || die "cannot read the container state"
+  nginx_before=$(nginx_log_lines) || die "cannot read nginx's access log"
   rows_before=$(db_rows) || die "cannot read the row counts before the level (API or Postgres)"
   : >"$dir/samples.jsonl"
   sample_loop "$dir/samples.jsonl" &
@@ -405,6 +438,8 @@ run_level() {
   wait "$EVENTS_PID" 2>/dev/null || true
   EVENTS_PID=
   rows_after=$(db_rows) || die "cannot read the row counts after the level (API or Postgres)"
+  nginx_after=$(nginx_log_lines) || die "cannot read nginx's access log"
+  nginx_log=$(jq -cn --argjson b "$nginx_before" --argjson a "$nginx_after" 'if $b == null then null else {lines_before: $b, lines_after: $a, lines: ($a - $b)} end')
   setup_ms=$(sed -n 's/.*LT_SETUP_DONE \([0-9]*\) .*/\1/p' "$dir/k6.log" | head -1)
   setup_json=$(sed -n 's/.*LT_SETUP_DONE [0-9]* \(.*\)" source=console.*/\1/p' "$dir/k6.log" | head -1 | sed 's/\\"/"/g')
   [ -n "$setup_ms" ] && jq -e . >/dev/null 2>&1 <<<"$setup_json" || die "k6 did not report its start (log: $dir/k6.log)"
@@ -416,7 +451,7 @@ run_level() {
     --argjson setup "$setup_json" \
     --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
     --argjson before "$restarts_before" --argjson after "$restarts_after" \
-    --argjson rows_before "$rows_before" --argjson rows_after "$rows_after" \
+    --argjson rows_before "$rows_before" --argjson rows_after "$rows_after" --argjson nginx_log "$nginx_log" \
     -f "loadtest/level.jq" >"$dir/level.json" || die "could not compute the level result (loadtest/level.jq; inputs in $dir)"
   jq -e '.pass | type == "boolean"' "$dir/level.json" >/dev/null 2>&1 || die "level.json is empty or malformed ($dir/level.json)"
   jq -r -f loadtest/level-line.jq "$dir/level.json" || die "could not print the level result"
@@ -432,7 +467,7 @@ pause_between_levels() {
 write_summary() {
   local dir=$1 levels=$2 result=${3:-null} aborted=${4:-}
   jq -s --argjson result "$result" --arg aborted "$aborted" --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
-    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" \
+    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" --arg db "$([ "$LT_MODE" = web ] && echo "$LT_DB" || true)" \
     -f loadtest/summary.jq "$levels" >"$dir/summary.json" || return 1
   jq -r -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
   SUMMARY_DONE=true
@@ -441,7 +476,7 @@ write_summary() {
 }
 
 new_results_dir() {
-  local dir="${RESULTS_DIR:-$RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)}"
+  local dir="${RESULTS_DIR:-$RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)$([ "$LT_MODE" = web ] && echo "-$LT_DB")}"
   mkdir -p "$dir" || die "cannot create the results directory $dir"
   echo "$dir"
 }
