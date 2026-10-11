@@ -1,0 +1,22 @@
+# LOAD TEST ONLY (scripts/loadtest.sh). Limits one node like a 2 vCPU / 4 GB
+# VM: the four services share cores 6,7 (4.4 GHz efficiency cores), so the node
+# as a whole gets 2 CPUs; the memory limits add up to 4 GB. memswap_limit equals
+# mem_limit, so there is no swap, as on a VM. Never put cores 14,15 (2.5 GHz) here.
+# Use it after node.yml and node.override.yml.
+services:
+  restore:
+    cpuset: "${NODE_CPUS:-6,7}"
+    mem_limit: 512m
+    memswap_limit: 512m
+  litestream:
+    cpuset: "${NODE_CPUS:-6,7}"
+    mem_limit: 512m
+    memswap_limit: 512m
+  web:
+    cpuset: "${NODE_CPUS:-6,7}"
+    mem_limit: 3g
+    memswap_limit: 3g
+  sync-worker:
+    cpuset: "${NODE_CPUS:-6,7}"
+    mem_limit: 512m
+    memswap_limit: 512m

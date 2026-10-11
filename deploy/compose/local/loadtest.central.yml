@@ -1,0 +1,9 @@
+# LOAD TEST ONLY (scripts/loadtest.sh). Keeps the central services off the
+# node's cores and off the cores k6 uses. Use it after central.yml.
+services:
+  postgres:
+    cpuset: "${CENTRAL_CPUS:-8-13}"
+  garage:
+    cpuset: "${CENTRAL_CPUS:-8-13}"
+  prometheus:
+    cpuset: "${CENTRAL_CPUS:-8-13}"
