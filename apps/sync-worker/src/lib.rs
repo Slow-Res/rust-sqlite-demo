@@ -1,6 +1,7 @@
 //! sync-worker: copies one node's SQLite changes to the central Postgres
 //! (spec §6). `main.rs` is a thin shell; everything testable lives here.
 
+pub mod changes;
 pub mod config;
 pub mod tables;
 
