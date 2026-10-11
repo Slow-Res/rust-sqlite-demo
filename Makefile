@@ -42,12 +42,13 @@ types: ## Regenerate TypeScript types from the shared crate
 sqlx-prepare: ## Refresh committed offline query metadata
 	cd apps/web && DATABASE_URL=sqlite://$(CURDIR)/data/dev.db cargo sqlx prepare
 
-check: ## Every gate CI runs
+check: ## Every CI gate except the Docker end-to-end test (make e2e)
 	cargo fmt --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	$(MAKE) test
-	SQLX_OFFLINE=true cargo build -p library-web
+	SQLX_OFFLINE=true cargo build -p library-web -p sync-worker
 	@test -z "$$(cargo tree -q -p library-web -i sqlx-postgres 2>/dev/null)" || { echo "library-web must not depend on a Postgres driver"; exit 1; }
+	cargo test -q -p library-shared --features ts && git diff --exit-code -- apps/frontend/src/generated
 	cd apps/frontend && npm run lint && npm run typecheck && npm test
 
 images: ## Build the three images (tag :dev)

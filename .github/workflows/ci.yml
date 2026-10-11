@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # apps/web's compile-time checked SQL reads the committed .sqlx/ data.
+  SQLX_OFFLINE: "true"
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, tests with Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      TEST_POSTGRES_URL: postgres://postgres:test@127.0.0.1:55432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build -p library-web -p sync-worker
+      - name: The web app has no Postgres driver
+        run: test -z "$(cargo tree -q -p library-web -i sqlx-postgres 2>/dev/null)"
+
+  types:
+    name: Generated TypeScript types are up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p library-shared --features ts
+      - name: Fail if regenerating changed anything
+        run: git diff --exit-code -- apps/frontend/src/generated
+
+  frontend:
+    name: React (lint, typecheck, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  e2e:
+    name: Images, restore gate and end-to-end
+    runs-on: ubuntu-latest
+    # The restore-gate test alone takes about 8 minutes (Litestream retries
+    # against an unreachable S3), and a full `make e2e` takes 15-25 minutes.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: make e2e
