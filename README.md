@@ -63,7 +63,7 @@ make reset                    # stop everything and delete all its data (asks fi
 
 | Command | What it runs |
 |---|---|
-| `make test` | The Rust tests. It starts a throwaway Postgres in Docker (port 55432) for the worker tests. |
+| `make test` | The Rust tests, then the web tests again with `--features postgres`. It starts a throwaway Postgres in Docker (port 55432) for the worker tests and the Postgres variants. |
 | `make check` | Every CI gate except the end-to-end test: format, clippy, tests, the "web has no Postgres driver" check, generated TypeScript types, and the React lint, typecheck and tests. |
 | `make e2e` | Builds the images, then runs the restore-gate test (15 checks) and the full cluster scenarios on a separate, throwaway cluster. It does not touch your `make up` cluster. |
 
@@ -82,6 +82,28 @@ when any count differs. In production the live counts keep moving, so use `--str
 only on an idle node; the e2e test uses it after waiting for the upload. See the
 [runbook](docs/RUNBOOK.md#run-the-restore-drill).
 
+## Postgres backend (load-test comparison only)
+
+`library-web` can run on Postgres so the load test can compare it with SQLite on the
+same machine. It is a comparison mode, not a production topology.
+
+- **Feature.** Build with `cargo build -p library-web --features postgres`, or
+  `make loadtest-image` (the web image tagged `sqlite-production/web:lt`). The feature is
+  off by default.
+- **`DATABASE_URL`.** `postgres://user:password@host:5432/db` (or `postgresql://`) selects
+  Postgres; `sqlite:` stays the default. `web` migrates the database on start with
+  `migrations/web-postgres`. A binary built without the feature refuses a Postgres URL at
+  startup. Its pool has 16 connections (SQLite: 8). `create-user` works on both backends.
+- **Not supported.** Litestream, the sync worker (there is no `change_log`), `seed` and
+  `check-db`: the last two exit with an error on Postgres.
+- **Same behaviour.** The Postgres adapters return the same results and errors as the
+  SQLite ones, and the same HTTP tests run on both (`make test`). Where SQLite takes the
+  write lock with `BEGIN IMMEDIATE`, Postgres locks the rows a check depends on with
+  `SELECT ... FOR UPDATE`, always in the order book, member, loan.
+- **Why it is behind a feature.** The spec (§4) says only `sync-worker` has a Postgres
+  driver. The default build has none, and `make check` fails if `library-web` depends on
+  `sqlx-postgres` without the feature.
+
 ## Folders
 
 | Folder | Job |
@@ -93,6 +115,7 @@ only on an idle node; the e2e test uses it after waiting for the upload. See the
 | `crates/sqlite` | The one place SQLite is opened and configured (package `sqlite-setup`). |
 | `migrations/sqlite` | App tables, change log and triggers. Run by `web`. |
 | `migrations/postgres` | Mirror tables, checkpoints and archive. Run by `sync-worker`. |
+| `migrations/web-postgres` | The app tables for the optional Postgres backend of `web` (load-test comparison only). |
 | `deploy/docker` | The Dockerfiles, Litestream config and the restore gate. |
 | `deploy/compose` | `node.yml` (one VM), `central.yml` (Postgres, Garage, Prometheus) and the local cluster's env files. |
 | `deploy/garage` | Config and setup script for the local S3 (Garage). |

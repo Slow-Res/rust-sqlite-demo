@@ -6,12 +6,16 @@
 
 mod extractor;
 mod password;
+#[cfg(feature = "postgres")]
+mod postgres;
 mod repo;
 mod routes;
 mod service;
 mod sqlite;
 
 pub use extractor::AuthUser;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresAuthRepository;
 pub use repo::{AuthRepository, SessionUser, UserRecord};
 pub use routes::routes;
 pub use service::{AuthService, LoginSession};

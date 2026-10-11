@@ -72,8 +72,9 @@ async fn a_corrupted_file_fails_the_check() {
         database_url: format!("sqlite://{}", path.display()),
         ..common::test_config()
     };
-    let pool = library_web::db::connect(&config).await.unwrap();
-    library_web::db::migrate(&pool).await.unwrap();
+    let db = library_web::db::connect(&config).await.unwrap();
+    library_web::db::migrate(&db).await.unwrap();
+    let pool = db.require_sqlite("test").unwrap().clone();
     for i in 0..300 {
         sqlx::query(
             "INSERT INTO books (title, author, total_copies, created_at, updated_at) \

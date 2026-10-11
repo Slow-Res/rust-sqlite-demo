@@ -13,5 +13,5 @@ async fn a_newer_applied_migration_does_not_stop_the_older_binary(pool: SqlitePo
     .execute(&pool)
     .await
     .unwrap();
-    library_web::db::migrate(&pool).await.unwrap();
+    library_web::db::migrate(&pool.into()).await.unwrap();
 }

@@ -8,7 +8,6 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use common::{TestApp, insert_loan, start_time};
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
 
 /// Create a book with `copies` copies through the API; returns its id.
 async fn add_book(app: &TestApp, cookie: &str, title: &str, copies: i64) -> i64 {
@@ -64,9 +63,43 @@ fn time(value: &Value) -> DateTime<Utc> {
     value.as_str().unwrap().parse().unwrap()
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn every_endpoint_requires_auth(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+/// Fire one borrow per `(book, member)` pair at once and count the outcomes:
+/// `(created, refused with `code`)`. Any other status fails the test.
+async fn race_borrows(
+    app: &TestApp,
+    cookie: &str,
+    pairs: Vec<(i64, i64)>,
+    code: &str,
+) -> (usize, usize) {
+    let handles: Vec<_> = pairs
+        .into_iter()
+        .map(|(book, member)| {
+            let app = app.clone();
+            let cookie = cookie.to_owned();
+            tokio::spawn(async move {
+                let body = json!({ "book_id": book, "member_id": member });
+                app.post_json("/api/loans", &body, Some(&cookie)).await
+            })
+        })
+        .collect();
+    let (mut created, mut refused) = (0, 0);
+    for handle in handles {
+        let (status, _, json) = handle.await.unwrap();
+        match status {
+            StatusCode::CREATED => created += 1,
+            StatusCode::CONFLICT => {
+                assert_eq!(json["error"]["code"], code, "{json}");
+                refused += 1;
+            }
+            other => panic!("unexpected status {other}: {json}"),
+        }
+    }
+    (created, refused)
+}
+
+db_tests! {
+async fn every_endpoint_requires_auth(db: Database) {
+    let app = TestApp::new(db);
     let body = json!({ "book_id": 1, "member_id": 1 });
     let (status, _, _) = app.get("/api/loans", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -76,9 +109,8 @@ async fn every_endpoint_requires_auth(pool: SqlitePool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn borrowing_creates_a_loan_due_in_fourteen_days(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn borrowing_creates_a_loan_due_in_fourteen_days(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let book = add_book(&app, &cookie, "Dune", 2).await;
     let member = add_member(&app, &cookie, "Grace").await;
@@ -97,9 +129,8 @@ async fn borrowing_creates_a_loan_due_in_fourteen_days(pool: SqlitePool) {
     assert_eq!(loan["is_overdue"], false);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn borrowing_and_returning_move_the_derived_counts(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn borrowing_and_returning_move_the_derived_counts(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let book = add_book(&app, &cookie, "Dune", 3).await;
     let member = add_member(&app, &cookie, "Grace").await;
@@ -119,9 +150,8 @@ async fn borrowing_and_returning_move_the_derived_counts(pool: SqlitePool) {
     assert_eq!(m["active_loans"], 0);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn non_positive_ids_are_422(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn non_positive_ids_are_422(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let body = json!({ "book_id": 0, "member_id": -1 });
     let (status, _, json) = app.post_json("/api/loans", &body, Some(&cookie)).await;
@@ -133,9 +163,8 @@ async fn non_positive_ids_are_422(pool: SqlitePool) {
     );
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn unknown_book_or_member_is_404(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn unknown_book_or_member_is_404(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let book = add_book(&app, &cookie, "Dune", 1).await;
     let member = add_member(&app, &cookie, "Grace").await;
@@ -156,9 +185,8 @@ async fn unknown_book_or_member_is_404(pool: SqlitePool) {
     assert_eq!(json["error"]["message"], "book not found");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn no_free_copy_is_409(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn no_free_copy_is_409(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let book = add_book(&app, &cookie, "Dune", 1).await;
     let a = add_member(&app, &cookie, "Ann").await;
@@ -175,9 +203,8 @@ async fn no_free_copy_is_409(pool: SqlitePool) {
     );
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn sixth_active_loan_is_409(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn sixth_active_loan_is_409(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let member = add_member(&app, &cookie, "Grace").await;
     let mut books = Vec::new();
@@ -204,9 +231,8 @@ async fn sixth_active_loan_is_409(pool: SqlitePool) {
     borrow(&app, &cookie, books[5], member).await;
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn returning_sets_returned_at_once(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn returning_sets_returned_at_once(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let book = add_book(&app, &cookie, "Dune", 1).await;
     let member = add_member(&app, &cookie, "Grace").await;
@@ -233,9 +259,8 @@ async fn returning_sets_returned_at_once(pool: SqlitePool) {
     assert_eq!(json["error"]["message"], "loan not found");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn list_filters_by_status(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn list_filters_by_status(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let book = add_book(&app, &cookie, "Dune", 5).await;
     let member = add_member(&app, &cookie, "Grace").await;
@@ -275,9 +300,8 @@ async fn list_filters_by_status(pool: SqlitePool) {
     assert_eq!(all["total"], 3);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn list_filters_by_member_and_book(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn list_filters_by_member_and_book(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let dune = add_book(&app, &cookie, "Dune", 3).await;
     let emma = add_book(&app, &cookie, "Emma", 3).await;
@@ -310,9 +334,8 @@ async fn list_filters_by_member_and_book(pool: SqlitePool) {
     assert_eq!(ids(&page), [l3]);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn list_ordering_follows_the_status(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn list_ordering_follows_the_status(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let book = add_book(&app, &cookie, "Dune", 5).await;
     let member = add_member(&app, &cookie, "Grace").await;
@@ -343,13 +366,12 @@ async fn list_ordering_follows_the_status(pool: SqlitePool) {
     assert_eq!(ids(&all), [first, second, third]);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn list_is_paginated(pool: SqlitePool) {
-    let app = TestApp::new(pool.clone());
+async fn list_is_paginated(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let member = add_member(&app, &cookie, "Grace").await;
     for _ in 0..3 {
-        insert_loan(&pool, member, false).await;
+        insert_loan(&app, member, false).await;
     }
 
     let (_, _, page) = app.get("/api/loans?page=2&per_page=2", Some(&cookie)).await;
@@ -359,19 +381,17 @@ async fn list_is_paginated(pool: SqlitePool) {
     assert_eq!(ids(&page).len(), 1);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn bad_query_params_are_400(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn bad_query_params_are_400(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let (status, _, json) = app.get("/api/loans?status=lost", Some(&cookie)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["error"]["code"], "bad_request");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn concurrent_borrows_never_exceed_total_copies(pool: SqlitePool) {
+async fn concurrent_borrows_never_exceed_total_copies(db: Database) {
     const BORROWERS: usize = 8;
-    let app = TestApp::new(pool);
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let book = add_book(&app, &cookie, "Scarce", 2).await;
     let mut members = Vec::new();
@@ -379,7 +399,7 @@ async fn concurrent_borrows_never_exceed_total_copies(pool: SqlitePool) {
         members.push(add_member(&app, &cookie, &format!("Member{n}")).await);
     }
 
-    // All requests race through clones of the same router and pool.
+    // All requests race through clones of the same router and database pool.
     let handles: Vec<_> = members
         .into_iter()
         .map(|member| {
@@ -407,11 +427,55 @@ async fn concurrent_borrows_never_exceed_total_copies(pool: SqlitePool) {
     }
     assert_eq!((created, refused), (2, BORROWERS - 2));
 
-    let active: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM loans WHERE book_id = ? AND returned_at IS NULL")
-            .bind(book)
-            .fetch_one(&app.pool)
-            .await
-            .unwrap();
+    let active = app
+        .scalar(
+            "SELECT COUNT(*) FROM loans WHERE book_id = $1 AND returned_at IS NULL",
+            &[book.into()],
+        )
+        .await;
     assert_eq!(active, 2);
+}
+
+async fn ten_members_race_for_the_last_copy(db: Database) {
+    let app = TestApp::new(db);
+    let cookie = app.login("ada", "password123").await;
+    let book = add_book(&app, &cookie, "Last copy", 1).await;
+    let mut pairs = Vec::new();
+    for n in 0..10 {
+        pairs.push((book, add_member(&app, &cookie, &format!("Member{n}")).await));
+    }
+
+    let outcome = race_borrows(&app, &cookie, pairs, "no_copies_available").await;
+    assert_eq!(outcome, (1, 9));
+
+    let active = app
+        .scalar(
+            "SELECT COUNT(*) FROM loans WHERE book_id = $1 AND returned_at IS NULL",
+            &[book.into()],
+        )
+        .await;
+    assert_eq!(active, 1);
+}
+
+async fn one_member_racing_never_exceeds_the_loan_limit(db: Database) {
+    let app = TestApp::new(db);
+    let cookie = app.login("ada", "password123").await;
+    let member = add_member(&app, &cookie, "Grace").await;
+    let mut pairs = Vec::new();
+    for n in 0..12 {
+        let book = add_book(&app, &cookie, &format!("Book {n}"), 1).await;
+        pairs.push((book, member));
+    }
+
+    let outcome = race_borrows(&app, &cookie, pairs, "loan_limit_reached").await;
+    assert_eq!(outcome, (5, 7));
+
+    let active = app
+        .scalar(
+            "SELECT COUNT(*) FROM loans WHERE member_id = $1 AND returned_at IS NULL",
+            &[member.into()],
+        )
+        .await;
+    assert_eq!(active, 5);
+}
 }

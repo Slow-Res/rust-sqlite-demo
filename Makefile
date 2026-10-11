@@ -1,4 +1,4 @@
-.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user restore-drill e2e alerts-test loadtest loadtest-up loadtest-down
+.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user restore-drill e2e alerts-test loadtest loadtest-up loadtest-down loadtest-image
 
 # One-time developer setup. Tools are not installed for you: missing ones are reported.
 setup: ## Check tools, install npm deps, create the dev database
@@ -26,11 +26,15 @@ seed-dev: ## Sample data in the dev database
 user-dev: ## Staff account in the dev database
 	cargo run -p library-web -- create-user $(or $(NAME),admin)
 
-test: ## Rust tests; starts a throwaway Postgres (Docker) for the worker tests
-	TEST_POSTGRES_URL=$$(./scripts/test-postgres.sh) cargo test --workspace
+# The second run is the web app's optional Postgres backend (load-test comparison only).
+test: ## Rust tests, default build and web --features postgres; starts a throwaway Postgres (Docker)
+	url=$$(./scripts/test-postgres.sh) && \
+	TEST_POSTGRES_URL=$$url cargo test --workspace && \
+	TEST_POSTGRES_URL=$$url cargo test -p library-web --features postgres
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy -p library-web --all-targets --features postgres -- -D warnings
 
 fmt:
 	cargo fmt
@@ -49,9 +53,10 @@ alerts-test: ## Check and unit-test the alert rules with promtool (Docker)
 
 check: alerts-test ## Every CI gate except the Docker end-to-end test (make e2e)
 	cargo fmt --check
-	cargo clippy --workspace --all-targets -- -D warnings
+	$(MAKE) lint
 	$(MAKE) test
 	SQLX_OFFLINE=true cargo build -p library-web -p sync-worker
+	SQLX_OFFLINE=true cargo build -p library-web --features postgres
 	@test -z "$$(cargo tree -q -p library-web -i sqlx-postgres 2>/dev/null)" || { echo "library-web must not depend on a Postgres driver"; exit 1; }
 	cargo test -q -p library-shared --features ts && git diff --exit-code -- apps/frontend/src/generated
 	cd apps/frontend && npm run lint && npm run typecheck && npm test
@@ -60,6 +65,9 @@ images: ## Build the three images (tag :dev)
 	docker build -f deploy/docker/Dockerfile --target web -t sqlite-production/web:dev .
 	docker build -f deploy/docker/Dockerfile --target sync-worker -t sqlite-production/sync-worker:dev .
 	docker build -f deploy/docker/litestream.Dockerfile -t sqlite-production/litestream:dev .
+
+loadtest-image: ## Build the web image with the Postgres backend (:lt), for the load-test comparison
+	docker build -f deploy/docker/Dockerfile --target web --build-arg WEB_FEATURES=postgres -t sqlite-production/web:lt .
 
 up: images ## Start Postgres, Garage, Prometheus and nodes 1-3 (ports 4001-4003)
 	scripts/cluster.sh up

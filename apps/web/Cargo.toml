@@ -12,6 +12,11 @@ path = "src/lib.rs"
 name = "library-web"
 path = "src/main.rs"
 
+[features]
+# Postgres backend for the load-test comparison only; off by default so the
+# default web binary has no Postgres driver (spec §4).
+postgres = ["sqlx/postgres"]
+
 [dependencies]
 library-shared.workspace = true
 sqlite-setup.workspace = true

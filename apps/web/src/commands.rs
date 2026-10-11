@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 
-use crate::auth::{AuthService, SqliteAuthRepository};
+use crate::auth::AuthService;
 use crate::clock::{Clock, SystemClock};
 use crate::config::Config;
 use crate::db;
 use crate::error::AppError;
 use crate::seed::{self, SeedReport};
+use crate::state::auth_repository;
 use sqlite_setup::CheckReport;
 use sqlx::SqlitePool;
 
@@ -31,16 +32,16 @@ pub async fn create_user(
         prompt_password()?
     };
 
-    let pool = db::connect(&config).await?;
-    db::migrate(&pool).await?;
+    let database = db::connect(&config).await?;
+    db::migrate(&database).await?;
     let auth = AuthService::new(
-        Arc::new(SqliteAuthRepository::new(pool.clone())),
+        auth_repository(&database),
         Arc::new(SystemClock),
         chrono::Duration::hours(config.session_ttl_hours),
     );
 
     let result = auth.create_user(username, &password).await;
-    pool.close().await;
+    database.close().await;
     // `AppError`'s message is user-facing for validation and conflict errors.
     let user = result.map_err(|err| describe(&err))?;
     println!("Created user `{}` (id {})", user.username, user.id);
@@ -49,10 +50,12 @@ pub async fn create_user(
 
 /// `seed`: fill an empty database with sample books, members and loans.
 pub async fn seed(config: Config) -> anyhow::Result<()> {
-    let pool = db::connect(&config).await?;
-    db::migrate(&pool).await?;
-    let result = seed::seed(&pool, SystemClock.now()).await;
-    pool.close().await;
+    let database = db::connect(&config).await?;
+    // Checked before migrating, so a refused command leaves a Postgres database untouched.
+    let pool = database.require_sqlite("seed")?;
+    db::migrate(&database).await?;
+    let result = seed::seed(pool, SystemClock.now()).await;
+    database.close().await;
     match result? {
         SeedReport::Seeded {
             books,
@@ -119,6 +122,9 @@ pub fn render(database_url: &str, inspection: &DbInspection) -> String {
 /// counts (spec §5 S15). It never creates or migrates the database, because it
 /// is used on restored copies, which must be inspected exactly as they are.
 pub async fn check_db(config: Config) -> anyhow::Result<()> {
+    if db::is_postgres_url(&config.database_url) {
+        bail!("`check-db` supports only SQLite, not Postgres");
+    }
     let pool = sqlite_setup::open_pool(&config.database_url, 1, false).await?;
     let inspection = inspect(&pool).await;
     pool.close().await;

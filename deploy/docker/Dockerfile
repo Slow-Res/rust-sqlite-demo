@@ -25,11 +25,14 @@ COPY crates/ crates/
 COPY apps/web/ apps/web/
 COPY apps/sync-worker/ apps/sync-worker/
 COPY migrations/ migrations/
+# Empty by default. The load-test image passes `postgres` (make loadtest-image).
+ARG WEB_FEATURES=""
 # Two separate builds on purpose: built alone, library-web gets only its own
-# SQLx features, so the web binary contains no Postgres driver (spec §4).
+# SQLx features, so the web binary contains no Postgres driver (spec §4),
+# unless WEB_FEATURES asks for the load-test backend.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked -p library-web \
+    cargo build --release --locked -p library-web ${WEB_FEATURES:+--features "$WEB_FEATURES"} \
     && cargo build --release --locked -p sync-worker \
     && mkdir /out \
     && cp target/release/library-web target/release/sync-worker /out/
