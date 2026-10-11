@@ -51,14 +51,16 @@ A new book, from the browser to Postgres.
 | 4 | The transaction commits. The response is sent. Nothing so far waited for the network. | |
 | 5 | Litestream uploads the new WAL pages to S3, within about 1 s. | [litestream.yml](../deploy/docker/litestream/litestream.yml) |
 | 6 | The worker reads the next batch of up to `BATCH_SIZE` log rows and the rows' current values. It polls every 200 ms while busy and backs off to 2 s while idle. | [read_batch](../apps/sync-worker/src/changes.rs#L99), [next_poll](../apps/sync-worker/src/run.rs#L53) |
-| 7 | One Postgres transaction applies the batch (one insert-or-update and one delete statement per table) and moves the checkpoint. | [apply_batch](../apps/sync-worker/src/mirror.rs#L79) |
+| 7 | One Postgres transaction applies the batch (one insert-or-update and one delete statement per table) and moves the checkpoint. | [apply_batch](../apps/sync-worker/src/mirror.rs#L102) |
 | 8 | The worker deletes log rows below the new checkpoint. The row at the checkpoint stays, because the next cycle checks it. | [prune](../apps/sync-worker/src/changes.rs#L303) |
 
 Why nothing is lost or repeated:
 
 - Postgres data and the checkpoint commit together, so they cannot disagree.
 - If the worker dies after the Postgres commit and before the prune, the next cycle
-  starts from the saved checkpoint and the prune catches up.
+  starts from the saved checkpoint and the prune catches up. If the prune itself
+  fails after a commit, the outcome stands and the failure is counted in
+  `sync_errors_total` (the shipped rows stay in the log until a later prune).
 - Upserts and deletes by `(node_id, id)` give the same result when repeated. Current
   values are shipped, so a replay cannot put an old value back.
 - The worker never skips a change. A batch it cannot apply fails and is retried.
@@ -70,6 +72,18 @@ Why nothing is lost or repeated:
 | Lost disk | About 1 s of writes (Litestream's interval). |
 | Postgres | It never loses what the node still has. After a node is restored from an older backup, Postgres follows the node and keeps the rest in `sync_archive`. |
 | App during an outage | It keeps working when Postgres or S3 is down. Nothing in a request waits for either. |
+
+One gap exists. When a batch is full (the node had more than `BATCH_SIZE`
+changes waiting), the worker ships the rows' *current* values, read in one
+transaction, and those can be newer than the batch's last change
+([read_batch](../apps/sync-worker/src/changes.rs#L99) reads the rows after the
+changes). The checkpoint still points at the batch's last `seq`. If the node is then
+restored to a point between the two, that checkpoint row is still there with the same
+token, so the check passes and there is no resync. Postgres keeps the newer values
+the node lost, until those rows change again. The gap is bounded by the Litestream
+window (what the backup had not yet uploaded), and only happens with a backlog larger
+than `BATCH_SIZE`. A partial batch has no such gap, because it covers every change
+up to the moment it was read.
 
 What Postgres is: a readable copy of each branch's books, members and loans, for
 reports and last-resort recovery.
@@ -93,11 +107,11 @@ notes.
 | S6 | Write transactions that read then write start with `BEGIN IMMEDIATE`. | [books](../apps/web/src/books/sqlite.rs#L205), [loans](../apps/web/src/loans/sqlite.rs#L158), [members](../apps/web/src/members/sqlite.rs#L170) |
 | S7 | Write transactions are short and never wait on the network. | A code review rule. |
 | S8 | Every pragma is applied to every connection, by the pool's connect options. | [test](../crates/sqlite/src/lib.rs#L122) opens two connections and checks both. |
-| S9 | Only `library-web` runs SQLite migrations. They are forward-only and never edited after merge. | [migrate](../apps/web/src/db.rs#L18); the worker only [embeds](../apps/sync-worker/src/lib.rs#L21) them to check. |
+| S9 | Only `library-web` runs SQLite migrations. They are forward-only and never edited after merge. | [migrate](../apps/web/src/db.rs#L20); the worker only [embeds](../apps/sync-worker/src/lib.rs#L21) them to check. |
 | S10 | Schema changes are expand then contract. | [Decision 0003](decisions/0003-expand-and-contract-migrations.md) |
 | S11 | A change to a synced table needs a matching Postgres migration in the same change. | [contract test](../apps/sync-worker/tests/contract.rs#L28) |
 | S12 | Never copy a live database with `cp`; use `litestream restore` or `VACUUM INTO`. Never delete `library.db` without its `-wal` and `-shm` files. | RUNBOOK; the [restore gate](../deploy/docker/litestream/restore.sh#L26) refuses leftover files. |
-| S13 | One Litestream per database, and a unique `NODE_ID` per node. | The gate [validates](../deploy/docker/litestream/restore.sh#L13) `NODE_ID`; the worker's [lock](../apps/sync-worker/src/mirror.rs#L55) detects a duplicate. |
+| S13 | One Litestream per database, and a unique `NODE_ID` per node. | The gate [validates](../deploy/docker/litestream/restore.sh#L13) `NODE_ID`; the worker's [lock](../apps/sync-worker/src/mirror.rs#L78) detects a duplicate. |
 | S14 | Backups are tested by restoring them. | [restore-drill.sh](../scripts/restore-drill.sh) and the [e2e test](../scripts/e2e.sh#L125) |
 | S15 | The database is checked after every restore and on demand. | The gate's [`-integrity-check quick`](../deploy/docker/litestream/restore.sh#L37); [`library-web check-db`](../apps/web/src/commands.rs#L121). |
 | S16 | Checkpointing stays at SQLite's default (every 1000 pages). | A note, below. |
@@ -131,14 +145,14 @@ cycle the worker looks for that `seq` in the log and compares the token
 | Postgres itself restored to an older point | Missing | Full copy |
 | New Postgres with no checkpoint | n/a | Full copy (first sync) |
 
-A full copy is also called a resync ([full_copy](../apps/sync-worker/src/sync.rs#L110)).
+A full copy is also called a resync ([full_copy](../apps/sync-worker/src/sync.rs#L120)).
 In one Postgres transaction it:
 
 1. copies the node's current mirror rows into `sync_archive`, tagged with the old
    epoch;
 2. deletes them from the mirror;
 3. inserts the node's current rows, in chunks of 1000
-   ([COPY_CHUNK](../apps/sync-worker/src/mirror.rs#L16));
+   ([COPY_CHUNK](../apps/sync-worker/src/mirror.rs#L18));
 4. moves the checkpoint to `epoch + 1`, the newest log `seq` and its token.
 
 Anyone reading Postgres sees the old copy or the new one, never a mix. Each resync is
@@ -199,8 +213,41 @@ deletes a conflicting row, SQLite fires the DELETE trigger only if
 and the row would stay in Postgres for ever. `INSERT ... ON CONFLICT DO UPDATE` is
 fine, because it fires the UPDATE trigger.
 
+## Adding a column to a synced table
+
+The worker reads a changed row's current values by id, with the column list from
+[TABLES](../apps/sync-worker/src/tables.rs#L63)
+([read_rows](../apps/sync-worker/src/changes.rs#L211)). Rows are not stored in the
+change log, so the column list is the only thing that decides what is shipped.
+Four things ship in one release:
+
+1. The SQLite migration adds the column with a `DEFAULT`.
+2. The Postgres migration adds the same column with the same `DEFAULT`, so rows
+   Postgres already has match what SQLite holds for them.
+3. `tables.rs` lists the column.
+4. The web code that uses it (and, as always, expand before contract: see
+   [decision 0003](decisions/0003-expand-and-contract-migrations.md)).
+
+If `tables.rs` names a column that SQLite does not have yet, the `SELECT` fails, the
+cycle fails and is retried, and the checkpoint does not move: nothing is skipped. The
+new worker also waits until `library-web` has applied every SQLite migration it knows
+([schema.rs](../apps/sync-worker/src/schema.rs#L12)), so this only shows up if the
+schema really is missing.
+
+On deploy, stop `sync-worker` **before** the new web image migrates SQLite (RUNBOOK,
+"Deploy a new version"). Otherwise the old worker keeps running against the new
+schema: it ships and prunes changes with its old column list, so the rows reach
+Postgres without the new column, and the log rows that would say they changed are
+gone. After the new worker starts it ships current row values, the new column
+included, for every row that changes from then on. Rows that never change keep the
+Postgres `DEFAULT`, which is why the two defaults must match.
+
+Future work: a manual resync command, to re-copy a node on demand after a change like
+this.
+
 ## Future work
 
+- A manual resync command, to re-copy one node on demand.
 - A chunked full copy, for databases too large to read in one transaction.
 - A history table in Postgres. It needs the trigger to store the row's values in the
   log.

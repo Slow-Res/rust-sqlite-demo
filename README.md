@@ -114,7 +114,8 @@ only on an idle node; the e2e test uses it after waiting for the upload. See the
 | Prometheus on the host | `127.0.0.1:9090` |
 
 `node.yml` never publishes the metrics ports (9090 and 9100); Prometheus reaches them
-over the Docker network. The end-to-end test uses its own ports (web 4101-4103,
+over the Docker network. On a real VM, add `-f node.metrics.yml` to publish them on the
+VM's private address (RUNBOOK, "Add a node"). The end-to-end test uses its own ports (web 4101-4103,
 Postgres 5434, Prometheus 9091), so it can run next to `make up`.
 
 ## Read next

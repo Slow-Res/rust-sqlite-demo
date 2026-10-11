@@ -45,7 +45,7 @@ Two things are always true:
    `POSTGRES_URL` and the image names.
 3. Set `ALLOW_FRESH_DB=true` in `node.env`. A node with an empty disk and no backup
    refuses to start otherwise (see [Database file missing](#database-file-missing-but-its-wal-is-still-there)).
-4. Start it:
+4. Start it (step 7 adds the metrics file):
 
    ```bash
    docker compose -p <node> -f node.yml --env-file node.env up -d
@@ -60,9 +60,20 @@ Two things are always true:
 6. Set `ALLOW_FRESH_DB=false` in `node.env` and run the `up -d` command again.
    Leaving it `true` would let a later start with a wrong bucket or a mistyped
    `NODE_ID` come up empty and start a new backup.
-7. Add the node's Litestream (port 9090) and worker (port 9100) addresses to
-   [prometheus.yml](../deploy/monitoring/prometheus.yml). Keep those ports off the
-   internet.
+7. Make the node's metrics reachable by Prometheus. `node.yml` publishes no
+   ports, so on a VM also copy [node.metrics.yml](../deploy/compose/node.metrics.yml),
+   set `METRICS_BIND_ADDR` in `node.env` to the VM's private address, and start the
+   node with both files:
+
+   ```bash
+   docker compose -p <node> -f node.yml -f node.metrics.yml --env-file node.env up -d
+   ```
+
+   Then add `<METRICS_BIND_ADDR>:9090` (Litestream) and `<METRICS_BIND_ADDR>:9100`
+   (worker) to [prometheus.yml](../deploy/monitoring/prometheus.yml). These ports
+   have no authentication: they must be reachable only from Prometheus (a firewall
+   rule or a private network), never from the internet. Use the same two `-f` files
+   for every later `compose` command on that node.
 
 If the first start fails (for example S3 is not reachable yet):
 
@@ -98,11 +109,22 @@ docker compose -p <node> -f node.yml --env-file node.env exec sync-worker sync-w
 
 1. Build or pull the new images and set their tags in `node.env`
    (`WEB_IMAGE`, `WORKER_IMAGE`, `LITESTREAM_IMAGE`).
-2. Do one node at a time. On that node:
+2. Do one node at a time. If the release changes the columns of a synced table
+   (see [Adding a column to a synced table](ARCHITECTURE.md#adding-a-column-to-a-synced-table)),
+   first stop the worker, so the old worker cannot ship rows without the new column:
+
+   ```bash
+   docker compose -p <node> -f node.yml --env-file node.env stop sync-worker
+   ```
+
+   Then, on that node:
 
    ```bash
    docker compose -p <node> -f node.yml --env-file node.env up -d
    ```
+
+   The web container migrates SQLite as it starts, and `up -d` starts the new worker
+   after it, which ships current row values including the new column.
 
    Compose recreates only the containers whose image changed. Expect about 1-2 s of
    downtime for that node's users.
@@ -120,6 +142,9 @@ Migration rules (full reasoning in [decision 0003](decisions/0003-expand-and-con
 - Expand, then contract. Add the new column in one release. Use it in the next.
   Remove the old one in a later release. The previous version must still work on the
   new schema, so rolling back is deploying the old image.
+- Both migrators accept a database that has applied a migration they do not know
+  (`ignore_missing`), so the previous image still starts after a newer release ran
+  an expand migration. That is what makes rolling back an image deploy.
 - `library-web` runs the SQLite migrations when it starts. The worker waits and logs
   `waiting for library-web to apply the SQLite migrations` until they are all there.
 - The worker runs the Postgres migrations when it connects. Another node's older
@@ -224,12 +249,14 @@ was restored from an older backup, or Postgres was restored. The worker copied t
 whole node again, bumped the node's epoch, and put the rows Postgres used to have in
 `sync_archive`, tagged with the old epoch.
 
-The alert can miss a resync. `increase(sync_resyncs_total[1h])` needs an earlier
-sample inside its window. A new worker process starts its counter at 0, so if
-Prometheus has no earlier sample of it (for example after a VM was replaced following
-a long outage), the first sample it sees may already be 1 and the alert stays quiet.
-So also compare the `sync_epoch` metric, or the `epoch` line of `sync-worker status`,
-with what you expect. Epoch 1 is the first sync, and every resync adds 1.
+The alert reads the gauge `sync_last_resync_timestamp_seconds`: it is 0 until the
+worker detects a resync, then the unix time of it. `SyncResync` fires while that
+time is less than an hour old, so it does not depend on Prometheus having scraped an
+earlier value. The gauge lives in the worker process: a worker that restarts starts
+at 0 again, so a resync is shown for up to an hour only if the worker stays up. To
+check an older one, compare the `sync_epoch` metric, or the `epoch` line of
+`sync-worker status`, with what you expect. Epoch 1 is the first sync, and every
+resync adds 1.
 
 **Steps**
 
@@ -318,18 +345,20 @@ does not start, which is the safe outcome.
 
 How `LitestreamStalled` works (see [alerts.yml](../deploy/monitoring/alerts.yml)):
 
-- It fires when `litestream_txid` changes more than once in 5 minutes while the
-  node's `litestream_replica_operation_total{operation="PUT"}` does not increase.
-- It also fires when no PUT series exists yet, for example when Litestream restarted
-  during the outage. This branch also needs `litestream_txid` to change more than once
-  in 5 minutes.
-- Either branch must hold for 5 minutes (`for: 5m`) before the alert fires, so
-  expect it up to about 10 minutes after the uploads stop.
+- It fires when `litestream_txid` changed at least once in the last 30 minutes and
+  the node had no successful upload in those 30 minutes: either
+  `increase(litestream_replica_operation_total{operation="PUT"}[30m])` is 0, or no
+  PUT series exists yet (for example Litestream restarted during the outage).
+- Windows that contain Litestream's start-up jump of `litestream_txid` (from 0 to
+  the current value) are ignored, so a node that has only just started and had no
+  writes does not alert. A node that restarts during an outage can therefore take up
+  to 30 minutes longer to alert.
+- It must hold for 5 minutes (`for: 5m`), so expect the alert about 35 minutes
+  after the last upload, a quiet node with a single write included.
 - A live test showed that the PUT counter counts only successful uploads, and that
   `litestream_sync_error_count` stays 0 during an S3 outage, so that error counter is
   not a usable signal.
-- Limitation: a node that writes fewer than two times in 5 minutes does not alert
-  until writes pick up.
+- `make alerts-test` runs the rule's test cases (`promtool`).
 
 **Steps**
 
@@ -342,7 +371,7 @@ How `LitestreamStalled` works (see [alerts.yml](../deploy/monitoring/alerts.yml)
 
 **Check it worked**
 
-- In Prometheus, `increase(litestream_replica_operation_total{operation="PUT"}[5m])`
+- In Prometheus, `increase(litestream_replica_operation_total{operation="PUT"}[30m])`
   is above 0 for the node, and the alert clears.
 - [Run the restore drill](#run-the-restore-drill) for the node. It proves the new
   backup restores.

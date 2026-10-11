@@ -16,7 +16,7 @@ the `seq` and `token` of the last row shipped. At the start of every cycle the w
 checks that the log still has a row with that `seq` and the same token
 ([checkpoint_is_valid](../../apps/sync-worker/src/changes.rs#L167)). If not, the node
 was restored, and the worker does a full copy
-([replace_all](../../apps/sync-worker/src/mirror.rs#L102)):
+([replace_all](../../apps/sync-worker/src/mirror.rs#L125)):
 
 - Rows Postgres had for the node go to `sync_archive`, tagged with the old epoch.
 - The node's mirror rows are replaced by the current snapshot.
