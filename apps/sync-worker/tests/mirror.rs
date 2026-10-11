@@ -335,3 +335,85 @@ async fn a_full_copy_of_an_empty_node_sits_at_zero() {
     m.close().await;
     pg.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_failed_batch_rolls_back_every_table_and_the_checkpoint() {
+    let pg = TestPg::new().await;
+    let mut m = connect_mirror(&pg, "node1").await;
+    m.apply_batch(
+        &batch(3, vec![books_changes(vec![book(1, "a")], vec![])]),
+        1,
+    )
+    .await
+    .unwrap();
+    // Books come first and apply fine; the loan has no book_id, which
+    // Postgres refuses (NOT NULL), so the whole batch must be undone.
+    let bad_loan = vec![
+        Value::Int(1),
+        Value::Null,
+        Value::Int(1),
+        Value::Int(0),
+        Value::Int(100),
+        Value::Null,
+    ];
+    let failing = batch(
+        9,
+        vec![
+            books_changes(vec![book(1, "changed"), book(2, "new")], vec![]),
+            TableChanges {
+                table: loans(),
+                upserts: vec![bad_loan],
+                deletes: vec![],
+            },
+        ],
+    );
+    assert!(m.apply_batch(&failing, 1).await.is_err());
+    assert_eq!(m.read_all(books()).await.unwrap(), vec![book(1, "a")]);
+    assert!(m.read_all(loans()).await.unwrap().is_empty());
+    assert_eq!(
+        m.load_checkpoint().await.unwrap(),
+        Some(Checkpoint {
+            epoch: 1,
+            last_seq: 3,
+            last_token: Some(vec![3; 8])
+        })
+    );
+    m.close().await;
+    pg.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_database_with_a_newer_unknown_migration_still_connects() {
+    let pg = TestPg::new().await;
+    let first = Mirror::connect(&pg.options, "node1").await.unwrap();
+    first.close().await;
+    // What an older worker sees after a newer release ran an expand migration.
+    let mut conn = pg.connect().await;
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (99991231000000, 'from a newer release', true, '\\x00', 0)",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    drop(conn);
+    connect_mirror(&pg, "node1").await.close().await;
+    pg.cleanup().await;
+}
+
+#[tokio::test]
+async fn sessions_carry_a_statement_timeout() {
+    use sqlx::Connection;
+    let pg = TestPg::new().await;
+    let options = sync_worker::mirror::session_options(&pg.options);
+    assert_eq!(options.get_options(), Some("-c statement_timeout=60s"));
+    // The server really applies it.
+    let mut conn = sqlx::PgConnection::connect_with(&options).await.unwrap();
+    let shown: String = sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(shown, "1min");
+    conn.close().await.ok();
+    pg.cleanup().await;
+}

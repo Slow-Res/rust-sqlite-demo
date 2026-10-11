@@ -240,3 +240,37 @@ async fn backlog_gauges_stay_current_while_postgres_is_unreachable() {
     stop(task, token).await;
     pg.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_failed_prune_counts_as_a_sync_error_but_the_row_ships() {
+    let (db, pg) = (TestSqlite::new().await, TestPg::new().await);
+    let (task, metrics, token) = start(config(&db.url, &pg));
+    while metrics.last_success_seconds.get() == 0.0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sqlx::query(
+        "CREATE TRIGGER block_prune BEFORE DELETE ON change_log \
+         BEGIN SELECT RAISE(ABORT, 'prune blocked'); END",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // Pruning keeps the checkpoint row itself, so it only has something to
+    // delete once a second change has been shipped.
+    insert_book(&db.pool, "first").await;
+    insert_book(&db.pool, "unpruned").await;
+    wait_for_title(&pg, "unpruned").await;
+    for _ in 0..200 {
+        if metrics.errors.get() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop(task, token).await;
+    assert!(
+        metrics.errors.get() >= 1,
+        "the failed prune was not counted"
+    );
+    assert_eq!(metrics.rows_shipped.get(), 2, "the outcome stands");
+    pg.cleanup().await;
+}

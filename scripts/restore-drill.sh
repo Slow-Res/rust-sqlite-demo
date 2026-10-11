@@ -24,13 +24,17 @@ volume="${PREFIX}drill-${node}-$$"
 
 # The scratch volume is mounted at /data, whose owner in the images (uid
 # 10001) is copied into a new volume, so the restore can write there.
-trap 'docker volume rm -f "$volume" >/dev/null || true' EXIT
+# Only NODE_ID and the LITESTREAM_* settings go to the Litestream container;
+# the env file also holds POSTGRES_URL, which that container must never see.
+litestream_env=$(mktemp)
+trap 'docker volume rm -f "$volume" >/dev/null || true; rm -f "$litestream_env"' EXIT
+grep -E '^(NODE_ID|LITESTREAM_[A-Z_]+)=' "$env_file" >"$litestream_env" || true
 docker volume create "$volume" >/dev/null
 net=()
 if docker network inspect "$NETWORK" >/dev/null 2>&1; then net=(--network "$NETWORK"); fi
 
 echo "== restoring the newest backup of $node into a scratch volume"
-docker run --rm --env-file "$env_file" -e NODE_ID="$node" "${net[@]}" -v "$volume:/data" \
+docker run --rm --env-file "$litestream_env" -e NODE_ID="$node" "${net[@]}" -v "$volume:/data" \
   --entrypoint litestream "$LITESTREAM_IMAGE" \
   restore -config /etc/litestream.yml -integrity-check full /data/library.db
 

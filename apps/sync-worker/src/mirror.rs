@@ -5,6 +5,8 @@
 //! connection drops, Postgres releases the lock *and* our writes fail, so a
 //! worker can never write without holding the lock.
 
+use std::time::Duration;
+
 use anyhow::Context;
 use sqlx::postgres::{PgConnectOptions, PgRow};
 use sqlx::{AssertSqlSafe, Connection, PgConnection, Postgres, Row as _, Transaction};
@@ -14,6 +16,29 @@ use crate::tables::{self, Kind, Row, Table, Value};
 
 /// Rows per INSERT during a full copy.
 const COPY_CHUNK: usize = 1000;
+
+/// Without these, a half-open connection (a dead network path) would hang a
+/// cycle until the OS gives up, about 15 minutes.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const STATEMENT_TIMEOUT: &str = "60s";
+
+/// `options` plus the server-side statement timeout every worker session uses.
+pub fn session_options(options: &PgConnectOptions) -> PgConnectOptions {
+    options
+        .clone()
+        .options([("statement_timeout", STATEMENT_TIMEOUT)])
+}
+
+/// Connect with the session options, giving up after [`CONNECT_TIMEOUT`].
+pub async fn connect_with_timeouts(options: &PgConnectOptions) -> anyhow::Result<PgConnection> {
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        PgConnection::connect_with(&session_options(options)),
+    )
+    .await
+    .context("timed out connecting to Postgres")?
+    .context("connecting to Postgres")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
@@ -43,9 +68,7 @@ pub struct Mirror {
 impl Mirror {
     /// Connect, run the Postgres migrations, and take the node's lock.
     pub async fn connect(options: &PgConnectOptions, node_id: &str) -> Result<Self, ConnectError> {
-        let mut conn = PgConnection::connect_with(options)
-            .await
-            .context("connecting to Postgres")?;
+        let mut conn = connect_with_timeouts(options).await?;
         // run_direct, not run: `run` goes through `Acquire`, which makes the
         // worker's future fail the `Send` check when it is `tokio::spawn`ed.
         crate::POSTGRES_MIGRATIONS

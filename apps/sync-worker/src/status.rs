@@ -1,7 +1,6 @@
 //! `sync-worker status`: where this node's copy in Postgres stands (RUNBOOK).
 
-use anyhow::Context;
-use sqlx::{Connection, PgConnection};
+use sqlx::Connection;
 
 use crate::changes::{self, Checkpoint, Pending};
 use crate::config::Config;
@@ -10,9 +9,7 @@ use crate::mirror;
 
 pub async fn status(config: &Config) -> anyhow::Result<String> {
     let sqlite = sqlite_setup::open_pool(&config.database_url, 1, false).await?;
-    let mut conn = PgConnection::connect_with(&config.postgres)
-        .await
-        .context("connecting to Postgres")?;
+    let mut conn = mirror::connect_with_timeouts(&config.postgres).await?;
     let checkpoint = mirror::load_checkpoint(&mut conn, &config.node_id).await;
     conn.close().await.ok();
     let text = match checkpoint? {

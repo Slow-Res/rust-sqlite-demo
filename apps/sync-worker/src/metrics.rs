@@ -13,6 +13,8 @@ pub struct Metrics {
     pub pending_changes: Gauge,
     pub lag_seconds: Gauge<f64, AtomicU64>,
     pub last_success_seconds: Gauge<f64, AtomicU64>,
+    /// 0 until a resync happens; then the unix time it was detected.
+    pub last_resync_seconds: Gauge<f64, AtomicU64>,
     pub epoch: Gauge,
     // Counters get `_total` appended to their names when exposed.
     pub batches: Counter,
@@ -34,6 +36,7 @@ impl Metrics {
             pending_changes: Gauge::default(),
             lag_seconds: Gauge::default(),
             last_success_seconds: Gauge::default(),
+            last_resync_seconds: Gauge::default(),
             epoch: Gauge::default(),
             batches: Counter::default(),
             rows_shipped: Counter::default(),
@@ -55,6 +58,11 @@ impl Metrics {
             "sync_last_success_timestamp_seconds",
             "Unix time of the last successful sync cycle",
             metrics.last_success_seconds.clone(),
+        );
+        registry.register(
+            "sync_last_resync_timestamp_seconds",
+            "Unix time the last resync was detected (0 if none since start)",
+            metrics.last_resync_seconds.clone(),
         );
         registry.register(
             "sync_epoch",
@@ -135,6 +143,7 @@ mod tests {
             "sync_pending_changes",
             "sync_lag_seconds",
             "sync_last_success_timestamp_seconds",
+            "sync_last_resync_timestamp_seconds",
             "sync_epoch",
             "sync_batches_total",
             "sync_rows_shipped_total",

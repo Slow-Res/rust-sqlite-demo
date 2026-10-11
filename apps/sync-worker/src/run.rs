@@ -147,6 +147,8 @@ async fn session(
         }
         let outcome = syncer.cycle().await.map_err(SessionError::Failed)?;
         record_outcome(metrics, &outcome, syncer.checkpoint());
+        // A failed prune leaves shipped rows in the log that no gauge counts.
+        metrics.errors.inc_by(syncer.take_prune_failures());
         if let Some(checkpoint) = syncer.checkpoint() {
             *known_seq = checkpoint.last_seq;
         }
@@ -169,6 +171,7 @@ fn record_outcome(metrics: &Metrics, outcome: &Outcome, checkpoint: Option<&Chec
             metrics.rows_shipped.inc_by(*copied);
             if *resync {
                 metrics.resyncs.inc();
+                metrics.last_resync_seconds.set(now_secs());
             }
         }
         Outcome::Idle => {}
@@ -285,8 +288,14 @@ mod tests {
             (m.resyncs.get(), m.epoch.get(), m.rows_shipped.get()),
             (0, 2, 4)
         );
+        assert_eq!(m.last_resync_seconds.get(), 0.0, "no resync yet");
         record_outcome(&m, &copied(true), Some(&checkpoint));
         assert_eq!((m.resyncs.get(), m.rows_shipped.get()), (1, 8));
+        let at = m.last_resync_seconds.get();
+        assert!(
+            (now_secs() - at).abs() < 5.0,
+            "set to the current unix time, got {at}"
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub struct Syncer {
     mirror: Mirror,
     batch_size: usize,
     checkpoint: Option<Checkpoint>,
+    prune_failures: u64,
 }
 
 impl Syncer {
@@ -45,12 +46,19 @@ impl Syncer {
             mirror,
             batch_size,
             checkpoint: None,
+            prune_failures: 0,
         }
     }
 
     /// The checkpoint after the last successful cycle.
     pub fn checkpoint(&self) -> Option<&Checkpoint> {
         self.checkpoint.as_ref()
+    }
+
+    /// Prunes that failed after their batch committed, since the last call.
+    /// The caller counts them in `sync_errors_total`.
+    pub fn take_prune_failures(&mut self) -> u64 {
+        std::mem::take(&mut self.prune_failures)
     }
 
     /// Hand back the Postgres side, e.g. to close it.
@@ -92,11 +100,13 @@ impl Syncer {
         }
     }
 
-    /// Prune after Postgres has committed. A failure is only logged: the
-    /// outcome is already decided, and the next successful cycle prunes the
-    /// rows this one missed.
-    async fn prune_after_commit(&self, below_seq: i64) {
+    /// Prune after Postgres has committed. A failure is logged and counted
+    /// (see `take_prune_failures`) but does not change the outcome, which is
+    /// already decided; the next successful cycle prunes the rows this one
+    /// missed.
+    async fn prune_after_commit(&mut self, below_seq: i64) {
         if let Err(err) = changes::prune(&self.sqlite, below_seq).await {
+            self.prune_failures += 1;
             tracing::warn!(
                 node = self.mirror.node_id(),
                 error = format!("{err:#}"),
@@ -125,6 +135,18 @@ impl Syncer {
                 copied = report.copied,
                 "the checkpoint did not match this database (restored from an older backup?); \
                  copied the whole node and archived the rows Postgres had"
+            );
+        } else if report.archived > 0 {
+            // A first copy has nothing to archive unless Postgres already
+            // held rows for this node, e.g. its checkpoint row was lost.
+            tracing::warn!(
+                node = self.mirror.node_id(),
+                epoch = report.epoch,
+                archived = report.archived,
+                copied = report.copied,
+                "first sync for this node found {} rows already in Postgres with no checkpoint; \
+                 archived them and copied every row",
+                report.archived
             );
         } else {
             tracing::info!(

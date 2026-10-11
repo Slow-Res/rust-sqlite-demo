@@ -396,3 +396,34 @@ async fn an_unknown_table_stops_the_cycle_without_moving_the_checkpoint() {
     s.into_mirror().close().await;
     pg.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_failed_prune_keeps_the_outcome_and_is_counted() {
+    let (db, pg) = (TestSqlite::new().await, TestPg::new().await);
+    let mut s = syncer(&db.pool, &pg, 500).await;
+    s.cycle().await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER block_prune BEFORE DELETE ON change_log \
+         BEGIN SELECT RAISE(ABORT, 'prune blocked'); END",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // Pruning keeps the checkpoint row itself, so two changes are needed
+    // for it to have anything to delete.
+    insert_book(&db.pool, "a").await;
+    insert_book(&db.pool, "b").await;
+    assert_eq!(
+        s.cycle().await.unwrap(),
+        Outcome::Shipped {
+            changes: 2,
+            rows: 2,
+            full: false
+        }
+    );
+    assert_eq!(s.take_prune_failures(), 1);
+    assert_eq!(s.take_prune_failures(), 0, "reading resets the count");
+    assert_in_sync(&db.pool, &pg, NODE).await;
+    s.into_mirror().close().await;
+    pg.cleanup().await;
+}

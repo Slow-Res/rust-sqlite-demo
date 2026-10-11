@@ -15,8 +15,12 @@ pub async fn connect(config: &Config) -> anyhow::Result<SqlitePool> {
 }
 
 /// Apply the migrations embedded in the binary at compile time.
+/// `ignore_missing`: the previous version must keep running after an expand
+/// migration (spec S10).
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
-    sqlx::migrate!("../../migrations/sqlite").run(pool).await?;
+    let mut migrator = sqlx::migrate!("../../migrations/sqlite");
+    migrator.set_ignore_missing(true);
+    migrator.run(pool).await?;
     Ok(())
 }
 

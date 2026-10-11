@@ -21,5 +21,9 @@ pub mod telemetry;
 pub static SQLITE_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/sqlite");
 
 /// The Postgres migrations. The worker runs these when it connects.
-pub static POSTGRES_MIGRATIONS: sqlx::migrate::Migrator =
-    sqlx::migrate!("../../migrations/postgres");
+/// `ignore_missing`: the previous version must keep running after an expand
+/// migration (spec S10).
+pub static POSTGRES_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate::Migrator {
+    ignore_missing: true,
+    ..sqlx::migrate!("../../migrations/postgres")
+};

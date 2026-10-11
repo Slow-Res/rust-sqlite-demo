@@ -61,3 +61,53 @@ async fn a_missing_file_is_an_error_and_is_not_created() {
     assert!(commands::check_db(config).await.is_err());
     assert!(!path.exists(), "check-db must never create a database");
 }
+
+#[tokio::test]
+async fn a_corrupted_file_fails_the_check() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt.db");
+    let config = Config {
+        database_url: format!("sqlite://{}", path.display()),
+        ..common::test_config()
+    };
+    let pool = library_web::db::connect(&config).await.unwrap();
+    library_web::db::migrate(&pool).await.unwrap();
+    for i in 0..300 {
+        sqlx::query(
+            "INSERT INTO books (title, author, total_copies, created_at, updated_at) \
+             VALUES (?, 'Author', 1, 0, 0)",
+        )
+        .bind(format!("book {i} {}", "x".repeat(100)))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    // Closing the last connection folds the WAL into the main file.
+    pool.close().await;
+    let len = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        len >= 8 * 4096,
+        "the file needs several pages, has {len} bytes"
+    );
+
+    // Overwrite a whole page in the middle, leaving the header and schema intact.
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(3 * 4096)).unwrap();
+    file.write_all(&[0xAB; 4096]).unwrap();
+    drop(file);
+
+    // The check itself reports a problem...
+    let pool = sqlite_setup::open_pool(&config.database_url, 1, false)
+        .await
+        .unwrap();
+    let report = sqlite_setup::check(&pool).await;
+    assert!(
+        report.map_or(true, |r| !r.is_ok()),
+        "integrity_check must not pass on a corrupted page"
+    );
+    pool.close().await;
+    // ...and the command exits with an error.
+    assert!(commands::check_db(config).await.is_err());
+}
