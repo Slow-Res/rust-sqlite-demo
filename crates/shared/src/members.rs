@@ -15,6 +15,11 @@ pub struct MemberQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub per_page: Option<u32>,
+    /// Keyset cursor (`next_cursor` of the previous page): the page starts right
+    /// after that item and `page` is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

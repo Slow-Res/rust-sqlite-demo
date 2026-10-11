@@ -5,4 +5,9 @@ import type { Availability } from "./Availability";
  * Query string of `GET /api/books`. Optional fields are skipped when `None`
  * so frontends can serialize this straight into a query string.
  */
-export type BookQuery = { q?: string, availability?: Availability, page?: number, per_page?: number, };
+export type BookQuery = { q?: string, availability?: Availability, page?: number, per_page?: number, 
+/**
+ * Keyset cursor (`next_cursor` of the previous page): the page starts right
+ * after that item and `page` is ignored.
+ */
+after?: string, };

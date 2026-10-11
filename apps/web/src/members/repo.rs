@@ -57,11 +57,14 @@ pub enum DeleteMemberOutcome {
 
 #[async_trait]
 pub trait MemberRepository: Send + Sync {
-    /// One page of matching members plus the total number of matches.
+    /// Up to `page.limit()` (`per_page + 1`) matching members plus the total number
+    /// of matches. With `after` (the `(name, id)` of the last member seen) the rows
+    /// start strictly after it and `page.offset()` is 0.
     async fn list(
         &self,
         filter: &MemberFilter,
         page: PageParams,
+        after: Option<(String, i64)>,
     ) -> Result<(Vec<MemberRecord>, u64), RepoError>;
 
     async fn get(&self, id: i64) -> Result<Option<MemberRecord>, RepoError>;

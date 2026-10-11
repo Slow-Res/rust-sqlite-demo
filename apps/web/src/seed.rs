@@ -120,9 +120,10 @@ pub async fn seed(pool: &SqlitePool, now: DateTime<Utc>) -> anyhow::Result<SeedR
                 availability: Availability::All,
             },
             one,
+            None,
         )
         .await?;
-    let (_, member_count) = members.list(&MemberFilter { q: None }, one).await?;
+    let (_, member_count) = members.list(&MemberFilter { q: None }, one, None).await?;
     if book_count > 0 || member_count > 0 {
         return Ok(SeedReport::Skipped);
     }
@@ -250,13 +251,13 @@ mod tests {
         };
         let page = PageParams::new(None, None);
         let (overdue, _) = loans
-            .list(&filter(LoanStatus::Overdue), now(), page)
+            .list(&filter(LoanStatus::Overdue), now(), page, None)
             .await
             .unwrap();
         assert_eq!(overdue.len(), 1);
         assert_eq!(overdue[0].due_at, now() - Duration::days(6));
         let (active, _) = loans
-            .list(&filter(LoanStatus::Active), now(), page)
+            .list(&filter(LoanStatus::Active), now(), page, None)
             .await
             .unwrap();
         assert_eq!(active.len(), 3);

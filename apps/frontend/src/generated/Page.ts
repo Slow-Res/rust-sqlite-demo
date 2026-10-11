@@ -8,4 +8,10 @@ export type Page<T> = { items: Array<T>, page: number, per_page: number,
  * Number of matching items over all pages. For an unfiltered list it may lag
  * behind a write by up to `LIST_COUNT_TTL_MS` (default 1 s; 0 is exact).
  */
-total: number, };
+total: number, 
+/**
+ * Cursor of the last item when more may follow, else `null`. Pass it as
+ * `after` to get the next page without an `OFFSET` walk. Set for `page`
+ * requests too, so a client can switch to cursors after page 1.
+ */
+next_cursor: string | null, };

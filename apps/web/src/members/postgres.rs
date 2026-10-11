@@ -117,6 +117,7 @@ impl MemberRepository for PostgresMemberRepository {
         &self,
         filter: &MemberFilter,
         page: PageParams,
+        after: Option<(String, i64)>,
     ) -> Result<(Vec<MemberRecord>, u64), RepoError> {
         let total = self
             .counts
@@ -131,6 +132,13 @@ impl MemberRepository for PostgresMemberRepository {
             " FROM (SELECT m.id FROM members m"
         ));
         push_filter(&mut select, filter);
+        if let Some((name, id)) = after {
+            select.push(" AND (m.name, m.id) > (");
+            select.push_bind(name);
+            select.push(", ");
+            select.push_bind(id);
+            select.push(")");
+        }
         select.push(" ORDER BY m.name ASC, m.id ASC LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");

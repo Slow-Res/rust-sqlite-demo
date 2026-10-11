@@ -19,7 +19,7 @@ function renderAt(url: string, body: unknown) {
 
 describe('LoansPage', () => {
   it('marks only the active status tab with aria-current', async () => {
-    renderAt('/loans?status=overdue', { items: [], page: 1, per_page: 20, total: 0 })
+    renderAt('/loans?status=overdue', { items: [], page: 1, per_page: 20, total: 0, next_cursor: null })
     await screen.findByText('No loans found.')
 
     expect(screen.getByRole('button', { name: 'Overdue' })).toHaveAttribute('aria-current', 'page')
@@ -29,7 +29,7 @@ describe('LoansPage', () => {
   })
 
   it('offers a way back to page 1 when the page is out of range', async () => {
-    renderAt('/loans?page=99', { items: [], page: 99, per_page: 20, total: 3 })
+    renderAt('/loans?page=99', { items: [], page: 99, per_page: 20, total: 3, next_cursor: null })
 
     const link = await screen.findByRole('link', { name: 'Go to page 1' })
     expect(link).toHaveAttribute('href', '/loans')

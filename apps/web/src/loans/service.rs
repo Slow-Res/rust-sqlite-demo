@@ -11,8 +11,9 @@ use super::repo::{
 };
 use super::{LOAN_PERIOD_DAYS, MAX_ACTIVE_LOANS_PER_MEMBER};
 use crate::clock::Clock;
+use crate::db::to_timestamp;
 use crate::error::{AppError, FieldErrors};
-use crate::pagination::PageParams;
+use crate::pagination::{PageParams, encode_cursor};
 
 /// The service holds its collaborators as trait objects (`Arc<dyn ...>`):
 /// production passes the SQLite repository and the system clock, the unit
@@ -30,16 +31,26 @@ impl LoanService {
     }
 
     pub async fn list(&self, query: LoanQuery) -> Result<Page<Loan>, AppError> {
-        let page = PageParams::new(query.page, query.per_page);
+        let (page, after) =
+            PageParams::with_after::<i64>(query.page, query.per_page, query.after.as_deref())?;
         let filter = LoanFilter {
             status: query.status.unwrap_or(LoanStatus::Active),
             member_id: query.member_id,
             book_id: query.book_id,
         };
         let now = self.clock.now();
-        let (records, total) = self.repo.list(&filter, now, page).await?;
+        let (records, total) = self.repo.list(&filter, now, page, after).await?;
+        let (records, more) = page.split(records);
+        // The cursor holds the key the list is ordered by (see `LoanRepository::list`).
+        let next_cursor = records.last().filter(|_| more).map(|r| {
+            let key = match filter.status {
+                LoanStatus::Returned => r.returned_at.unwrap_or(r.due_at),
+                _ => r.due_at,
+            };
+            encode_cursor(&to_timestamp(key), r.id)
+        });
         let items = records.into_iter().map(|r| to_loan(r, now)).collect();
-        Ok(page.into_page(items, total))
+        Ok(page.into_page(items, total, next_cursor))
     }
 
     /// Borrow a book. The service owns the *policy* (14-day period, limit of 5);
@@ -170,6 +181,7 @@ mod tests {
             filter: &LoanFilter,
             now: DateTime<Utc>,
             page: PageParams,
+            _after: Option<(i64, i64)>,
         ) -> Result<(Vec<LoanDetails>, u64), RepoError> {
             let matching: Vec<_> = self
                 .lock()

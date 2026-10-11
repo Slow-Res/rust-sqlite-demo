@@ -11,7 +11,7 @@ use super::repo::{BookFilter, BookRepository, DeleteBookOutcome, UpdateBookOutco
 use crate::clock::Clock;
 use crate::db::RepoError;
 use crate::error::AppError;
-use crate::pagination::{PageParams, search_term};
+use crate::pagination::{PageParams, encode_cursor, search_term};
 
 /// The unique index on `books.isbn` shows up as this constraint name.
 const ISBN_CONSTRAINT: &str = "books.isbn";
@@ -28,13 +28,21 @@ impl BookService {
     }
 
     pub async fn list(&self, query: BookQuery) -> Result<Page<Book>, AppError> {
-        let page = PageParams::new(query.page, query.per_page);
+        let (page, after) =
+            PageParams::with_after::<String>(query.page, query.per_page, query.after.as_deref())?;
         let filter = BookFilter {
             q: search_term(query.q)?,
             availability: query.availability.unwrap_or(Availability::All),
         };
-        let (records, total) = self.repo.list(&filter, page).await?;
-        Ok(page.into_page(records.into_iter().map(Book::from).collect(), total))
+        let (records, total) = self.repo.list(&filter, page, after).await?;
+        let (records, more) = page.split(records);
+        let next = records.last().filter(|_| more);
+        let next_cursor = next.map(|b| encode_cursor(&b.title, b.id));
+        Ok(page.into_page(
+            records.into_iter().map(Book::from).collect(),
+            total,
+            next_cursor,
+        ))
     }
 
     pub async fn get(&self, id: i64) -> Result<Book, AppError> {

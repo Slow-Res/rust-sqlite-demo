@@ -15,6 +15,10 @@ pub struct Page<T> {
     /// behind a write by up to `LIST_COUNT_TTL_MS` (default 1 s; 0 is exact).
     #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub total: u64,
+    /// Cursor of the last item when more may follow, else `null`. Pass it as
+    /// `after` to get the next page without an `OFFSET` walk. Set for `page`
+    /// requests too, so a client can switch to cursors after page 1.
+    pub next_cursor: Option<String>,
 }
 
 /// Error envelope returned for every non-2xx JSON response.
@@ -92,6 +96,7 @@ mod tests {
             page: 1,
             per_page: 20,
             total: 2,
+            next_cursor: Some("abc".into()),
         };
         let json = serde_json::to_string(&page).unwrap();
         assert_eq!(serde_json::from_str::<Page<i32>>(&json).unwrap(), page);

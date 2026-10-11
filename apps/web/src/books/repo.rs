@@ -75,11 +75,14 @@ pub enum DeleteBookOutcome {
 
 #[async_trait]
 pub trait BookRepository: Send + Sync {
-    /// One page of matching books plus the total number of matches.
+    /// Up to `page.limit()` (`per_page + 1`) matching books plus the total number
+    /// of matches. With `after` (the `(title, id)` of the last book seen) the rows
+    /// start strictly after it and `page.offset()` is 0.
     async fn list(
         &self,
         filter: &BookFilter,
         page: PageParams,
+        after: Option<(String, i64)>,
     ) -> Result<(Vec<BookRecord>, u64), RepoError>;
 
     async fn get(&self, id: i64) -> Result<Option<BookRecord>, RepoError>;

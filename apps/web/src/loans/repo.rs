@@ -77,13 +77,17 @@ pub enum ReturnLoanOutcome {
 
 #[async_trait]
 pub trait LoanRepository: Send + Sync {
-    /// One page of matching loans plus the total number of matches. `now` is
-    /// only used by the `Overdue` filter (`due_at < now`).
+    /// Up to `page.limit()` (`per_page + 1`) matching loans plus the total number
+    /// of matches. `now` is only used by the `Overdue` filter (`due_at < now`).
+    /// With `after` (the sort key as a timestamp, and the id, of the last loan
+    /// seen) the rows start strictly after it and `page.offset()` is 0. The order
+    /// is `due_at, id`, or `returned_at DESC, id DESC` for `Returned`.
     async fn list(
         &self,
         filter: &LoanFilter,
         now: DateTime<Utc>,
         page: PageParams,
+        after: Option<(i64, i64)>,
     ) -> Result<(Vec<LoanDetails>, u64), RepoError>;
 
     async fn get(&self, id: i64) -> Result<Option<LoanDetails>, RepoError>;

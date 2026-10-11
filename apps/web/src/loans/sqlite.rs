@@ -139,6 +139,7 @@ impl LoanRepository for SqliteLoanRepository {
         filter: &LoanFilter,
         now: DateTime<Utc>,
         page: PageParams,
+        after: Option<(i64, i64)>,
     ) -> Result<(Vec<LoanDetails>, u64), RepoError> {
         let total = self
             .counts
@@ -157,6 +158,17 @@ impl LoanRepository for SqliteLoanRepository {
             "l.borrowed_at, l.due_at, l.returned_at FROM (SELECT l.id FROM loans l"
         ));
         push_filter(&mut select, filter, now);
+        if let Some((key, id)) = after {
+            // Strictly after the cursor in the list's own direction.
+            select.push(match filter.status {
+                LoanStatus::Returned => " AND (l.returned_at, l.id) < (",
+                _ => " AND (l.due_at, l.id) > (",
+            });
+            select.push_bind(key);
+            select.push(", ");
+            select.push_bind(id);
+            select.push(")");
+        }
         select.push(order);
         select.push(" LIMIT ");
         select.push_bind(page.limit());

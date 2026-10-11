@@ -190,6 +190,7 @@ impl BookRepository for SqliteBookRepository {
         &self,
         filter: &BookFilter,
         page: PageParams,
+        after: Option<(String, i64)>,
     ) -> Result<(Vec<BookRecord>, u64), RepoError> {
         let total = self
             .counts
@@ -204,6 +205,13 @@ impl BookRepository for SqliteBookRepository {
             " FROM (SELECT b.id FROM books b"
         ));
         push_filter(&mut select, filter);
+        if let Some((title, id)) = after {
+            select.push(" AND (b.title, b.id) > (");
+            select.push_bind(title);
+            select.push(", ");
+            select.push_bind(id);
+            select.push(")");
+        }
         select.push(" ORDER BY b.title ASC, b.id ASC LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");

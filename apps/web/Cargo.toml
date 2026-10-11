@@ -22,6 +22,7 @@ library-shared.workspace = true
 sqlite-setup.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+base64 = "0.22"
 chrono.workspace = true
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }

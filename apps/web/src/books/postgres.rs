@@ -169,6 +169,7 @@ impl BookRepository for PostgresBookRepository {
         &self,
         filter: &BookFilter,
         page: PageParams,
+        after: Option<(String, i64)>,
     ) -> Result<(Vec<BookRecord>, u64), RepoError> {
         let total = self
             .counts
@@ -179,6 +180,17 @@ impl BookRepository for PostgresBookRepository {
         // reading only ids; the columns and the correlated subquery are computed
         // for the page's rows only, not for every skipped row.
         let mut select = QueryBuilder::<Postgres>::new(concat!(book_columns!(), " FROM ("));
+        // The keyset condition as a clause; `alias` is the table or CTE the page
+        // query reads `title` and `id` from.
+        let push_after = |select: &mut QueryBuilder<Postgres>, alias: &str, clause: &str| {
+            if let Some((title, id)) = &after {
+                select.push(format!(" {clause} ({alias}.title, {alias}.id) > ("));
+                select.push_bind(title.clone());
+                select.push(", ");
+                select.push_bind(*id);
+                select.push(")");
+            }
+        };
         if filter.q.as_deref().is_some_and(trigram_usable) {
             // A search the trigram indexes can serve is fenced into a materialized
             // CTE: find the matches with the indexes, then sort just those. Left to
@@ -189,10 +201,13 @@ impl BookRepository for PostgresBookRepository {
             // 20 matches, is the better plan.
             select.push("WITH f AS MATERIALIZED (SELECT b.id, b.title FROM books b");
             push_filter(&mut select, filter);
-            select.push(") SELECT f.id FROM f ORDER BY f.title ASC, f.id ASC");
+            select.push(") SELECT f.id FROM f");
+            push_after(&mut select, "f", "WHERE");
+            select.push(" ORDER BY f.title ASC, f.id ASC");
         } else {
             select.push("SELECT b.id FROM books b");
             push_filter(&mut select, filter);
+            push_after(&mut select, "b", "AND");
             select.push(" ORDER BY b.title ASC, b.id ASC");
         }
         select.push(" LIMIT ");
