@@ -79,15 +79,29 @@ impl Syncer {
                     last_seq: batch.last_seq,
                     last_token: Some(batch.last_token.clone()),
                 });
-                // Postgres has committed; if pruning fails now, the next
-                // successful batch prunes these rows too.
-                changes::prune(&self.sqlite, batch.last_seq).await?;
+                // Postgres has committed, so the outcome is decided. If
+                // pruning fails, the next successful cycle prunes these rows
+                // too (it removes everything below its own last_seq).
+                self.prune_after_commit(batch.last_seq).await;
                 Ok(Outcome::Shipped {
                     changes: batch.changes,
                     rows: batch.rows(),
                     full: batch.changes >= self.batch_size,
                 })
             }
+        }
+    }
+
+    /// Prune after Postgres has committed. A failure is only logged: the
+    /// outcome is already decided, and the next successful cycle prunes the
+    /// rows this one missed.
+    async fn prune_after_commit(&self, below_seq: i64) {
+        if let Err(err) = changes::prune(&self.sqlite, below_seq).await {
+            tracing::warn!(
+                node = self.mirror.node_id(),
+                error = format!("{err:#}"),
+                "pruning shipped changes failed; the next batch prunes them"
+            );
         }
     }
 
@@ -102,7 +116,6 @@ impl Syncer {
             last_seq: snapshot.seq,
             last_token: snapshot.token.clone(),
         });
-        changes::prune(&self.sqlite, snapshot.seq).await?;
         let resync = old.is_some();
         if resync {
             tracing::warn!(
@@ -121,6 +134,7 @@ impl Syncer {
                 "first sync for this node: copied every row"
             );
         }
+        self.prune_after_commit(snapshot.seq).await;
         Ok(Outcome::Copied {
             resync,
             epoch: report.epoch,
