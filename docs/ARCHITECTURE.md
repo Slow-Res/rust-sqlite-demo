@@ -120,6 +120,15 @@ On S16: Litestream 0.5 copes with checkpoints made by the app. At very high writ
 rates (tens of thousands of transactions a second), set `wal_autocheckpoint = 0` and
 let Litestream checkpoint. Nothing here needs that.
 
+`SQLITE_CHECKPOINT_INTERVAL_MS` (default 0, off) starts a background task in
+`library-web` that runs `PRAGMA wal_checkpoint(TRUNCATE)` that often
+([checkpoint.rs](../apps/web/src/checkpoint.rs)). SQLite's own checkpoints are PASSIVE,
+and under constant readers they never let the WAL reset: in the web-only load test it
+reached 2.5 GB for a 43 MB database and stalled requests. It is off wherever Litestream
+runs, because Litestream reads the WAL to replicate it and does the checkpoints itself;
+the load-test web-only mode (no Litestream) sets it to 1000. A busy checkpoint logs a
+warning with the pages left in the WAL.
+
 S7 in practice: do not call another service, wait on a channel, or read a slow file
 inside a write transaction. The write lock is held until the transaction ends, and
 every other writer waits for it.
@@ -197,15 +206,25 @@ holds the API types and `is_valid_node_id`.
 
 ## Book search
 
-Book search uses an FTS5 trigram index, `books_fts`
-([migration](../migrations/sqlite/20261012000000_perf_indexes.sql)). It is an
-external-content table over `books`; three triggers keep it in sync, with no `WHEN`
-condition, so every write to `books` updates it. A query of 3 or more characters
-(`q`, and `q` without spaces and hyphens, which is matched against the ISBN) goes
-through the index. A shorter query falls back to a `LIKE` scan, because a trigram
-index cannot match text shorter than 3 characters. The same `REPLACE` warning as
-below applies: use `INSERT ... ON CONFLICT DO UPDATE`, or the old row stays in the
-index. Member search keeps `LIKE`: the table is small.
+Book search matches word prefixes: `q` is split into words (runs of letters and
+digits; whitespace and punctuation separate them), and a book matches when every word
+is a prefix of some word of its title, author or ISBN, ignoring case. "anc" finds
+"Ancient", "fancy" does not. `q` with spaces and hyphens removed also matches the
+start of the ISBN, so "978-0-261" finds "9780261...". Ordering and `total` are
+unchanged. A `q` with no word at all (only punctuation) is matched as plain text,
+a scan.
+
+SQLite uses an FTS5 index, `books_fts`
+([migration](../migrations/sqlite/20261014000000_prefix_search.sql)): the `unicode61`
+tokenizer with `remove_diacritics 0` (accents stay significant) and `prefix = '2 3'`.
+It is an external-content table over `books`; three triggers keep it in sync, with no
+`WHEN` condition, so every write to `books` updates it. The match expression is every
+word as a quoted prefix (`"anc"*`), ANDed; quoting keeps query syntax out of the
+query. Postgres uses a GIN index on `book_search_vector(title, author, isbn)`
+([migration](../migrations/web-postgres/20261014000000_prefix_search.sql)) and
+`to_tsquery('simple', ...)` with `'word':*` terms; the ISBN form is `isbn LIKE 'digits%'`.
+The same `REPLACE` warning as below applies: use `INSERT ... ON CONFLICT DO UPDATE`, or
+the old row stays in the index. Member search keeps `LIKE`: the table is small.
 
 ## Adding a synced table
 
