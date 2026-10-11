@@ -170,12 +170,22 @@ impl BookRepository for PostgresBookRepository {
         // Deferred join: the inner query walks the index and skips OFFSET rows
         // reading only ids; the columns and the correlated subquery are computed
         // for the page's rows only, not for every skipped row.
-        let mut select = QueryBuilder::<Postgres>::new(concat!(
-            book_columns!(),
-            " FROM (SELECT b.id FROM books b"
-        ));
-        push_filter(&mut select, filter);
-        select.push(" ORDER BY b.title ASC, b.id ASC LIMIT ");
+        let mut select = QueryBuilder::<Postgres>::new(concat!(book_columns!(), " FROM ("));
+        if filter.q.is_some() {
+            // A search is fenced into a materialized CTE: find the matches with
+            // the trigram indexes, then sort just those. Left to itself the
+            // planner often walks the whole `(title, id)` index in order and
+            // applies the ILIKE to every row, hoping to meet 20 matches early;
+            // for a rare term that is a full index scan (20-50 ms at 50k books).
+            select.push("WITH f AS MATERIALIZED (SELECT b.id, b.title FROM books b");
+            push_filter(&mut select, filter);
+            select.push(") SELECT f.id FROM f ORDER BY f.title ASC, f.id ASC");
+        } else {
+            select.push("SELECT b.id FROM books b");
+            push_filter(&mut select, filter);
+            select.push(" ORDER BY b.title ASC, b.id ASC");
+        }
+        select.push(" LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");
         select.push_bind(page.offset());
