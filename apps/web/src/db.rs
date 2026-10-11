@@ -1,44 +1,17 @@
 //! SQLite connection pool, migrations, and the adapter-agnostic repository error.
 
-use std::str::FromStr;
-use std::time::Duration;
-
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::config::Config;
 
 const MAX_CONNECTIONS: u32 = 8;
 
-/// Open the pool, creating the database file and its parent directory if needed.
-/// The pragmas are part of the connect options, so they apply to *every*
-/// connection the pool opens (not just the first).
+/// Open the pool, creating the database file and its parent directory if
+/// needed. The settings (WAL, busy timeout, foreign keys...) come from
+/// `sqlite-setup`, the one place they are defined (spec §5).
 pub async fn connect(config: &Config) -> anyhow::Result<SqlitePool> {
-    use anyhow::Context;
-
-    let options = SqliteConnectOptions::from_str(&config.database_url)
-        .with_context(|| format!("invalid DATABASE_URL `{}`", config.database_url))?
-        .create_if_missing(true)
-        .foreign_keys(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_secs(5));
-
-    if let Some(dir) = options
-        .get_filename()
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating database directory {}", dir.display()))?;
-    }
-
-    SqlitePoolOptions::new()
-        .max_connections(MAX_CONNECTIONS)
-        .connect_with(options)
-        .await
-        .context("connecting to the database")
+    sqlite_setup::open_pool(&config.database_url, MAX_CONNECTIONS, true).await
 }
 
 /// Apply the migrations embedded in the binary at compile time.
