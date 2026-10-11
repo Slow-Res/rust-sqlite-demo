@@ -26,8 +26,8 @@ seed-dev: ## Sample data in the dev database
 user-dev: ## Staff account in the dev database
 	cargo run -p library-web -- create-user $(or $(NAME),admin)
 
-test: ## Rust tests
-	cargo test --workspace
+test: ## Rust tests; starts a throwaway Postgres (Docker) for the worker tests
+	TEST_POSTGRES_URL=$$(./scripts/test-postgres.sh) cargo test --workspace
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
@@ -45,6 +45,6 @@ sqlx-prepare: ## Refresh committed offline query metadata
 check: ## Every gate CI runs
 	cargo fmt --check
 	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace
+	$(MAKE) test
 	SQLX_OFFLINE=true cargo build -p library-web
 	cd apps/frontend && npm run lint && npm run typecheck && npm test

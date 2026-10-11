@@ -1,0 +1,33 @@
+[package]
+name = "sync-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sync_worker"
+path = "src/lib.rs"
+
+[dependencies]
+library-shared.workspace = true
+sqlite-setup.workspace = true
+# The only crate with the Postgres driver (spec §4). rustls lets POSTGRES_URL use `sslmode=require`.
+sqlx = { workspace = true, features = ["postgres", "migrate", "macros", "tls-rustls-ring-webpki"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+axum = "0.8"
+prometheus-client = "0.25"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true
