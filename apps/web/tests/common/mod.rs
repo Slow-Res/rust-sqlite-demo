@@ -123,6 +123,7 @@ impl TestApp {
                         Arg::Int(n) => query.bind(*n),
                         Arg::OptInt(n) => query.bind(*n),
                         Arg::Text(text) => query.bind(text.clone()),
+                        Arg::OptText(text) => query.bind(text.clone()),
                     };
                 }
                 query.fetch_one(pool).await.expect("scalar query")
@@ -135,6 +136,7 @@ impl TestApp {
                         Arg::Int(n) => query.bind(*n),
                         Arg::OptInt(n) => query.bind(*n),
                         Arg::Text(text) => query.bind(text.clone()),
+                        Arg::OptText(text) => query.bind(text.clone()),
                     };
                 }
                 query.fetch_one(pool).await.expect("scalar query")
@@ -276,6 +278,7 @@ pub enum Arg {
     Int(i64),
     OptInt(Option<i64>),
     Text(String),
+    OptText(Option<String>),
 }
 
 impl From<i64> for Arg {
@@ -293,6 +296,12 @@ impl From<Option<i64>> for Arg {
 impl From<&str> for Arg {
     fn from(text: &str) -> Self {
         Self::Text(text.to_owned())
+    }
+}
+
+impl From<Option<String>> for Arg {
+    fn from(text: Option<String>) -> Self {
+        Self::OptText(text)
     }
 }
 

@@ -1,8 +1,8 @@
 //! Book search (`GET /api/books?q=`): the FTS5 trigram path, the `LIKE`
 //! fallback for short queries, and the index staying in sync with `books`.
 //!
-//! Raw SQL here uses `$1` placeholders, which SQLite also accepts, so the
-//! statements stay portable to the Postgres backend.
+//! Raw SQL goes through `TestApp::scalar` with `$1` placeholders, so every test
+//! runs on SQLite and on Postgres (`db_tests!`). Only the migration test is SQLite-only.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -23,34 +23,30 @@ struct Fixture {
     cafe: i64,
 }
 
-async fn insert_book(pool: &SqlitePool, title: &str, author: &str, isbn: Option<&str>) -> i64 {
-    sqlx::query_scalar(
+async fn insert_book(app: &TestApp, title: &str, author: &str, isbn: Option<&str>) -> i64 {
+    app.scalar(
         "INSERT INTO books (title, author, isbn, total_copies, created_at, updated_at) \
          VALUES ($1, $2, $3, 1, 0, 0) RETURNING id",
+        &[title.into(), author.into(), isbn.map(str::to_owned).into()],
     )
-    .bind(title)
-    .bind(author)
-    .bind(isbn)
-    .fetch_one(pool)
     .await
-    .unwrap()
 }
 
-async fn fixture(pool: &SqlitePool) -> Fixture {
+async fn fixture(app: &TestApp) -> Fixture {
     Fixture {
-        hobbit: insert_book(pool, "The Hobbit", "J.R.R. Tolkien", Some("9780261102217")).await,
-        dune: insert_book(pool, "Dune", "Frank Herbert", Some("9780441172719")).await,
+        hobbit: insert_book(app, "The Hobbit", "J.R.R. Tolkien", Some("9780261102217")).await,
+        dune: insert_book(app, "Dune", "Frank Herbert", Some("9780441172719")).await,
         hobbit_cookbook: insert_book(
-            pool,
+            app,
             "Hobbit Hole Cookbook",
             "Sam Gamgee",
             Some("9781234567897"),
         )
         .await,
-        fellowship: insert_book(pool, "The Fellowship of the Ring", "J.R.R. Tolkien", None).await,
-        pure_joy: insert_book(pool, "100% Pure_Joy", "Ann Author", None).await,
-        hello: insert_book(pool, "Say \"Hello\" World", "Bob Writer", None).await,
-        cafe: insert_book(pool, "Café Société", "Zoë Müller", None).await,
+        fellowship: insert_book(app, "The Fellowship of the Ring", "J.R.R. Tolkien", None).await,
+        pure_joy: insert_book(app, "100% Pure_Joy", "Ann Author", None).await,
+        hello: insert_book(app, "Say \"Hello\" World", "Bob Writer", None).await,
+        cafe: insert_book(app, "Café Société", "Zoë Müller", None).await,
     }
 }
 
@@ -98,26 +94,24 @@ async fn assert_finds(app: &TestApp, q: &str, expected: Vec<i64>) {
     assert_eq!(total, expected.len() as u64, "total for q = {q:?}");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn title_substring_ignores_case(pool: SqlitePool) {
-    let f = fixture(&pool).await;
-    let app = TestApp::new(pool);
+db_tests! {
+async fn title_substring_ignores_case(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
     assert_finds(&app, "hobbit", vec![f.hobbit, f.hobbit_cookbook]).await;
     assert_finds(&app, "HoBbIt", vec![f.hobbit, f.hobbit_cookbook]).await;
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn author_substring(pool: SqlitePool) {
-    let f = fixture(&pool).await;
-    let app = TestApp::new(pool);
+async fn author_substring(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
     assert_finds(&app, "tolkien", vec![f.hobbit, f.fellowship]).await;
     assert_finds(&app, "Gamgee", vec![f.hobbit_cookbook]).await;
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn isbn_substring_and_typed_with_hyphens_and_spaces(pool: SqlitePool) {
-    let f = fixture(&pool).await;
-    let app = TestApp::new(pool);
+async fn isbn_substring_and_typed_with_hyphens_and_spaces(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
     assert_finds(&app, "0261102", vec![f.hobbit]).await;
     // Stored without separators; the typed form has them.
     assert_finds(&app, "978-0-261 10221-7", vec![f.hobbit]).await;
@@ -125,10 +119,9 @@ async fn isbn_substring_and_typed_with_hyphens_and_spaces(pool: SqlitePool) {
     assert_finds(&app, "000-000", vec![]).await;
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn wildcards_and_quotes_match_literally(pool: SqlitePool) {
-    let f = fixture(&pool).await;
-    let app = TestApp::new(pool);
+async fn wildcards_and_quotes_match_literally(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
     assert_finds(&app, "100%", vec![f.pure_joy]).await;
     assert_finds(&app, "e_Joy", vec![f.pure_joy]).await;
     // `LIKE` wildcards would match these; literal text does not.
@@ -147,20 +140,18 @@ async fn wildcards_and_quotes_match_literally(pool: SqlitePool) {
     assert_finds(&app, "\"\"\"", vec![]).await;
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn non_ascii_title_in_the_stored_case(pool: SqlitePool) {
-    let f = fixture(&pool).await;
-    let app = TestApp::new(pool);
+async fn non_ascii_title_in_the_stored_case(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
     // Same case as stored. How other-case non-ASCII text behaves differs by backend.
     assert_finds(&app, "Café", vec![f.cafe]).await;
     assert_finds(&app, "Société", vec![f.cafe]).await;
     assert_finds(&app, "Müller", vec![f.cafe]).await;
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn short_queries_fall_back_to_like(pool: SqlitePool) {
-    let f = fixture(&pool).await;
-    let app = TestApp::new(pool);
+async fn short_queries_fall_back_to_like(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
     // 2 characters: the title/author part.
     assert_finds(&app, "zo", vec![f.cafe]).await;
     assert_finds(&app, "ZO", vec![f.cafe]).await;
@@ -175,36 +166,31 @@ async fn short_queries_fall_back_to_like(pool: SqlitePool) {
     assert_finds(&app, "_", vec![f.pure_joy]).await;
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn multi_word_query_is_one_phrase(pool: SqlitePool) {
-    let f = fixture(&pool).await;
-    let app = TestApp::new(pool);
+async fn multi_word_query_is_one_phrase(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
     assert_finds(&app, "fellowship of the", vec![f.fellowship]).await;
     assert_finds(&app, "the hobbit", vec![f.hobbit]).await;
     // Both words occur in "The Hobbit" / "J.R.R. Tolkien", but not as one string.
     assert_finds(&app, "hobbit tolkien", vec![]).await;
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn combined_with_availability(pool: SqlitePool) {
-    let f = fixture(&pool).await;
+async fn combined_with_availability(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
     // The only copy of "The Hobbit" is out.
-    let member_id: i64 = sqlx::query_scalar(
-        "INSERT INTO members (name, email, created_at, updated_at) \
-         VALUES ('M', 'm@example.com', 0, 0) RETURNING id",
+    let member_id = app
+        .scalar(
+            "INSERT INTO members (name, email, created_at, updated_at) \
+             VALUES ('M', 'm@example.com', 0, 0) RETURNING id",
+            &[],
+        )
+        .await;
+    app.scalar(
+        "INSERT INTO loans (book_id, member_id, borrowed_at, due_at) VALUES ($1, $2, 0, 100) RETURNING id",
+        &[f.hobbit.into(), member_id.into()],
     )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO loans (book_id, member_id, borrowed_at, due_at) VALUES ($1, $2, 0, 100)",
-    )
-    .bind(f.hobbit)
-    .bind(member_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let app = TestApp::new(pool);
+    .await;
 
     let (found, total) = search(&app, "hobbit", "&availability=available").await;
     assert_eq!((found, total), (vec![f.hobbit_cookbook], 1));
@@ -220,10 +206,9 @@ async fn combined_with_availability(pool: SqlitePool) {
     assert_eq!((found, total), (vec![], 0));
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn index_follows_updates_and_deletes(pool: SqlitePool) {
-    let f = fixture(&pool).await;
-    let app = TestApp::new(pool.clone());
+async fn index_follows_updates_and_deletes(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
     let cookie = app.login("ada", "password123").await;
 
     // Update through the API: the old title stops matching, the new one starts.
@@ -242,12 +227,11 @@ async fn index_follows_updates_and_deletes(pool: SqlitePool) {
     assert_finds(&app, "0441172719", vec![]).await;
 
     // Update with plain SQL: the triggers do not care who writes.
-    sqlx::query("UPDATE books SET author = $1 WHERE id = $2")
-        .bind("Someone Else")
-        .bind(f.dune)
-        .execute(&pool)
-        .await
-        .unwrap();
+    app.scalar(
+        "UPDATE books SET author = $1 WHERE id = $2 RETURNING id",
+        &["Someone Else".into(), f.dune.into()],
+    )
+    .await;
     assert_finds(&app, "herbert", vec![]).await;
     assert_finds(&app, "someone else", vec![f.dune]).await;
 
@@ -260,19 +244,22 @@ async fn index_follows_updates_and_deletes(pool: SqlitePool) {
     assert_finds(&app, "someone else", vec![]).await;
 
     // Delete and insert with plain SQL.
-    sqlx::query("DELETE FROM books WHERE id = $1")
-        .bind(f.fellowship)
-        .execute(&pool)
-        .await
-        .unwrap();
+    app.scalar(
+        "DELETE FROM books WHERE id = $1 RETURNING id",
+        &[f.fellowship.into()],
+    )
+    .await;
     assert_finds(&app, "fellowship", vec![]).await;
     assert_finds(&app, "tolkien", vec![f.hobbit]).await;
-    let new_id = insert_book(&pool, "Neuromancer", "William Gibson", None).await;
+    let new_id = insert_book(&app, "Neuromancer", "William Gibson", None).await;
     assert_finds(&app, "neuromancer", vec![new_id]).await;
+}
 }
 
 #[sqlx::test(migrations = false)]
 async fn books_from_before_the_migration_are_found_after_it(pool: SqlitePool) {
+    // SQLite-only: it is about the SQLite migration set (FTS5 index added over existing rows).
+    let app = TestApp::new(pool.clone());
     // The schema as the previous release left it: everything up to the change log.
     let mut previous = sqlx::migrate!("../../migrations/sqlite");
     let migrations = previous
@@ -289,13 +276,14 @@ async fn books_from_before_the_migration_are_found_after_it(pool: SqlitePool) {
             .unwrap();
     assert!(!has_index, "the search index must not exist yet");
 
-    let f = fixture(&pool).await;
+    let f = fixture(&app).await;
 
     // Now the full set, as `library-web` runs it at startup. It also proves the
     // bundled SQLite has FTS5 and the trigram tokenizer.
-    library_web::db::migrate(&pool).await.unwrap();
+    library_web::db::migrate(&pool.clone().into())
+        .await
+        .unwrap();
 
-    let app = TestApp::new(pool);
     assert_finds(&app, "hobbit", vec![f.hobbit, f.hobbit_cookbook]).await;
     assert_finds(&app, "tolkien", vec![f.hobbit, f.fellowship]).await;
     assert_finds(&app, "978-0-261-10221-7", vec![f.hobbit]).await;
