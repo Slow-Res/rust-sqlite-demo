@@ -2,4 +2,5 @@
 //! compile time but does not watch it for new files on stable Rust.
 fn main() {
     println!("cargo:rerun-if-changed=../../migrations/sqlite");
+    println!("cargo:rerun-if-changed=../../migrations/web-postgres");
 }

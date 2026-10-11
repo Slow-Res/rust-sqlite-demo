@@ -7,11 +7,15 @@
 //! "Borrow a book" is `routes::create` -> `LoanService::create` ->
 //! `LoanRepository::create_checked`.
 
+#[cfg(feature = "postgres")]
+mod postgres;
 mod repo;
 mod routes;
 mod service;
 mod sqlite;
 
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresLoanRepository;
 pub use repo::{
     CreateLoanOutcome, LoanDetails, LoanFilter, LoanRepository, NewLoanRecord, ReturnLoanOutcome,
 };

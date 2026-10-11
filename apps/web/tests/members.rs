@@ -7,7 +7,6 @@ mod common;
 use axum::http::StatusCode;
 use common::{TestApp, insert_loan};
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
 
 fn member(name: &str, email: &str) -> Value {
     json!({ "name": name, "email": email })
@@ -28,9 +27,9 @@ fn names(page: &Value) -> Vec<&str> {
         .collect()
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn every_endpoint_requires_auth(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+db_tests! {
+async fn every_endpoint_requires_auth(db: Database) {
+    let app = TestApp::new(db);
     let body = member("X", "x@example.com");
     let (s, _, _) = app.get("/api/members", None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -44,9 +43,8 @@ async fn every_endpoint_requires_auth(pool: SqlitePool) {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn create_trims_and_lowercases(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn create_trims_and_lowercases(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let created = create(&app, &cookie, member("  Grace  ", " Grace@Example.COM ")).await;
     assert_eq!(created["name"], "Grace");
@@ -60,9 +58,8 @@ async fn create_trims_and_lowercases(pool: SqlitePool) {
     assert_eq!(one, created);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn invalid_fields_are_all_reported(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn invalid_fields_are_all_reported(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let (status, _, json) = app
         .post_json("/api/members", &member(" ", "nope"), Some(&cookie))
@@ -77,9 +74,8 @@ async fn invalid_fields_are_all_reported(pool: SqlitePool) {
     }
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn duplicate_email_is_409_case_insensitively(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn duplicate_email_is_409_case_insensitively(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     create(&app, &cookie, member("A", "a@example.com")).await;
     let (status, _, json) = app
@@ -89,18 +85,16 @@ async fn duplicate_email_is_409_case_insensitively(pool: SqlitePool) {
     assert_eq!(json["error"]["code"], "email_taken");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn get_missing_is_404(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn get_missing_is_404(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let (status, _, json) = app.get("/api/members/999", Some(&cookie)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(json["error"]["message"], "member not found");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn list_searches_name_and_email_ordered_by_name(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn list_searches_name_and_email_ordered_by_name(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     create(&app, &cookie, member("Charlie", "c@example.com")).await;
     create(&app, &cookie, member("Alice", "alice@work.org")).await;
@@ -121,9 +115,8 @@ async fn list_searches_name_and_email_ordered_by_name(pool: SqlitePool) {
     assert_eq!(none["total"], 0);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn search_longer_than_200_chars_is_rejected(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn search_longer_than_200_chars_is_rejected(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let uri = format!("/api/members?q={}", "a".repeat(201));
     let (status, _, body) = app.get(&uri, Some(&cookie)).await;
@@ -135,9 +128,8 @@ async fn search_longer_than_200_chars_is_rejected(pool: SqlitePool) {
     );
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn list_paginates(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn list_paginates(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     for (name, email) in [("A", "a@x.io"), ("B", "b@x.io"), ("C", "c@x.io")] {
         create(&app, &cookie, member(name, email)).await;
@@ -151,15 +143,14 @@ async fn list_paginates(pool: SqlitePool) {
     assert_eq!(page2["per_page"], 2);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn active_loans_counts_only_unreturned(pool: SqlitePool) {
-    let app = TestApp::new(pool.clone());
+async fn active_loans_counts_only_unreturned(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let created = create(&app, &cookie, member("A", "a@x.io")).await;
     let id = created["id"].as_i64().unwrap();
-    insert_loan(&pool, id, false).await;
-    insert_loan(&pool, id, false).await;
-    insert_loan(&pool, id, true).await;
+    insert_loan(&app, id, false).await;
+    insert_loan(&app, id, false).await;
+    insert_loan(&app, id, true).await;
 
     let (_, _, one) = app.get(&format!("/api/members/{id}"), Some(&cookie)).await;
     assert_eq!(one["active_loans"], 2);
@@ -167,9 +158,8 @@ async fn active_loans_counts_only_unreturned(pool: SqlitePool) {
     assert_eq!(page["items"][0]["active_loans"], 2);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn update_replaces_fields(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn update_replaces_fields(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let created = create(&app, &cookie, member("A", "a@x.io")).await;
     let id = created["id"].as_i64().unwrap();
@@ -192,9 +182,8 @@ async fn update_replaces_fields(pool: SqlitePool) {
     assert_eq!(status, StatusCode::OK);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn update_missing_invalid_and_taken(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn update_missing_invalid_and_taken(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     create(&app, &cookie, member("A", "a@x.io")).await;
     let b = create(&app, &cookie, member("B", "b@x.io")).await;
@@ -217,9 +206,8 @@ async fn update_missing_invalid_and_taken(pool: SqlitePool) {
     assert_eq!(json["error"]["code"], "email_taken");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn delete_outcomes(pool: SqlitePool) {
-    let app = TestApp::new(pool.clone());
+async fn delete_outcomes(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
 
     let (status, _, _) = app.delete("/api/members/999", Some(&cookie)).await;
@@ -227,7 +215,7 @@ async fn delete_outcomes(pool: SqlitePool) {
 
     let busy = create(&app, &cookie, member("Busy", "busy@x.io")).await;
     let busy_id = busy["id"].as_i64().unwrap();
-    insert_loan(&pool, busy_id, false).await;
+    insert_loan(&app, busy_id, false).await;
     let (status, _, json) = app
         .delete(&format!("/api/members/{busy_id}"), Some(&cookie))
         .await;
@@ -237,7 +225,7 @@ async fn delete_outcomes(pool: SqlitePool) {
     // Returned loans are removed together with the member.
     let done = create(&app, &cookie, member("Done", "done@x.io")).await;
     let done_id = done["id"].as_i64().unwrap();
-    insert_loan(&pool, done_id, true).await;
+    insert_loan(&app, done_id, true).await;
     let (status, _, _) = app
         .delete(&format!("/api/members/{done_id}"), Some(&cookie))
         .await;
@@ -246,10 +234,12 @@ async fn delete_outcomes(pool: SqlitePool) {
         .get(&format!("/api/members/{done_id}"), Some(&cookie))
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let loans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM loans WHERE member_id = ?")
-        .bind(done_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let loans = app
+        .scalar(
+            "SELECT COUNT(*) FROM loans WHERE member_id = $1",
+            &[done_id.into()],
+        )
+        .await;
     assert_eq!(loans, 0);
+}
 }

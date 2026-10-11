@@ -12,11 +12,11 @@ use crate::{build_router, db};
 
 /// Run the HTTP server: connect, migrate, serve, and shut down gracefully.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let pool = db::connect(&config).await?;
-    db::migrate(&pool).await?;
+    let database = db::connect(&config).await?;
+    db::migrate(&database).await?;
 
     let bind_addr = config.bind_addr;
-    let state = AppState::new(pool.clone(), Arc::new(config), Arc::new(SystemClock));
+    let state = AppState::new(database.clone(), Arc::new(config), Arc::new(SystemClock));
     let router = build_router(state);
 
     let listener = TcpListener::bind(bind_addr)
@@ -29,7 +29,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .await
         .context("server error")?;
 
-    pool.close().await;
+    database.close().await;
     tracing::info!("shut down cleanly");
     Ok(())
 }

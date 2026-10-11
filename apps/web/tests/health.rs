@@ -5,12 +5,12 @@ mod common;
 use axum::http::StatusCode;
 use common::TestApp;
 use serde_json::json;
-use sqlx::SqlitePool;
 
-// `#[sqlx::test(...)]` creates a fresh database, runs `migrations/sqlite/`, and passes the pool in.
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn health_is_ok(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+// `db_tests!` runs each body on a fresh, migrated SQLite database and, with the
+// `postgres` feature, on a fresh Postgres one (see `common/mod.rs`).
+db_tests! {
+async fn health_is_ok(db: Database) {
+    let app = TestApp::new(db);
     let (status, headers, body) = app.get("/api/health", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -21,10 +21,10 @@ async fn health_is_ok(pool: SqlitePool) {
     assert_eq!(headers["x-content-type-options"], "nosniff");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn unknown_api_route_is_json_404(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn unknown_api_route_is_json_404(db: Database) {
+    let app = TestApp::new(db);
     let (status, _, body) = app.get("/api/nope", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "not_found");
+}
 }

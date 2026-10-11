@@ -4,12 +4,16 @@
 //! `domain` holds the validated types (`Isbn`, `BookFields`) the layers share.
 
 mod domain;
+#[cfg(feature = "postgres")]
+mod postgres;
 mod repo;
 mod routes;
 mod service;
 mod sqlite;
 
 pub use domain::{BookFields, Isbn};
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresBookRepository;
 pub use repo::{BookFilter, BookRecord, BookRepository, DeleteBookOutcome, UpdateBookOutcome};
 pub use routes::routes;
 pub use service::BookService;

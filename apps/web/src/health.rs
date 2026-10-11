@@ -7,9 +7,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use library_shared::Health;
-use sqlx::SqlitePool;
 
 use crate::config::Config;
+use crate::db::Database;
 use crate::extract::ApiJson;
 use crate::state::AppState;
 
@@ -18,7 +18,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn health(
-    State(pool): State<SqlitePool>,
+    State(db): State<Database>,
     State(config): State<Arc<Config>>,
 ) -> (StatusCode, ApiJson<Health>) {
     let health = |status: &str| Health {
@@ -26,8 +26,8 @@ async fn health(
         node_id: config.node_id.clone(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
     };
-    match sqlx::query("SELECT 1").execute(&pool).await {
-        Ok(_) => (StatusCode::OK, ApiJson(health("ok"))),
+    match db.ping().await {
+        Ok(()) => (StatusCode::OK, ApiJson(health("ok"))),
         Err(err) => {
             tracing::error!(error = ?err, "health check failed");
             (

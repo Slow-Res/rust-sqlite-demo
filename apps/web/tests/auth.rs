@@ -6,11 +6,10 @@ use axum::http::{StatusCode, header};
 use chrono::Duration;
 use common::TestApp;
 use serde_json::json;
-use sqlx::SqlitePool;
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn login_success_returns_user_and_cookie(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+db_tests! {
+async fn login_success_returns_user_and_cookie(db: Database) {
+    let app = TestApp::new(db);
     app.auth.create_user("ada", "password123").await.unwrap();
 
     let body = json!({ "username": "ada", "password": "password123" });
@@ -28,9 +27,8 @@ async fn login_success_returns_user_and_cookie(pool: SqlitePool) {
     assert!(!cookie.contains("; Secure"), "{cookie}");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn secure_config_marks_the_cookie_secure(pool: SqlitePool) {
-    let app = TestApp::with_secure_cookie(pool);
+async fn secure_config_marks_the_cookie_secure(db: Database) {
+    let app = TestApp::with_secure_cookie(db);
     app.auth.create_user("ada", "password123").await.unwrap();
 
     let body = json!({ "username": "ada", "password": "password123" });
@@ -41,9 +39,8 @@ async fn secure_config_marks_the_cookie_secure(pool: SqlitePool) {
     assert!(cookie.contains("; Secure"), "{cookie}");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn wrong_password_and_unknown_user_look_identical(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn wrong_password_and_unknown_user_look_identical(db: Database) {
+    let app = TestApp::new(db);
     app.auth.create_user("ada", "password123").await.unwrap();
 
     let wrong = json!({ "username": "ada", "password": "nope-nope" });
@@ -57,18 +54,16 @@ async fn wrong_password_and_unknown_user_look_identical(pool: SqlitePool) {
     assert_eq!((s1, b1), (s2, b2));
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn login_ignores_username_case(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn login_ignores_username_case(db: Database) {
+    let app = TestApp::new(db);
     app.auth.create_user("Ada", "password123").await.unwrap();
     let body = json!({ "username": "ADA", "password": "password123" });
     let (status, _, _) = app.post_json("/api/auth/login", &body, None).await;
     assert_eq!(status, StatusCode::OK);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn empty_fields_are_422(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn empty_fields_are_422(db: Database) {
+    let app = TestApp::new(db);
     let body = json!({ "username": "", "password": "" });
     let (status, _, json) = app.post_json("/api/auth/login", &body, None).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -77,9 +72,8 @@ async fn empty_fields_are_422(pool: SqlitePool) {
     assert!(json["error"]["fields"]["password"].is_string());
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn malformed_json_is_400(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn malformed_json_is_400(db: Database) {
+    let app = TestApp::new(db);
     let (status, _, json) = app
         .send_raw(
             axum::http::Method::POST,
@@ -92,9 +86,8 @@ async fn malformed_json_is_400(pool: SqlitePool) {
     assert_eq!(json["error"]["code"], "bad_request");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn me_requires_a_valid_session(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn me_requires_a_valid_session(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
 
     let (status, _, json) = app.get("/api/auth/me", Some(&cookie)).await;
@@ -110,9 +103,8 @@ async fn me_requires_a_valid_session(pool: SqlitePool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn expired_session_is_rejected(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn expired_session_is_rejected(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
 
     app.clock.advance(Duration::hours(167));
@@ -124,39 +116,30 @@ async fn expired_session_is_rejected(pool: SqlitePool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn login_sweeps_expired_sessions(pool: SqlitePool) {
-    let app = TestApp::new(pool.clone());
+async fn login_sweeps_expired_sessions(db: Database) {
+    let app = TestApp::new(db);
     app.login("ada", "password123").await;
     app.clock.advance(Duration::hours(200));
 
     let body = json!({ "username": "ada", "password": "password123" });
     app.post_json("/api/auth/login", &body, None).await;
 
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count = app.scalar("SELECT COUNT(*) FROM sessions", &[]).await;
     assert_eq!(count, 1);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn session_table_stores_only_a_hash(pool: SqlitePool) {
-    let app = TestApp::new(pool.clone());
+async fn session_table_stores_only_a_hash(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let token = cookie.strip_prefix("library_session=").unwrap();
 
-    let stored: String = sqlx::query_scalar("SELECT token_hash FROM sessions")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let stored = app.text("SELECT token_hash FROM sessions").await;
     assert_ne!(stored, token);
     assert_eq!(stored.len(), 64);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn logout_ends_the_session(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn logout_ends_the_session(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
 
     let (status, headers, _) = app
@@ -171,16 +154,14 @@ async fn logout_ends_the_session(pool: SqlitePool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn logout_without_session_is_401(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn logout_without_session_is_401(db: Database) {
+    let app = TestApp::new(db);
     let (status, _, _) = app.post_json("/api/auth/logout", &json!({}), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn usernames_are_unique_ignoring_case(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn usernames_are_unique_ignoring_case(db: Database) {
+    let app = TestApp::new(db);
     app.auth.create_user("Ada", "password123").await.unwrap();
     let err = app
         .auth
@@ -196,9 +177,8 @@ async fn usernames_are_unique_ignoring_case(pool: SqlitePool) {
     ));
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn create_user_validates_input(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn create_user_validates_input(db: Database) {
+    let app = TestApp::new(db);
     let err = app.auth.create_user("  ", "short").await.unwrap_err();
     match err {
         library_web::error::AppError::Validation(fields) => {
@@ -207,4 +187,5 @@ async fn create_user_validates_input(pool: SqlitePool) {
         }
         other => panic!("expected Validation, got {other:?}"),
     }
+}
 }

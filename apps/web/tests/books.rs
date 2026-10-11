@@ -7,7 +7,6 @@ mod common;
 use axum::http::StatusCode;
 use common::TestApp;
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
 
 fn book(title: &str) -> Value {
     json!({ "title": title, "author": "Some Author", "isbn": null, "published_year": 2000, "total_copies": 2 })
@@ -21,31 +20,21 @@ async fn create(app: &TestApp, cookie: &str, body: Value) -> Value {
 
 /// Insert a member and a loan straight into the database (the loans API is a
 /// later feature). Returns the loan id.
-async fn insert_loan(pool: &SqlitePool, book_id: i64, returned: bool) -> i64 {
+async fn insert_loan(app: &TestApp, book_id: i64, returned: bool) -> i64 {
     // Each loan gets its own member (emails are unique).
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
-        .fetch_one(pool)
-        .await
-        .unwrap();
+    let n = app.scalar("SELECT COUNT(*) FROM members", &[]).await;
     let email = format!("member{n}@example.com");
-    let member_id = sqlx::query(
-        "INSERT INTO members (name, email, created_at, updated_at) VALUES ('M', ?, 0, 0)",
+    let member_id = app
+        .scalar(
+            "INSERT INTO members (name, email, created_at, updated_at) VALUES ('M', $1, 0, 0) RETURNING id",
+            &[email.into()],
+        )
+        .await;
+    app.scalar(
+        "INSERT INTO loans (book_id, member_id, borrowed_at, due_at, returned_at) VALUES ($1, $2, 0, 100, $3) RETURNING id",
+        &[book_id.into(), member_id.into(), returned.then_some(50).into()],
     )
-    .bind(email)
-    .execute(pool)
     .await
-    .unwrap()
-    .last_insert_rowid();
-    sqlx::query(
-        "INSERT INTO loans (book_id, member_id, borrowed_at, due_at, returned_at) VALUES (?, ?, 0, 100, ?)",
-    )
-    .bind(book_id)
-    .bind(member_id)
-    .bind(returned.then_some(50))
-    .execute(pool)
-    .await
-    .unwrap()
-    .last_insert_rowid()
 }
 
 fn titles(page: &Value) -> Vec<&str> {
@@ -57,9 +46,9 @@ fn titles(page: &Value) -> Vec<&str> {
         .collect()
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn list_and_get_are_public(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+db_tests! {
+async fn list_and_get_are_public(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let created = create(&app, &cookie, book("Dune")).await;
     let id = created["id"].as_i64().unwrap();
@@ -75,18 +64,16 @@ async fn list_and_get_are_public(pool: SqlitePool) {
     assert_eq!(one["available_copies"], 2);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn get_missing_is_404(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn get_missing_is_404(db: Database) {
+    let app = TestApp::new(db);
     let (status, _, json) = app.get("/api/books/999", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(json["error"]["code"], "not_found");
     assert_eq!(json["error"]["message"], "book not found");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn mutations_require_auth(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn mutations_require_auth(db: Database) {
+    let app = TestApp::new(db);
     let (s, _, _) = app.post_json("/api/books", &book("X"), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _, _) = app.put_json("/api/books/1", &book("X"), None).await;
@@ -95,9 +82,8 @@ async fn mutations_require_auth(pool: SqlitePool) {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn create_normalizes_isbn(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn create_normalizes_isbn(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let mut body = book("SICP");
     body["isbn"] = json!("978-0-13-110362-7");
@@ -107,9 +93,8 @@ async fn create_normalizes_isbn(pool: SqlitePool) {
     assert!(created["created_at"].is_string());
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn invalid_fields_are_all_reported(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn invalid_fields_are_all_reported(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let body = json!({ "title": " ", "author": "", "isbn": "123", "published_year": 3000, "total_copies": 0 });
     let (status, _, json) = app.post_json("/api/books", &body, Some(&cookie)).await;
@@ -123,9 +108,8 @@ async fn invalid_fields_are_all_reported(pool: SqlitePool) {
     }
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn duplicate_isbn_is_409(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn duplicate_isbn_is_409(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let mut body = book("A");
     body["isbn"] = json!("9780131103627");
@@ -142,9 +126,8 @@ async fn duplicate_isbn_is_409(pool: SqlitePool) {
     create(&app, &cookie, book("C")).await;
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn update_to_taken_isbn_is_409(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn update_to_taken_isbn_is_409(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let mut a = book("A");
     a["isbn"] = json!("9780131103627");
@@ -162,9 +145,8 @@ async fn update_to_taken_isbn_is_409(pool: SqlitePool) {
     assert_eq!(json["error"]["code"], "isbn_taken");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn search_matches_title_author_isbn_case_insensitively(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn search_matches_title_author_isbn_case_insensitively(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     create(&app, &cookie, book("The Rust Book")).await;
     create(
@@ -186,9 +168,8 @@ async fn search_matches_title_author_isbn_case_insensitively(pool: SqlitePool) {
     assert_eq!(page["total"], 0);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn search_matches_isbn_typed_with_hyphens_or_spaces(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn search_matches_isbn_typed_with_hyphens_or_spaces(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     create(&app, &cookie, book("The Rust Book")).await;
     create(
@@ -207,9 +188,8 @@ async fn search_matches_isbn_typed_with_hyphens_or_spaces(pool: SqlitePool) {
     assert_eq!(page["total"], 0);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn search_longer_than_200_chars_is_rejected(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn search_longer_than_200_chars_is_rejected(db: Database) {
+    let app = TestApp::new(db);
     let (status, _, body) = app
         .get(&format!("/api/books?q={}", "a".repeat(201)), None)
         .await;
@@ -226,9 +206,8 @@ async fn search_longer_than_200_chars_is_rejected(pool: SqlitePool) {
     assert_eq!(status, StatusCode::OK);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn search_treats_wildcards_literally(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn search_treats_wildcards_literally(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     create(&app, &cookie, book("100% Rust")).await;
     create(&app, &cookie, book("snake_case")).await;
@@ -243,17 +222,16 @@ async fn search_treats_wildcards_literally(pool: SqlitePool) {
     assert_eq!(titles(&page), ["back\\slash"]);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn availability_filter(pool: SqlitePool) {
-    let app = TestApp::new(pool.clone());
+async fn availability_filter(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let free = create(&app, &cookie, book("Free")).await;
     let partial = create(&app, &cookie, book("Partial")).await; // 2 copies
     let full = create(&app, &cookie, json!({ "title": "Full", "author": "A", "isbn": null, "published_year": null, "total_copies": 1 })).await;
-    insert_loan(&pool, partial["id"].as_i64().unwrap(), false).await;
-    insert_loan(&pool, full["id"].as_i64().unwrap(), false).await;
+    insert_loan(&app, partial["id"].as_i64().unwrap(), false).await;
+    insert_loan(&app, full["id"].as_i64().unwrap(), false).await;
     // A returned loan does not count.
-    insert_loan(&pool, free["id"].as_i64().unwrap(), true).await;
+    insert_loan(&app, free["id"].as_i64().unwrap(), true).await;
 
     let (_, _, page) = app.get("/api/books?availability=available", None).await;
     assert_eq!(titles(&page), ["Free", "Partial"]);
@@ -274,9 +252,8 @@ async fn availability_filter(pool: SqlitePool) {
     assert_eq!(json["error"]["code"], "bad_request");
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn pagination_and_ordering(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn pagination_and_ordering(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     for title in ["d", "b", "a", "e", "c"] {
         create(&app, &cookie, book(title)).await;
@@ -309,9 +286,8 @@ async fn pagination_and_ordering(pool: SqlitePool) {
     assert_eq!(page["per_page"], 20);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn update_replaces_fields(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn update_replaces_fields(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let created = create(&app, &cookie, book("Old")).await;
     let uri = format!("/api/books/{}", created["id"]);
@@ -325,9 +301,8 @@ async fn update_replaces_fields(pool: SqlitePool) {
     assert_eq!(json["published_year"], Value::Null);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn update_missing_is_404_and_invalid_is_422(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn update_missing_is_404_and_invalid_is_422(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let (status, _, _) = app
         .put_json("/api/books/999", &book("X"), Some(&cookie))
@@ -347,16 +322,15 @@ async fn update_missing_is_404_and_invalid_is_422(pool: SqlitePool) {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn cannot_reduce_copies_below_active_loans(pool: SqlitePool) {
-    let app = TestApp::new(pool.clone());
+async fn cannot_reduce_copies_below_active_loans(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let mut body = book("A");
     body["total_copies"] = json!(3);
     let created = create(&app, &cookie, body).await;
     let id = created["id"].as_i64().unwrap();
-    insert_loan(&pool, id, false).await;
-    insert_loan(&pool, id, true).await; // returned: does not count
+    insert_loan(&app, id, false).await;
+    insert_loan(&app, id, true).await; // returned: does not count
     let uri = format!("/api/books/{id}");
 
     // Exactly as many copies as active loans is allowed...
@@ -366,7 +340,7 @@ async fn cannot_reduce_copies_below_active_loans(pool: SqlitePool) {
     assert_eq!(status, StatusCode::OK, "{json}");
 
     // ...one fewer than active loans is not.
-    insert_loan(&pool, id, false).await;
+    insert_loan(&app, id, false).await;
     let (status, _, json) = app.put_json(&uri, &body, Some(&cookie)).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(json["error"]["code"], "copies_below_active_loans");
@@ -377,9 +351,8 @@ async fn cannot_reduce_copies_below_active_loans(pool: SqlitePool) {
     assert_eq!(json["available_copies"], 0);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn delete_happy_path_and_404(pool: SqlitePool) {
-    let app = TestApp::new(pool);
+async fn delete_happy_path_and_404(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let created = create(&app, &cookie, book("A")).await;
     let uri = format!("/api/books/{}", created["id"]);
@@ -393,13 +366,12 @@ async fn delete_happy_path_and_404(pool: SqlitePool) {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn delete_with_active_loan_is_409(pool: SqlitePool) {
-    let app = TestApp::new(pool.clone());
+async fn delete_with_active_loan_is_409(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let created = create(&app, &cookie, book("A")).await;
     let id = created["id"].as_i64().unwrap();
-    insert_loan(&pool, id, false).await;
+    insert_loan(&app, id, false).await;
 
     let (status, _, json) = app.delete(&format!("/api/books/{id}"), Some(&cookie)).await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -408,19 +380,16 @@ async fn delete_with_active_loan_is_409(pool: SqlitePool) {
     assert_eq!(status, StatusCode::OK);
 }
 
-#[sqlx::test(migrations = "../../migrations/sqlite")]
-async fn delete_with_only_returned_loans_removes_them(pool: SqlitePool) {
-    let app = TestApp::new(pool.clone());
+async fn delete_with_only_returned_loans_removes_them(db: Database) {
+    let app = TestApp::new(db);
     let cookie = app.login("ada", "password123").await;
     let created = create(&app, &cookie, book("A")).await;
     let id = created["id"].as_i64().unwrap();
-    insert_loan(&pool, id, true).await;
+    insert_loan(&app, id, true).await;
 
     let (status, _, _) = app.delete(&format!("/api/books/{id}"), Some(&cookie)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let loans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM loans")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let loans = app.scalar("SELECT COUNT(*) FROM loans", &[]).await;
     assert_eq!(loans, 0);
+}
 }
