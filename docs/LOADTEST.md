@@ -60,10 +60,19 @@ The rule does not change: the box total must be 4096 MiB, and `up` dies with a m
 otherwise. `scripts/loadtest.sh config` prints the rendered compose file of the box
 (`docker compose config`), to see the limits and Postgres flags without starting anything.
 
-Postgres runs with defaults except for memory: `shared_buffers` = 25% of `PG_MEM` and
-`effective_cache_size` = 75% of it, rounded to MB (704MB and 2112MB at 2816m; the runner
-derives them from `PG_MEM` and passes them as flags), `max_connections=50`, `work_mem=4MB`,
-`maintenance_work_mem=128MB` (and `shm_size` 256m). `synchronous_commit=on` and `fsync=on`
+Postgres runs with defaults except for memory, planner and WAL settings. Memory:
+`shared_buffers` = 25% of `PG_MEM` and `effective_cache_size` = 75% of it, rounded to MB
+(704MB and 2112MB at 2816m; the runner derives them from `PG_MEM` and passes them as
+flags), `max_connections=50`, `work_mem=4MB`, `maintenance_work_mem=176MB` (and `shm_size`
+256m). Planner and WAL, the standard SSD values as PGTune gives for a 2-CPU web workload:
+`random_page_cost=1.1`, `effective_io_concurrency=200`, `min_wal_size=1GB`,
+`max_wal_size=4GB`, `max_parallel_workers_per_gather=1`. With the hard-disk default
+`random_page_cost=4` the planner chose a Seq Scan of 52k rows (23 ms) for a whole-title
+book search, an `ILIKE` OR over three trigram GIN indexes; with 1.1 it uses the indexes
+(6 ms). Autovacuum runs more often (`autovacuum_vacuum_scale_factor=0.05`,
+`autovacuum_vacuum_insert_scale_factor=0.05`), so the visibility map keeps index-only scans
+cheap under constant updates; without it deep book-list pages did about 23k heap fetches
+per page. `synchronous_commit=on` and `fsync=on`
 stay, so a Postgres commit is durable on power loss. That is stronger than SQLite's
 `synchronous=NORMAL` (WAL), which can lose the last commits on power loss. Weigh this when
 you compare the two variants: Postgres pays for a durability SQLite does not give here.

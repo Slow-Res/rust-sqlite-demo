@@ -12,10 +12,15 @@ services:
       POSTGRES_USER: library # local only
       POSTGRES_PASSWORD: library # local only
       POSTGRES_DB: library
-    # Only the memory settings differ from the defaults: synchronous_commit=on
+    # Memory, planner and WAL settings differ from the defaults; synchronous_commit=on
     # and fsync=on stay, so a commit is durable on power loss. shared_buffers is
     # 25% and effective_cache_size 75% of PG_MEM; the runner derives them (the
-    # defaults here are those of the default 2816m).
+    # defaults here are those of the default 2816m). The planner and WAL flags
+    # are the standard SSD values, as PGTune gives for a 2-CPU web workload
+    # (random_page_cost=4 is a hard-disk default: it made the planner Seq Scan
+    # 52k rows for a whole-title ILIKE search instead of using the trigram GIN
+    # indexes). Autovacuum runs more often (scale factors 0.05) so the
+    # visibility map keeps index-only scans cheap under constant updates.
     command:
       - postgres
       - -c
@@ -27,7 +32,21 @@ services:
       - -c
       - work_mem=4MB
       - -c
-      - maintenance_work_mem=128MB
+      - maintenance_work_mem=176MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - max_parallel_workers_per_gather=1
+      - -c
+      - autovacuum_vacuum_scale_factor=0.05
+      - -c
+      - autovacuum_vacuum_insert_scale_factor=0.05
     # On disk, not tmpfs: the SQLite file is on disk too. The volume is the
     # parent of PGDATA (as in central.yml).
     volumes: [pgdata:/var/lib/postgresql]
