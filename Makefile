@@ -1,4 +1,4 @@
-.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user restore-drill e2e alerts-test
+.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user restore-drill e2e alerts-test loadtest loadtest-up loadtest-down
 
 # One-time developer setup. Tools are not installed for you: missing ones are reported.
 setup: ## Check tools, install npm deps, create the dev database
@@ -91,3 +91,15 @@ restore-drill: ## Restore a node's backup to a scratch copy and check it: make r
 e2e: images ## End-to-end test on a separate, throwaway cluster
 	scripts/test-restore-gate.sh
 	scripts/e2e.sh
+
+loadtest-up: ## Load test: start the 2 CPU / 4 GB node and seed it (needs make images)
+	scripts/loadtest.sh up
+
+loadtest-down: ## Load test: remove its cluster (results are kept)
+	scripts/loadtest.sh down
+
+loadtest: ## Load test: up, search users, search rps, down (takes hours; see docs/LOADTEST.md)
+	scripts/loadtest.sh up
+	scripts/loadtest.sh search users; rc=$$?; \
+	scripts/loadtest.sh search rps || rc=$$?; \
+	scripts/loadtest.sh down; exit $$rc

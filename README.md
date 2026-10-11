@@ -122,6 +122,7 @@ Postgres 5434, Prometheus 9091), so it can run next to `make up`.
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the picture, one write step by step, the guarantees.
 - [docs/RUNBOOK.md](docs/RUNBOOK.md): what to do when something breaks, and how to add a node or deploy.
+- [docs/LOADTEST.md](docs/LOADTEST.md): how much load one node (2 CPUs, 4 GB) handles, and how to measure it (`make loadtest`).
 - [docs/decisions](docs/decisions): why it is built this way.
   - [0001 SQLite as the primary database](docs/decisions/0001-sqlite-as-the-primary-database.md)
   - [0002 One container per job](docs/decisions/0002-one-container-per-job.md)
