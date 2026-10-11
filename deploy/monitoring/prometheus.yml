@@ -1,5 +1,7 @@
 # Scrapes every local node's Litestream and sync-worker (spec §8). On real
-# VMs, list each VM's address instead, and keep these ports off the internet.
+# VMs, list each VM's address instead (its METRICS_BIND_ADDR, with ports 9090
+# and 9100; see deploy/compose/node.metrics.yml) and keep those ports off the
+# internet.
 global:
   scrape_interval: 5s
   evaluation_interval: 5s

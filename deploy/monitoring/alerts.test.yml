@@ -1,0 +1,128 @@
+# Unit tests for alerts.yml: `make alerts-test` (promtool test rules).
+# One sample per minute. In every LitestreamStalled case the txid and PUT
+# series carry the labels Prometheus gives a real scrape.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # One write in a quiet hour, S3 down: the PUT counter never moves.
+  - name: stalled, quiet node with one write while S3 is down
+    interval: 1m
+    input_series:
+      - series: 'litestream_txid{instance="n1:9090", db="/data/library.db"}'
+        values: "100x70 101x40"
+      - series: 'litestream_replica_operation_total{instance="n1:9090", operation="PUT"}'
+        values: "50x110"
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: LitestreamStalled
+        exp_alerts: []
+      - eval_time: 85m
+        alertname: LitestreamStalled
+        exp_alerts:
+          - exp_labels:
+              instance: "n1:9090"
+              db: /data/library.db
+            exp_annotations:
+              summary: "n1:9090: Litestream stopped uploading to S3 while the database keeps changing"
+              runbook: "docs/RUNBOOK.md#s3-down"
+
+  # The same write, but S3 took the upload.
+  - name: stalled, silent on a quiet healthy node
+    interval: 1m
+    input_series:
+      - series: 'litestream_txid{instance="n1:9090", db="/data/library.db"}'
+        values: "100x70 101x40"
+      - series: 'litestream_replica_operation_total{instance="n1:9090", operation="PUT"}'
+        values: "50x70 51x40"
+    alert_rule_test:
+      - eval_time: 76m
+        alertname: LitestreamStalled
+        exp_alerts: []
+      - eval_time: 85m
+        alertname: LitestreamStalled
+        exp_alerts: []
+
+  # Litestream starts: txid is 0, then jumps to the current value. No write
+  # happened and the PUT counter has no series yet.
+  - name: stalled, silent on an idle node just after start
+    interval: 1m
+    input_series:
+      - series: 'litestream_txid{instance="n1:9090", db="/data/library.db"}'
+        values: "0 0 0 500x120"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LitestreamStalled
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: LitestreamStalled
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: LitestreamStalled
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: LitestreamStalled
+        exp_alerts: []
+
+  # Litestream restarted at minute 31 while S3 was down, so its PUT counter
+  # has no series. A write at minute 74 (after the start-up window left the
+  # 30m range) must alert.
+  - name: stalled, restart during an outage then a write
+    interval: 1m
+    input_series:
+      - series: 'litestream_txid{instance="n1:9090", db="/data/library.db"}'
+        values: "500x30 0x1 520x40 521x40"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: LitestreamStalled
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: LitestreamStalled
+        exp_alerts: []
+      - eval_time: 85m
+        alertname: LitestreamStalled
+        exp_alerts:
+          - exp_labels:
+              instance: "n1:9090"
+              db: /data/library.db
+            exp_annotations:
+              summary: "n1:9090: Litestream stopped uploading to S3 while the database keeps changing"
+              runbook: "docs/RUNBOOK.md#s3-down"
+
+  # time() is the eval time in seconds: 1800 s here, 5400 s in the last case.
+  - name: resync, fires while the gauge is recent
+    interval: 1m
+    input_series:
+      - series: 'sync_last_resync_timestamp_seconds{instance="n1:9100"}'
+        values: "1000x120"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SyncResync
+        exp_alerts:
+          - exp_labels:
+              instance: "n1:9100"
+            exp_annotations:
+              summary: "n1:9100 was restored from an older backup and may have lost writes; check sync_archive"
+              runbook: "docs/RUNBOOK.md#after-a-resync"
+
+  - name: resync, silent while the gauge is 0
+    interval: 1m
+    input_series:
+      - series: 'sync_last_resync_timestamp_seconds{instance="n1:9100"}'
+        values: "0x120"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SyncResync
+        exp_alerts: []
+
+  - name: resync, silent once the resync is over an hour old
+    interval: 1m
+    input_series:
+      - series: 'sync_last_resync_timestamp_seconds{instance="n1:9100"}'
+        values: "1000x120"
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SyncResync
+        exp_alerts: []

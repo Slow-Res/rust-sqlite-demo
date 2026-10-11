@@ -38,6 +38,13 @@ jobs:
       - name: The web app has no Postgres driver
         run: test -z "$(cargo tree -q -p library-web -i sqlx-postgres 2>/dev/null)"
 
+  alerts:
+    name: Alert rules (promtool)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make alerts-test
+
   types:
     name: Generated TypeScript types are up to date
     runs-on: ubuntu-latest

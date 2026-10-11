@@ -10,8 +10,10 @@ groups:
         annotations:
           summary: "{{ $labels.instance }}: Postgres is {{ $value | humanizeDuration }} behind this node"
           runbook: "docs/RUNBOOK.md#postgres-down"
+      # The worker sets the gauge when it detects a resync, so this does not
+      # depend on Prometheus having scraped the counter before it changed.
       - alert: SyncResync
-        expr: increase(sync_resyncs_total[1h]) > 0
+        expr: sync_last_resync_timestamp_seconds > 0 and time() - sync_last_resync_timestamp_seconds < 3600
         annotations:
           summary: "{{ $labels.instance }} was restored from an older backup and may have lost writes; check sync_archive"
           runbook: "docs/RUNBOOK.md#after-a-resync"
@@ -27,25 +29,25 @@ groups:
         annotations:
           summary: "{{ $labels.instance }}: Litestream is down; the S3 backup has stopped"
           runbook: "docs/RUNBOOK.md#s3-down"
-      # Both rules use the metrics Litestream 0.5.17 exposes. A stalled replica
-      # means S3 uploads stopped while the database kept getting new
-      # transactions. The PUT counter has no db label, so match on instance.
-      # The second branch covers a Litestream that restarted while S3 was down:
-      # a labelled counter has no series until its first success, so the first
-      # branch would be empty there. litestream_txid jumps from 0 to the current
-      # value when Litestream starts, so require more than one change to tell
-      # real writes from that start-up jump.
+      # A stalled replica: the database got new transactions in the last 30
+      # minutes but S3 took no upload. The PUT counter counts only successful
+      # uploads, has no db label (match on instance), and has no series at all
+      # until its first success, so a Litestream that restarted during an outage
+      # has none: `unless` keeps the node in that case too. The 30m window is
+      # why a quiet node (a few writes an hour) is still caught.
+      # litestream_txid jumps from 0 to the current value when Litestream
+      # starts. `min_over_time(...) > 0` drops every window that holds a 0
+      # sample, so that jump never counts as a write. (process_start_time_seconds
+      # exists too; this needs no extra series.) deploy/monitoring/alerts.test.yml
+      # tests the cases.
       - alert: LitestreamStalled
         expr: >-
           (
-            increase(litestream_replica_operation_total{operation="PUT"}[5m]) == 0
-            and on (instance) changes(litestream_txid[5m]) > 1
+            changes(litestream_txid[30m]) > 0
+            and on (instance) min_over_time(litestream_txid[30m]) > 0
           )
-          or
-          (
-            changes(litestream_txid[5m]) > 1
-            unless on (instance) litestream_replica_operation_total{operation="PUT"}
-          )
+          unless on (instance)
+          increase(litestream_replica_operation_total{operation="PUT"}[30m]) > 0
         for: 5m
         annotations:
           summary: "{{ $labels.instance }}: Litestream stopped uploading to S3 while the database keeps changing"

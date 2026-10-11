@@ -1,4 +1,4 @@
-.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user restore-drill e2e
+.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user restore-drill e2e alerts-test
 
 # One-time developer setup. Tools are not installed for you: missing ones are reported.
 setup: ## Check tools, install npm deps, create the dev database
@@ -42,7 +42,12 @@ types: ## Regenerate TypeScript types from the shared crate
 sqlx-prepare: ## Refresh committed offline query metadata
 	cd apps/web && DATABASE_URL=sqlite://$(CURDIR)/data/dev.db cargo sqlx prepare
 
-check: ## Every CI gate except the Docker end-to-end test (make e2e)
+# Same Prometheus image as deploy/compose/central.yml.
+alerts-test: ## Check and unit-test the alert rules with promtool (Docker)
+	docker run --rm -v "$(CURDIR)/deploy/monitoring:/m:ro" --entrypoint promtool prom/prometheus:v3.13.4 check rules /m/alerts.yml
+	docker run --rm -v "$(CURDIR)/deploy/monitoring:/m:ro" --entrypoint promtool prom/prometheus:v3.13.4 test rules /m/alerts.test.yml
+
+check: alerts-test ## Every CI gate except the Docker end-to-end test (make e2e)
 	cargo fmt --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	$(MAKE) test

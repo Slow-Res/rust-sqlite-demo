@@ -1,0 +1,17 @@
+# Optional override for a node on a real VM: publishes the Litestream (9090) and
+# worker (9100) metrics so a central Prometheus can scrape them. Use it with
+# node.yml:
+#   docker compose -p <node-id> -f node.yml -f node.metrics.yml --env-file node.env up -d
+# node.yml itself publishes nothing (the local cluster does not use this file:
+# Prometheus reaches the containers over the Docker network).
+#
+# METRICS_BIND_ADDR must be the VM's private address, reachable only from
+# Prometheus. These ports have no authentication; never bind them to a public
+# address or 0.0.0.0, and keep them closed in the firewall.
+services:
+  litestream:
+    ports:
+      - "${METRICS_BIND_ADDR:?set METRICS_BIND_ADDR to the VM's private address}:9090:9090"
+  sync-worker:
+    ports:
+      - "${METRICS_BIND_ADDR:?set METRICS_BIND_ADDR to the VM's private address}:9100:9100"
