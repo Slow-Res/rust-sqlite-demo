@@ -196,11 +196,11 @@ A user action is an intent. Each is picked by these shares:
 
 | Kind | Action | Share |
 |---|---|---|
-| read | browse a random page of books | 20% |
+| read | browse books: the next page, or page 1 (see "Browsing and paging") | 20% |
 | read | search books (a word from seeded titles/authors, or one whole seeded title) | 15% |
 | read | open a random book | 10% |
-| read | list a random page of members, or open a member | 8% |
-| read | list a random page of loans (active, returned or all) | 7% |
+| read | list members (next page or page 1), or open a member | 8% |
+| read | list loans (active, returned or all; next page or page 1) | 7% |
 | write | borrow a book | 13% |
 | write | return a loan | 13% |
 | write | edit a book | 5% |
@@ -218,6 +218,23 @@ actions per level (in the rps model, with many short-lived VUs, the share is lar
 summary also prints each level's starting `active_loans`, and the real split of the
 requests next to the intended split of the actions. The edits keep the copies, ISBN and email, so they
 cannot clash with other data (the API has no version column; a PUT replaces the record).
+
+### Browsing and paging
+
+`PAGING=cursor` (the default) makes browsing look like a user paging through a list.
+For `browse_books`, `list_members` and `list_loans` (one cursor per status) each VU keeps
+the `next_cursor` of its last answer for that list. With probability 0.75, if it has a
+cursor, it asks for the next page (`?after=<cursor>`); otherwise it asks for page 1, which
+resets the cursor (and so does the last page, whose `next_cursor` is null). Every page
+costs about the same as page 1, because the API pages by keyset (see
+`docs/ARCHITECTURE.md`, "List paging").
+
+`PAGING=offset` keeps the earlier workload: a random `page=N` of the whole list, so
+`OFFSET` reaches about 50,000 rows deep. Use it to reproduce earlier runs; their numbers
+are not comparable with cursor runs, because a random deep page is far more expensive,
+above all on Postgres. The summary header names the paging (`summary.json` has `paging`;
+older summaries have none and were run with offset). The action mix and the 40/60
+write/read split are the same in both.
 
 Every request is tagged `action:<name>`, `kind:read|write|auth` and
 `phase:ramp|hold|post`. Login, `GET /api/auth/me` and logout are `kind:auth` and count
@@ -376,6 +393,7 @@ Environment overrides (defaults in brackets):
 | `BOOKS` (50000), `MEMBERS` (10000), `LOANS` (20000) | size of the seed, for `up` |
 | `SEED_VUS` (16) | k6 VUs that seed |
 | `SESSION_POOL` (50) | sessions logged in at setup in the rps model |
+| `PAGING` (`cursor`) | `cursor`: "next page" browsing with `after`; `offset`: random deep `page=N`. See "Browsing and paging" |
 | `NODE_CPUS` (6,7), `CENTRAL_CPUS` (8-13), `K6_CPUS` (0-3) | core sets; they may not overlap or include 14-15 |
 | `PREFIX` (`lt-`) | name prefix of every resource of one box (compose projects, containers, networks, volumes, `loadtest/results/.state-<PREFIX>`); must start with `lt-` and end with `-`, e.g. `lt-pg-`. `down` removes only that prefix. See "Two boxes in parallel" |
 | `LT_MODE` (`web`) | `web` or `node`, see Modes |

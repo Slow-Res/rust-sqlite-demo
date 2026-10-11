@@ -15,6 +15,12 @@
 //                        MODE=users. Every request is
 //                        tagged step:<k> (k = elapsed / STEP_S, taken when the request
 //                        starts) and scripts/loadtest.sh ramp reads the numbers per step.
+// Browsing (browse_books, list_members, list_loans) follows PAGING:
+//   PAGING=cursor  (default) "next page" browsing: each VU keeps the last next_cursor
+//                        of each list; with probability 0.75, if it has one, it asks for
+//                        the next page (`after`), else for page 1, which resets the cursor.
+//   PAGING=offset  a random page=N of the whole list (OFFSET up to ~50,000), as in the
+//                        earlier runs.
 // users and rps ramp for RAMP seconds, then hold for HOLD seconds. Every request is
 // tagged phase:ramp|hold|post, action:<name> and kind:read|write|auth. All
 // reported numbers come from phase:hold only.
@@ -39,6 +45,9 @@ const SESSION_POOL = Number(__ENV.SESSION_POOL || 50);
 const SEED_BOOKS = Number(__ENV.SEED_BOOKS || 50000);
 const OUT = __ENV.OUT || '/out';
 const PER_PAGE = 20;
+const PAGING = __ENV.PAGING || 'cursor';
+if (PAGING !== 'cursor' && PAGING !== 'offset') throw new Error(`PAGING must be cursor or offset (got '${PAGING}')`);
+const NEXT_PAGE_P = 0.75; // cursor paging: chance of "next page" when the VU has a cursor
 
 // Every request kind with the statuses it may return. Anything else, a 5xx, a
 // timeout or a network error is an error. 409 is a normal business answer.
@@ -241,7 +250,8 @@ const json = (res, path) => {
 };
 
 // State one VU keeps across sessions.
-const vu = { loggedIn: false, everLoggedIn: false, ready: false, loans: [] };
+// `cursors`: the last next_cursor of each list (PAGING=cursor).
+const vu = { loggedIn: false, everLoggedIn: false, ready: false, loans: [], cursors: {} };
 
 function startSession() {
   const res = request('POST', '/api/auth/login', { username: c.ADMIN_USER, password: c.ADMIN_PASSWORD }, 'login');
@@ -254,9 +264,25 @@ function pageOf(total) {
   return 1 + c.rand(Math.max(1, Math.ceil(total / PER_PAGE)));
 }
 
+// One page of a list. `base` is the path with its query so far, `list` names the
+// cursor slot. offset: a random page of `total` items. cursor: the next page
+// after the VU's last cursor (probability NEXT_PAGE_P), else page 1; the answer's
+// next_cursor (null on the last page) becomes the VU's cursor either way.
+function browse(list, base, total, action) {
+  const join = base.includes('?') ? '&' : '?';
+  if (PAGING === 'offset') {
+    get(`${base}${join}page=${pageOf(total)}&per_page=${PER_PAGE}`, action);
+    return;
+  }
+  const cursor = vu.cursors[list];
+  const next = cursor && Math.random() < NEXT_PAGE_P;
+  const res = get(`${base}${join}per_page=${PER_PAGE}${next ? `&after=${encodeURIComponent(cursor)}` : ''}`, action);
+  vu.cursors[list] = res.status === 200 ? json(res, 'next_cursor') || undefined : undefined;
+}
+
 const ACTIONS = {
   browse_books(d) {
-    get(`/api/books?page=${pageOf(d.books)}&per_page=${PER_PAGE}`, 'browse_books');
+    browse('books', '/api/books', d.books, 'browse_books');
   },
   search_books() {
     // A word from the seeded titles or authors, or one whole seeded title.
@@ -267,12 +293,12 @@ const ACTIONS = {
     get(`/api/books/${1 + c.rand(d.books)}`, 'open_book');
   },
   members(d) {
-    if (Math.random() < 0.5) get(`/api/members?page=${pageOf(d.members)}&per_page=${PER_PAGE}`, 'list_members');
+    if (Math.random() < 0.5) browse('members', '/api/members', d.members, 'list_members');
     else get(`/api/members/${1 + c.rand(d.members)}`, 'open_member');
   },
   list_loans(d) {
     const status = c.pick(['active', 'returned', 'returned', 'all']);
-    get(`/api/loans?status=${status}&page=${pageOf(d.loans[status])}&per_page=${PER_PAGE}`, 'list_loans');
+    browse(`loans:${status}`, `/api/loans?status=${status}`, d.loans[status], 'list_loans');
   },
   borrow(d) {
     const res = request('POST', '/api/loans', { book_id: 1 + c.rand(d.books), member_id: 1 + c.rand(d.members) }, 'borrow');

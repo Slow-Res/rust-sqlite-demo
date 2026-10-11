@@ -257,6 +257,31 @@ Postgres `DEFAULT`, which is why the two defaults must match.
 Future work: a manual resync command, to re-copy a node on demand after a change like
 this.
 
+## List paging
+
+`GET /api/books`, `/api/members` and `/api/loans` return a `Page`: `items`, `page`,
+`per_page`, `total` and `next_cursor`. They page in two ways:
+
+- **`page=N`** uses `OFFSET`. A deep page walks and discards every row before it, which on
+  Postgres means a heap visit per skipped index entry (a random deep page of 50,000 books
+  ran at 257 req/s against 3,900 for page 1).
+- **`after=<cursor>`** is keyset paging: the page starts strictly after the item the
+  cursor names, in the list's own order (books `title, id`; members `name, id`; loans
+  `due_at, id`, or `returned_at DESC, id DESC` for `status=returned`), so every page costs
+  the same as page 1. `page` is ignored when `after` is given. Filters still apply.
+
+`next_cursor` is the cursor of the last item when another page may follow, else `null`. It
+is set for `page=N` requests too, so a client can start with page 1 and continue with
+`after`. The repository fetches `per_page + 1` rows to know whether there is a next page.
+`total` is unchanged (the cached count).
+
+A cursor is opaque: URL-safe base64 (no padding) of the JSON `[sort key, id]`. It is decoded
+into typed values and bound as parameters, never put into SQL, so it cannot inject. A
+cursor that is not valid base64, not that JSON, or has the wrong key type for the list is a
+400 `bad_request`. The SQL is a row-value comparison, `WHERE (b.title, b.id) > (?, ?)`
+(`<` for returned loans), which both SQLite and Postgres serve as an index range scan
+(`idx_books_title`, `idx_books_title_id`, ...) with no sort and no `OFFSET`.
+
 ## Future work
 
 - A manual resync command, to re-copy one node on demand.

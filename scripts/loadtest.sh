@@ -65,6 +65,8 @@ P95_MS="${P95_MS:-500}" P99_MS="${P99_MS:-1000}" ERR_PCT="${ERR_PCT:-$([ "${1:-}
 PAUSE_S="${PAUSE_S:-30}"           # between levels, after the sync worker has drained
 SAMPLE_S="${SAMPLE_S:-5}"
 SESSION_POOL="${SESSION_POOL:-50}"   # rps model: sessions logged in at setup
+PAGING="${PAGING:-cursor}"           # browsing: cursor = "next page" (keyset), offset = random deep pages
+[[ $PAGING == cursor || $PAGING == offset ]] || { echo "LOADTEST: PAGING must be cursor or offset" >&2; exit 2; }
 DRAIN_TIMEOUT_S="${DRAIN_TIMEOUT_S:-900}"
 MAX_LEVEL="${MAX_LEVEL:-100000}"   # the search gives up above this
 MAX_USERS="${MAX_USERS:-5000}"     # ramp stops here if no step has failed
@@ -458,7 +460,7 @@ run_level() {
   docker events --filter type=container --filter event=die --filter event=oom "${filters[@]}" --format '{{json .}}' >"$dir/events.jsonl" 2>/dev/null &
   EVENTS_PID=$!
   started=$(now)
-  k6_run "$dir" user.js "${env_args[@]}" -e RAMP="$RAMP" -e HOLD="$HOLD" -e SEED_BOOKS="$SEED_BOOKS" >"$dir/k6.log" 2>&1 || rc=$?
+  k6_run "$dir" user.js "${env_args[@]}" -e RAMP="$RAMP" -e HOLD="$HOLD" -e SEED_BOOKS="$SEED_BOOKS" -e PAGING="$PAGING" >"$dir/k6.log" 2>&1 || rc=$?
   finished=$(now)
   kill "$SAMPLER_PID" 2>/dev/null || true
   wait "$SAMPLER_PID" 2>/dev/null || true
@@ -510,7 +512,7 @@ pause_between_levels() {
 write_summary() {
   local dir=$1 levels=$2 result=${3:-null} aborted=${4:-}
   jq -s --argjson result "$result" --arg aborted "$aborted" --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
-    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" --arg db "$([ "$LT_MODE" = web ] && echo "$LT_DB" || true)" \
+    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg paging "$PAGING" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" --arg db "$([ "$LT_MODE" = web ] && echo "$LT_DB" || true)" \
     -f loadtest/summary.jq "$levels" >"$dir/summary.json" || return 1
   jq -r --arg prefix "$PREFIX" -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
   SUMMARY_DONE=true
@@ -699,7 +701,7 @@ cmd_ramp() {
   printf '\n==> ramp: %s users, +%s every %ss up to %s users (%s steps), until a step fails\n' "$start" "$step" "$step_s" "$MAX_USERS" "$nsteps"
   K6_ARGS=(--address 0.0.0.0:6565)
   k6_run "$dir" user.js -e MODE=ramp -e START="$start" -e STEP="$step" -e STEP_S="$step_s" -e MAX_USERS="$MAX_USERS" \
-    -e P99_MS="$P99_MS" -e SEED_BOOKS="$SEED_BOOKS" >"$dir/k6.log" 2>&1 &
+    -e P99_MS="$P99_MS" -e SEED_BOOKS="$SEED_BOOKS" -e PAGING="$PAGING" >"$dir/k6.log" 2>&1 &
   local k6_pid=$!
   K6_ARGS=()
   # k6 first starts every VU it may need (MAX_USERS), then runs setup().
@@ -769,7 +771,7 @@ cmd_ramp() {
   [ -z "$live_fail" ] || printed=$((k + 1))
   sed -n "$((printed + 1)),\$p" "$dir/steps.jsonl" | while IFS= read -r line; do jq -r -L loadtest -f loadtest/ramp-line.jq <<<"$line"; done
   local out
-  out=$(jq -s -L loadtest --arg db "$LT_DB" --arg node_cpus "$NODE_CPUS" --arg k6_cpus "$K6_CPUS" \
+  out=$(jq -s -L loadtest --arg db "$LT_DB" --arg paging "$PAGING" --arg node_cpus "$NODE_CPUS" --arg k6_cpus "$K6_CPUS" \
     --arg nginx_mem "$NGINX_MEM" --arg web_mem "$WEB_MEM" --arg pg_mem "$PG_MEM" \
     --arg pg_shared "${PG_SHARED_BUFFERS:-}" --arg pg_cache "${PG_EFFECTIVE_CACHE_SIZE:-}" \
     --argjson start "$start" --argjson step_users "$step" --argjson step_s "$step_s" --argjson max_users "$MAX_USERS" \
