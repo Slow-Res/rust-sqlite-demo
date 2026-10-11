@@ -11,6 +11,8 @@ pub struct Page<T> {
     pub items: Vec<T>,
     pub page: u32,
     pub per_page: u32,
+    /// Number of matching items over all pages. For an unfiltered list it may lag
+    /// behind a write by up to `LIST_COUNT_TTL_MS` (default 1 s; 0 is exact).
     #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub total: u64,
 }

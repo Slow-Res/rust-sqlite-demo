@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use library_shared::Member;
 
 use super::domain::MemberFields;
+use crate::count_cache::CountKey;
 use crate::db::RepoError;
 use crate::pagination::PageParams;
 
@@ -37,6 +38,14 @@ impl From<MemberRecord> for Member {
 pub struct MemberFilter {
     /// Already trimmed; `None` means no text search.
     pub q: Option<String>,
+}
+
+impl MemberFilter {
+    /// The count-cache slot for this filter, if its total is cacheable: only the
+    /// list without a search is.
+    pub fn count_key(&self) -> Option<CountKey> {
+        self.q.is_none().then_some(CountKey::Members)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

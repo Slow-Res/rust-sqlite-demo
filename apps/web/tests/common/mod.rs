@@ -99,6 +99,18 @@ impl TestApp {
         )
     }
 
+    /// Like [`new`](Self::new) but caching the totals of unfiltered lists for `ms`
+    /// (`LIST_COUNT_TTL_MS`).
+    pub fn with_count_ttl(db: impl Into<Database>, ms: u64) -> Self {
+        Self::with_config(
+            db.into(),
+            Config {
+                list_count_ttl_ms: ms,
+                ..test_config()
+            },
+        )
+    }
+
     fn with_config(db: Database, config: Config) -> Self {
         let clock = Arc::new(FixedClock::new(start_time()));
         let config = Arc::new(config);
@@ -321,6 +333,8 @@ pub fn test_config() -> Config {
         session_ttl_hours: 168,
         log_format: LogFormat::Pretty,
         node_id: "test-node".to_owned(),
+        // No count cache: list totals stay exact in the HTTP tests.
+        list_count_ttl_ms: 0,
     }
 }
 

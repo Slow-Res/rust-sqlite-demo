@@ -1,11 +1,13 @@
 //! Shared application state handed to every handler.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::auth::{AuthRepository, AuthService, SqliteAuthRepository};
 use crate::books::{BookRepository, BookService, SqliteBookRepository};
 use crate::clock::Clock;
 use crate::config::Config;
+use crate::count_cache::CountCache;
 use crate::db::Database;
 use crate::loans::{LoanRepository, LoanService, SqliteLoanRepository};
 use crate::members::{MemberRepository, MemberService, SqliteMemberRepository};
@@ -52,21 +54,33 @@ impl AppState {
             clock.clone(),
             chrono::Duration::hours(config.session_ttl_hours),
         );
+        // One cache for the totals of every unfiltered list.
+        let counts = Arc::new(CountCache::new(Duration::from_millis(
+            config.list_count_ttl_ms,
+        )));
         let (book_repo, member_repo, loan_repo): (
             Arc<dyn BookRepository>,
             Arc<dyn MemberRepository>,
             Arc<dyn LoanRepository>,
         ) = match &db {
             Database::Sqlite(pool) => (
-                Arc::new(SqliteBookRepository::new(pool.clone())),
-                Arc::new(SqliteMemberRepository::new(pool.clone())),
-                Arc::new(SqliteLoanRepository::new(pool.clone())),
+                Arc::new(SqliteBookRepository::new(pool.clone()).with_count_cache(counts.clone())),
+                Arc::new(
+                    SqliteMemberRepository::new(pool.clone()).with_count_cache(counts.clone()),
+                ),
+                Arc::new(SqliteLoanRepository::new(pool.clone()).with_count_cache(counts.clone())),
             ),
             #[cfg(feature = "postgres")]
             Database::Postgres(pool) => (
-                Arc::new(PostgresBookRepository::new(pool.clone())),
-                Arc::new(PostgresMemberRepository::new(pool.clone())),
-                Arc::new(PostgresLoanRepository::new(pool.clone())),
+                Arc::new(
+                    PostgresBookRepository::new(pool.clone()).with_count_cache(counts.clone()),
+                ),
+                Arc::new(
+                    PostgresMemberRepository::new(pool.clone()).with_count_cache(counts.clone()),
+                ),
+                Arc::new(
+                    PostgresLoanRepository::new(pool.clone()).with_count_cache(counts.clone()),
+                ),
             ),
         };
         let books = BookService::new(book_repo, clock.clone());

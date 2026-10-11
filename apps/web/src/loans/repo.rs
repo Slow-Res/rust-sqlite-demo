@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use library_shared::LoanStatus;
 
+use crate::count_cache::CountKey;
 use crate::db::RepoError;
 use crate::pagination::PageParams;
 
@@ -28,6 +29,23 @@ pub struct LoanFilter {
     pub status: LoanStatus,
     pub member_id: Option<i64>,
     pub book_id: Option<i64>,
+}
+
+impl LoanFilter {
+    /// The count-cache slot for this filter, if its total is cacheable: a status
+    /// of Active, Returned or All with no member or book. `Overdue` depends on
+    /// the current time, so it is always counted.
+    pub fn count_key(&self) -> Option<CountKey> {
+        if self.member_id.is_some() || self.book_id.is_some() {
+            return None;
+        }
+        match self.status {
+            LoanStatus::Active => Some(CountKey::LoansActive),
+            LoanStatus::Returned => Some(CountKey::LoansReturned),
+            LoanStatus::All => Some(CountKey::LoansAll),
+            LoanStatus::Overdue => None,
+        }
+    }
 }
 
 /// Everything needed to insert a loan; the service has already decided the dates.

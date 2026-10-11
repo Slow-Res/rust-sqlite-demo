@@ -1,11 +1,15 @@
 //! Postgres adapter for [`MemberRepository`] (load-test comparison only).
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 
 use super::domain::MemberFields;
 use super::repo::{DeleteMemberOutcome, MemberFilter, MemberRecord, MemberRepository};
+use crate::count_cache::CountCache;
 use crate::db::{RepoError, escape_like, from_timestamp, to_timestamp};
 use crate::pagination::PageParams;
 
@@ -30,11 +34,22 @@ macro_rules! select_members {
 #[derive(Debug, Clone)]
 pub struct PostgresMemberRepository {
     pool: PgPool,
+    counts: Arc<CountCache>,
 }
 
 impl PostgresMemberRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            // Off until `with_count_cache`: totals stay exact.
+            counts: Arc::new(CountCache::new(Duration::ZERO)),
+        }
+    }
+
+    /// Reuse the totals of unfiltered lists through `counts` (see `count_cache`).
+    pub fn with_count_cache(mut self, counts: Arc<CountCache>) -> Self {
+        self.counts = counts;
+        self
     }
 }
 
@@ -79,6 +94,14 @@ fn push_filter(builder: &mut QueryBuilder<Postgres>, filter: &MemberFilter) {
     }
 }
 
+/// Number of members matching `filter`.
+async fn count_members(pool: &PgPool, filter: &MemberFilter) -> Result<u64, RepoError> {
+    let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM members m");
+    push_filter(&mut count, filter);
+    let total: i64 = count.build_query_scalar().fetch_one(pool).await?;
+    u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))
+}
+
 /// Fetch one member. Takes a connection so it works on the pool and in a transaction.
 async fn fetch_member(conn: &mut PgConnection, id: i64) -> Result<Option<MemberRecord>, RepoError> {
     let row = sqlx::query_as::<_, MemberRow>(concat!(select_members!(), " WHERE m.id = $1"))
@@ -95,23 +118,24 @@ impl MemberRepository for PostgresMemberRepository {
         filter: &MemberFilter,
         page: PageParams,
     ) -> Result<(Vec<MemberRecord>, u64), RepoError> {
-        let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM members m");
-        push_filter(&mut count, filter);
-        let total: i64 = count.build_query_scalar().fetch_one(&self.pool).await?;
+        let total = self
+            .counts
+            .get_or_count_opt(filter.count_key(), || count_members(&self.pool, filter))
+            .await?;
 
-        // Paginate first, decorate after: Postgres evaluates the SELECT list for
-        // OFFSET rows too, so the correlated subquery would run for every skipped
-        // row. The inner query picks the page, the outer one computes the columns.
+        // Deferred join: the inner query walks the index and skips OFFSET rows
+        // reading only ids; the columns and the correlated subquery are computed
+        // for the page's rows only, not for every skipped row.
         let mut select = QueryBuilder::<Postgres>::new(concat!(
             member_columns!(),
-            " FROM (SELECT m.* FROM members m"
+            " FROM (SELECT m.id FROM members m"
         ));
         push_filter(&mut select, filter);
         select.push(" ORDER BY m.name ASC, m.id ASC LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");
         select.push_bind(page.offset());
-        select.push(") m ORDER BY m.name ASC, m.id ASC");
+        select.push(") p JOIN members m ON m.id = p.id ORDER BY m.name ASC, m.id ASC");
         let rows = select
             .build_query_as::<MemberRow>()
             .fetch_all(&self.pool)
@@ -121,7 +145,6 @@ impl MemberRepository for PostgresMemberRepository {
             .into_iter()
             .map(MemberRecord::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let total = u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))?;
         Ok((items, total))
     }
 

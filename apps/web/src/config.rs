@@ -26,6 +26,9 @@ pub struct Config {
     pub log_format: LogFormat,
     /// This node's name (spec §9); shown by /api/health.
     pub node_id: String,
+    /// How long the total of an unfiltered list page may be reused, in ms; 0
+    /// counts on every request (see `count_cache`).
+    pub list_count_ttl_ms: u64,
 }
 
 impl Config {
@@ -70,6 +73,7 @@ impl Config {
             session_ttl_hours,
             log_format,
             node_id,
+            list_count_ttl_ms: parse_or(&get, "LIST_COUNT_TTL_MS", 1000)?,
         })
     }
 }
@@ -110,6 +114,16 @@ mod tests {
         assert!(!config.cookie_secure);
         assert_eq!(config.session_ttl_hours, 168);
         assert_eq!(config.log_format, LogFormat::Pretty);
+        assert_eq!(config.list_count_ttl_ms, 1000);
+    }
+
+    #[test]
+    fn list_count_ttl_is_configurable_and_zero_is_allowed() {
+        let ttl = |v: &str| Config::from_lookup(lookup(&[("LIST_COUNT_TTL_MS", v)]));
+        assert_eq!(ttl("0").unwrap().list_count_ttl_ms, 0);
+        assert_eq!(ttl("250").unwrap().list_count_ttl_ms, 250);
+        let err = ttl("-1").unwrap_err();
+        assert!(err.to_string().contains("LIST_COUNT_TTL_MS"));
     }
 
     #[test]

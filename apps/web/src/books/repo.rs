@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use library_shared::{Availability, Book};
 
 use super::domain::BookFields;
+use crate::count_cache::CountKey;
 use crate::db::RepoError;
 use crate::pagination::PageParams;
 
@@ -45,6 +46,14 @@ pub struct BookFilter {
     /// Already trimmed; `None` means no text search.
     pub q: Option<String>,
     pub availability: Availability,
+}
+
+impl BookFilter {
+    /// The count-cache slot for this filter, if its total is cacheable: only the
+    /// unfiltered list (no search, availability All) is.
+    pub fn count_key(&self) -> Option<CountKey> {
+        (self.q.is_none() && self.availability == Availability::All).then_some(CountKey::Books)
+    }
 }
 
 /// Result of `update_checked`. The adapter decides atomically; the service

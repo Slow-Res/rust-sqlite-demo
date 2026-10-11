@@ -10,6 +10,7 @@ pub mod cli;
 pub mod clock;
 pub mod commands;
 pub mod config;
+pub mod count_cache;
 pub mod db;
 pub mod error;
 pub mod extract;

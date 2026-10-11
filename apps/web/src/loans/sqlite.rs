@@ -1,5 +1,8 @@
 //! SQLite adapter for [`LoanRepository`].
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use library_shared::LoanStatus;
@@ -8,6 +11,7 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 use super::repo::{
     CreateLoanOutcome, LoanDetails, LoanFilter, LoanRepository, NewLoanRecord, ReturnLoanOutcome,
 };
+use crate::count_cache::CountCache;
 use crate::db::{RepoError, from_timestamp, to_timestamp};
 use crate::pagination::PageParams;
 
@@ -27,11 +31,22 @@ macro_rules! select_loans {
 #[derive(Debug, Clone)]
 pub struct SqliteLoanRepository {
     pool: SqlitePool,
+    counts: Arc<CountCache>,
 }
 
 impl SqliteLoanRepository {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            // Off until `with_count_cache`: totals stay exact.
+            counts: Arc::new(CountCache::new(Duration::ZERO)),
+        }
+    }
+
+    /// Reuse the totals of unfiltered lists through `counts` (see `count_cache`).
+    pub fn with_count_cache(mut self, counts: Arc<CountCache>) -> Self {
+        self.counts = counts;
+        self
     }
 }
 
@@ -92,6 +107,18 @@ fn push_filter(builder: &mut QueryBuilder<Sqlite>, filter: &LoanFilter, now: Dat
     }
 }
 
+/// Number of loans matching `filter`.
+async fn count_loans(
+    pool: &SqlitePool,
+    filter: &LoanFilter,
+    now: DateTime<Utc>,
+) -> Result<u64, RepoError> {
+    let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM loans l");
+    push_filter(&mut count, filter, now);
+    let total: i64 = count.build_query_scalar().fetch_one(pool).await?;
+    u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))
+}
+
 /// Fetch one loan. Takes a connection so it works both on the pool and inside
 /// a transaction.
 async fn fetch_loan(
@@ -113,20 +140,32 @@ impl LoanRepository for SqliteLoanRepository {
         now: DateTime<Utc>,
         page: PageParams,
     ) -> Result<(Vec<LoanDetails>, u64), RepoError> {
-        let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM loans l");
-        push_filter(&mut count, filter, now);
-        let total: i64 = count.build_query_scalar().fetch_one(&self.pool).await?;
+        let total = self
+            .counts
+            .get_or_count_opt(filter.count_key(), || count_loans(&self.pool, filter, now))
+            .await?;
 
-        let mut select = QueryBuilder::<Sqlite>::new(select_loans!());
-        push_filter(&mut select, filter, now);
-        select.push(match filter.status {
+        // Deferred join: the inner query walks the index and skips OFFSET rows
+        // reading only ids; the joins to books and members are done for the
+        // page's rows only, not for every skipped row.
+        let order = match filter.status {
             LoanStatus::Returned => " ORDER BY l.returned_at DESC, l.id DESC",
             _ => " ORDER BY l.due_at ASC, l.id ASC",
-        });
+        };
+        let mut select = QueryBuilder::<Sqlite>::new(concat!(
+            "SELECT l.id, l.book_id, b.title AS book_title, l.member_id, m.name AS member_name, ",
+            "l.borrowed_at, l.due_at, l.returned_at FROM (SELECT l.id FROM loans l"
+        ));
+        push_filter(&mut select, filter, now);
+        select.push(order);
         select.push(" LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");
         select.push_bind(page.offset());
+        select.push(
+            ") p JOIN loans l ON l.id = p.id JOIN books b ON b.id = l.book_id JOIN members m ON m.id = l.member_id",
+        );
+        select.push(order);
         let rows = select
             .build_query_as::<LoanRow>()
             .fetch_all(&self.pool)
@@ -136,7 +175,6 @@ impl LoanRepository for SqliteLoanRepository {
             .into_iter()
             .map(LoanDetails::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let total = u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))?;
         Ok((items, total))
     }
 

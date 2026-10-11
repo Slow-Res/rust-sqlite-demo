@@ -3,4 +3,9 @@
 /**
  * One page of a list endpoint.
  */
-export type Page<T> = { items: Array<T>, page: number, per_page: number, total: number, };
+export type Page<T> = { items: Array<T>, page: number, per_page: number, 
+/**
+ * Number of matching items over all pages. For an unfiltered list it may lag
+ * behind a write by up to `LIST_COUNT_TTL_MS` (default 1 s; 0 is exact).
+ */
+total: number, };

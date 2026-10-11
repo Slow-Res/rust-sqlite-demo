@@ -1,5 +1,8 @@
 //! SQLite adapter for [`BookRepository`].
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use library_shared::Availability;
@@ -7,6 +10,7 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use super::domain::BookFields;
 use super::repo::{BookFilter, BookRecord, BookRepository, DeleteBookOutcome, UpdateBookOutcome};
+use crate::count_cache::CountCache;
 use crate::db::{RepoError, escape_like, from_timestamp, to_timestamp};
 use crate::pagination::PageParams;
 
@@ -21,26 +25,44 @@ macro_rules! active_loans {
     };
 }
 
-/// `SELECT ... FROM books b`, shaped like [`BookRow`].
-macro_rules! select_books {
+/// The column list of [`BookRow`], including the correlated subquery.
+macro_rules! book_columns {
     () => {
         concat!(
             "SELECT b.id, b.title, b.author, b.isbn, b.published_year, b.total_copies, ",
             "b.total_copies - ",
             active_loans!(),
-            " AS available_copies, b.created_at, b.updated_at FROM books b"
+            " AS available_copies, b.created_at, b.updated_at"
         )
+    };
+}
+
+/// `SELECT ... FROM books b`, shaped like [`BookRow`].
+macro_rules! select_books {
+    () => {
+        concat!(book_columns!(), " FROM books b")
     };
 }
 
 #[derive(Debug, Clone)]
 pub struct SqliteBookRepository {
     pool: SqlitePool,
+    counts: Arc<CountCache>,
 }
 
 impl SqliteBookRepository {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            // Off until `with_count_cache`: totals stay exact.
+            counts: Arc::new(CountCache::new(Duration::ZERO)),
+        }
+    }
+
+    /// Reuse the totals of unfiltered lists through `counts` (see `count_cache`).
+    pub fn with_count_cache(mut self, counts: Arc<CountCache>) -> Self {
+        self.counts = counts;
+        self
     }
 }
 
@@ -144,6 +166,14 @@ fn push_filter(builder: &mut QueryBuilder<Sqlite>, filter: &BookFilter) {
     }
 }
 
+/// Number of books matching `filter`.
+async fn count_books(pool: &SqlitePool, filter: &BookFilter) -> Result<u64, RepoError> {
+    let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM books b");
+    push_filter(&mut count, filter);
+    let total: i64 = count.build_query_scalar().fetch_one(pool).await?;
+    u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))
+}
+
 /// Fetch one book. Takes a connection so it works both on the pool and inside
 /// a transaction.
 async fn fetch_book(conn: &mut SqliteConnection, id: i64) -> Result<Option<BookRecord>, RepoError> {
@@ -161,16 +191,24 @@ impl BookRepository for SqliteBookRepository {
         filter: &BookFilter,
         page: PageParams,
     ) -> Result<(Vec<BookRecord>, u64), RepoError> {
-        let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM books b");
-        push_filter(&mut count, filter);
-        let total: i64 = count.build_query_scalar().fetch_one(&self.pool).await?;
+        let total = self
+            .counts
+            .get_or_count_opt(filter.count_key(), || count_books(&self.pool, filter))
+            .await?;
 
-        let mut select = QueryBuilder::<Sqlite>::new(select_books!());
+        // Deferred join: the inner query walks the index and skips OFFSET rows
+        // reading only ids; the columns and the correlated subquery are computed
+        // for the page's rows only, not for every skipped row.
+        let mut select = QueryBuilder::<Sqlite>::new(concat!(
+            book_columns!(),
+            " FROM (SELECT b.id FROM books b"
+        ));
         push_filter(&mut select, filter);
         select.push(" ORDER BY b.title ASC, b.id ASC LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");
         select.push_bind(page.offset());
+        select.push(") p JOIN books b ON b.id = p.id ORDER BY b.title ASC, b.id ASC");
         let rows = select
             .build_query_as::<BookRow>()
             .fetch_all(&self.pool)
@@ -180,7 +218,6 @@ impl BookRepository for SqliteBookRepository {
             .into_iter()
             .map(BookRecord::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let total = u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))?;
         Ok((items, total))
     }
 

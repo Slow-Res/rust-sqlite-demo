@@ -1,5 +1,8 @@
 //! Postgres adapter for [`BookRepository`] (load-test comparison only).
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use library_shared::Availability;
@@ -7,6 +10,7 @@ use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 
 use super::domain::BookFields;
 use super::repo::{BookFilter, BookRecord, BookRepository, DeleteBookOutcome, UpdateBookOutcome};
+use crate::count_cache::CountCache;
 use crate::db::{RepoError, escape_like, from_timestamp, to_timestamp};
 use crate::pagination::PageParams;
 
@@ -42,11 +46,22 @@ macro_rules! select_books {
 #[derive(Debug, Clone)]
 pub struct PostgresBookRepository {
     pool: PgPool,
+    counts: Arc<CountCache>,
 }
 
 impl PostgresBookRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            // Off until `with_count_cache`: totals stay exact.
+            counts: Arc::new(CountCache::new(Duration::ZERO)),
+        }
+    }
+
+    /// Reuse the totals of unfiltered lists through `counts` (see `count_cache`).
+    pub fn with_count_cache(mut self, counts: Arc<CountCache>) -> Self {
+        self.counts = counts;
+        self
     }
 }
 
@@ -122,6 +137,14 @@ fn push_filter(builder: &mut QueryBuilder<Postgres>, filter: &BookFilter) {
     }
 }
 
+/// Number of books matching `filter`.
+async fn count_books(pool: &PgPool, filter: &BookFilter) -> Result<u64, RepoError> {
+    let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM books b");
+    push_filter(&mut count, filter);
+    let total: i64 = count.build_query_scalar().fetch_one(pool).await?;
+    u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))
+}
+
 /// Fetch one book. Takes a connection so it works both on the pool and inside
 /// a transaction.
 async fn fetch_book(conn: &mut PgConnection, id: i64) -> Result<Option<BookRecord>, RepoError> {
@@ -139,23 +162,24 @@ impl BookRepository for PostgresBookRepository {
         filter: &BookFilter,
         page: PageParams,
     ) -> Result<(Vec<BookRecord>, u64), RepoError> {
-        let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM books b");
-        push_filter(&mut count, filter);
-        let total: i64 = count.build_query_scalar().fetch_one(&self.pool).await?;
+        let total = self
+            .counts
+            .get_or_count_opt(filter.count_key(), || count_books(&self.pool, filter))
+            .await?;
 
-        // Paginate first, decorate after: Postgres evaluates the SELECT list for
-        // OFFSET rows too, so the correlated subquery would run for every skipped
-        // row. The inner query picks the page, the outer one computes the columns.
+        // Deferred join: the inner query walks the index and skips OFFSET rows
+        // reading only ids; the columns and the correlated subquery are computed
+        // for the page's rows only, not for every skipped row.
         let mut select = QueryBuilder::<Postgres>::new(concat!(
             book_columns!(),
-            " FROM (SELECT b.* FROM books b"
+            " FROM (SELECT b.id FROM books b"
         ));
         push_filter(&mut select, filter);
         select.push(" ORDER BY b.title ASC, b.id ASC LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");
         select.push_bind(page.offset());
-        select.push(") b ORDER BY b.title ASC, b.id ASC");
+        select.push(") p JOIN books b ON b.id = p.id ORDER BY b.title ASC, b.id ASC");
         let rows = select
             .build_query_as::<BookRow>()
             .fetch_all(&self.pool)
@@ -165,7 +189,6 @@ impl BookRepository for PostgresBookRepository {
             .into_iter()
             .map(BookRecord::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let total = u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))?;
         Ok((items, total))
     }
 
