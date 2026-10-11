@@ -1,4 +1,4 @@
-# Build output, at any depth (e.g. backend/target/sqlx is created by #[sqlx::test]).
+# Build output, at any depth (e.g. apps/web/target/sqlx is created by #[sqlx::test]).
 target/
 # Local SQLite files, at any depth.
 data/

@@ -19,7 +19,7 @@ impl SqliteAuthRepository {
 }
 
 // `query!` checks the SQL against the dev database at compile time; the
-// results are cached in `backend/.sqlx/` so CI can build offline.
+// results are cached in `apps/web/.sqlx/` so CI can build offline.
 #[async_trait]
 impl AuthRepository for SqliteAuthRepository {
     async fn create_user(
