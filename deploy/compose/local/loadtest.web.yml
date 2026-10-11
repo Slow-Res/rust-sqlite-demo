@@ -42,6 +42,9 @@ services:
       COOKIE_SECURE: "false"
       SESSION_TTL_HOURS: "168"
       RUST_LOG: info
+      # No Litestream here, and constant readers keep SQLite's own checkpoints
+      # from ever resetting the WAL (2.5 GB for a 43 MB database): truncate it every second.
+      SQLITE_CHECKPOINT_INTERVAL_MS: "1000"
     volumes: [data:/data]
     # The same 2 cores (4.4 GHz efficiency cores) as the whole node of the
     # full-node mode; 4096 MiB minus nginx's 256. It holds the app, the SQLite

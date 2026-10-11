@@ -1,5 +1,6 @@
-//! Book search (`GET /api/books?q=`): the FTS5 trigram path, the `LIKE`
-//! fallback for short queries, and the index staying in sync with `books`.
+//! Book search (`GET /api/books?q=`): word prefixes (every word of `q` starts some
+//! word of title, author or ISBN), the plain-text fallback for a `q` with no word,
+//! and the index staying in sync with `books`.
 //!
 //! Raw SQL goes through `TestApp::scalar` with `$1` placeholders, so every test
 //! runs on SQLite and on Postgres (`db_tests!`). Only the migration test is SQLite-only.
@@ -95,84 +96,135 @@ async fn assert_finds(app: &TestApp, q: &str, expected: Vec<i64>) {
 }
 
 db_tests! {
-async fn title_substring_ignores_case(db: Database) {
+async fn words_match_by_prefix_ignoring_case(db: Database) {
     let app = TestApp::new(db);
     let f = fixture(&app).await;
-    assert_finds(&app, "hobbit", vec![f.hobbit, f.hobbit_cookbook]).await;
+    assert_finds(&app, "hob", vec![f.hobbit, f.hobbit_cookbook]).await;
     assert_finds(&app, "HoBbIt", vec![f.hobbit, f.hobbit_cookbook]).await;
+    assert_finds(&app, "tolk", vec![f.hobbit, f.fellowship]).await;
+    assert_finds(&app, "GAM", vec![f.hobbit_cookbook]).await;
+    // From 1 character on, in every column.
+    assert_finds(&app, "d", vec![f.dune]).await;
+    assert_finds(&app, "h", vec![f.hobbit, f.hobbit_cookbook, f.dune, f.hello]).await;
+    // A prefix of the whole word works too, and an extension of it does not.
+    assert_finds(&app, "dune", vec![f.dune]).await;
+    assert_finds(&app, "dunes", vec![]).await;
 }
 
-async fn author_substring(db: Database) {
+async fn the_middle_of_a_word_does_not_match(db: Database) {
     let app = TestApp::new(db);
-    let f = fixture(&app).await;
-    assert_finds(&app, "tolkien", vec![f.hobbit, f.fellowship]).await;
-    assert_finds(&app, "Gamgee", vec![f.hobbit_cookbook]).await;
+    fixture(&app).await;
+    assert_finds(&app, "obbit", vec![]).await;
+    assert_finds(&app, "olkien", vec![]).await;
+    assert_finds(&app, "ellowship", vec![]).await;
+    // "Fancy" contains "anc" but starts no word; "Ancient" starts with it.
+    let fancy = insert_book(&app, "Fancy Dress", "Zed", None).await;
+    assert_finds(&app, "anc", vec![]).await;
+    let ancient = insert_book(&app, "Ancient Dress", "Zed", None).await;
+    assert_finds(&app, "anc", vec![ancient]).await;
+    assert_finds(&app, "fanc", vec![fancy]).await;
+    assert_finds(&app, "ncy", vec![]).await;
+    assert_finds(&app, "gee", vec![]).await;
 }
 
-async fn isbn_substring_and_typed_with_hyphens_and_spaces(db: Database) {
+async fn every_word_must_match_a_prefix(db: Database) {
     let app = TestApp::new(db);
     let f = fixture(&app).await;
-    assert_finds(&app, "0261102", vec![f.hobbit]).await;
-    // Stored without separators; the typed form has them.
+    // Words may sit in different columns and in any order.
+    assert_finds(&app, "hobbit tolkien", vec![f.hobbit]).await;
+    assert_finds(&app, "tolkien hobbit", vec![f.hobbit]).await;
+    assert_finds(&app, "the hobbit", vec![f.hobbit]).await;
+    assert_finds(&app, "fellowship of the", vec![f.fellowship]).await;
+    assert_finds(&app, "ring fellow", vec![f.fellowship]).await;
+    assert_finds(&app, "hob cook", vec![f.hobbit_cookbook]).await;
+    assert_finds(&app, "tolkien the", vec![f.hobbit, f.fellowship]).await;
+    // Extra whitespace and punctuation between words change nothing.
+    assert_finds(&app, "  hob ,  tolk.  ", vec![f.hobbit]).await;
+    assert_finds(&app, "j.r.r. tolkien", vec![f.hobbit, f.fellowship]).await;
+    assert_finds(&app, "hobbit herbert", vec![]).await;
+    assert_finds(&app, "hobbit nonsense", vec![]).await;
+}
+
+async fn isbn_matches_by_prefix_typed_with_hyphens_and_spaces(db: Database) {
+    let app = TestApp::new(db);
+    let f = fixture(&app).await;
+    assert_finds(&app, "97802611", vec![f.hobbit]).await;
+    assert_finds(&app, "9780", vec![f.hobbit, f.dune]).await;
+    assert_finds(&app, "9", vec![f.hobbit, f.dune, f.hobbit_cookbook]).await;
+    // Stored without separators; the typed form has them, and is a prefix.
     assert_finds(&app, "978-0-261 10221-7", vec![f.hobbit]).await;
-    assert_finds(&app, "0441 172-719", vec![f.dune]).await;
+    assert_finds(&app, "978-0-441", vec![f.dune]).await;
+    assert_finds(&app, "978 1", vec![f.hobbit_cookbook]).await;
+    // Only a prefix: the middle of an ISBN does not match.
+    assert_finds(&app, "0261102", vec![]).await;
+    assert_finds(&app, "0441 172-719", vec![]).await;
     assert_finds(&app, "000-000", vec![]).await;
+    // The check digit X, in either case.
+    let tenth = insert_book(&app, "Tenth", "Ann", Some("012345678X")).await;
+    assert_finds(&app, "012345678x", vec![tenth]).await;
+    assert_finds(&app, "0-12345-678x", vec![tenth]).await;
+    assert_finds(&app, "0-12345-678X", vec![tenth]).await;
 }
 
-async fn wildcards_and_quotes_match_literally(db: Database) {
+async fn punctuation_and_search_syntax_are_literal_and_safe(db: Database) {
     let app = TestApp::new(db);
     let f = fixture(&app).await;
+    // Punctuation only separates words (`%` and `_` are not LIKE wildcards).
     assert_finds(&app, "100%", vec![f.pure_joy]).await;
-    assert_finds(&app, "e_Joy", vec![f.pure_joy]).await;
-    // `LIKE` wildcards would match these; literal text does not.
-    assert_finds(&app, "%%%", vec![]).await;
-    assert_finds(&app, "Pure%Joy", vec![]).await;
-    assert_finds(&app, "Pur_ Joy", vec![]).await;
+    assert_finds(&app, "Pure%Joy", vec![f.pure_joy]).await;
+    assert_finds(&app, "Pur_ Joy", vec![f.pure_joy]).await;
+    assert_finds(&app, "e_Joy", vec![]).await;
     assert_finds(&app, "\"Hello\"", vec![f.hello]).await;
-    assert_finds(&app, "y \"H", vec![f.hello]).await;
-    // FTS5 syntax is just text.
+    assert_finds(&app, "\"Hel", vec![f.hello]).await;
+    assert_finds(&app, "say \"H", vec![f.hello]).await;
+    assert_finds(&app, "(Dune)", vec![f.dune]).await;
+    assert_finds(&app, "-Dune-", vec![f.dune]).await;
+    assert_finds(&app, "Dun*", vec![f.dune]).await;
+    // Query-language words and operators are ordinary words that match nothing here.
     assert_finds(&app, "title:Dune", vec![]).await;
     assert_finds(&app, "Dune OR Hobbit", vec![]).await;
-    assert_finds(&app, "Dun*", vec![]).await;
-    assert_finds(&app, "(Dune)", vec![]).await;
-    // A lone quote is a 1-character query (the scan); three of them go to the index.
+    assert_finds(&app, "dune AND herbert NOT x", vec![]).await;
+    assert_finds(&app, "NEAR(dune herbert)", vec![]).await;
+    assert_finds(&app, "Dune NEAR Herbert", vec![]).await;
+    assert_finds(&app, "\"*:(-NEAR \"\"", vec![]).await;
+    assert_finds(&app, "'; DROP TABLE books; --", vec![]).await;
+    assert_finds(&app, "dune & herbert | !x <-> y:*", vec![]).await;
+    assert_finds(&app, "d\\", vec![f.dune]).await;
+    // ... and they match as words when the book has them.
+    let words = insert_book(&app, "Not And Or Near", "Ann Not", None).await;
+    assert_finds(&app, "not or", vec![words]).await;
+    assert_finds(&app, "near and not", vec![words]).await;
+    assert_finds(&app, "OR", vec![words]).await;
+    // With no word in `q` at all it is matched as plain text, like a substring.
     assert_finds(&app, "\"", vec![f.hello]).await;
+    assert_finds(&app, "%", vec![f.pure_joy]).await;
+    assert_finds(&app, "_", vec![f.pure_joy]).await;
+    assert_finds(&app, "%%%", vec![]).await;
+    assert_finds(&app, "-", vec![]).await;
+    assert_finds(&app, "*", vec![]).await;
+    assert_finds(&app, ":", vec![]).await;
+    assert_finds(&app, "(", vec![]).await;
+    assert_finds(&app, "\\", vec![]).await;
     assert_finds(&app, "\"\"\"", vec![]).await;
 }
 
-async fn non_ascii_title_in_the_stored_case(db: Database) {
+async fn non_ascii_words_in_the_stored_case(db: Database) {
     let app = TestApp::new(db);
     let f = fixture(&app).await;
-    // Same case as stored. How other-case non-ASCII text behaves differs by backend.
+    // Same case as stored: how other-case non-ASCII text folds depends on the
+    // backend (SQLite folds all Unicode, Postgres by its locale).
     assert_finds(&app, "Café", vec![f.cafe]).await;
+    assert_finds(&app, "Caf", vec![f.cafe]).await;
+    assert_finds(&app, "Soc", vec![f.cafe]).await;
     assert_finds(&app, "Société", vec![f.cafe]).await;
     assert_finds(&app, "Müller", vec![f.cafe]).await;
-}
-
-async fn short_queries_fall_back_to_like(db: Database) {
-    let app = TestApp::new(db);
-    let f = fixture(&app).await;
-    // 2 characters: the title/author part.
-    assert_finds(&app, "zo", vec![f.cafe]).await;
-    assert_finds(&app, "ZO", vec![f.cafe]).await;
-    // "ë" is 2 bytes but 1 character, so "oë" is short too.
-    assert_finds(&app, "oë", vec![f.cafe]).await;
-    // 1 character, matched in the ISBNs.
-    assert_finds(&app, "9", vec![f.hobbit, f.dune, f.hobbit_cookbook]).await;
-    // Long enough, but with its separators removed only "97" is left: still the scan.
-    assert_finds(&app, "9 7", vec![f.hobbit, f.dune, f.hobbit_cookbook]).await;
-    // `%` is a single character here and must still be literal.
-    assert_finds(&app, "%", vec![f.pure_joy]).await;
-    assert_finds(&app, "_", vec![f.pure_joy]).await;
-}
-
-async fn multi_word_query_is_one_phrase(db: Database) {
-    let app = TestApp::new(db);
-    let f = fixture(&app).await;
-    assert_finds(&app, "fellowship of the", vec![f.fellowship]).await;
-    assert_finds(&app, "the hobbit", vec![f.hobbit]).await;
-    // Both words occur in "The Hobbit" / "J.R.R. Tolkien", but not as one string.
-    assert_finds(&app, "hobbit tolkien", vec![]).await;
+    assert_finds(&app, "Mül", vec![f.cafe]).await;
+    assert_finds(&app, "zoë", vec![f.cafe]).await;
+    assert_finds(&app, "ZOË", vec![f.cafe]).await;
+    // Accents stay significant on both backends.
+    assert_finds(&app, "cafe", vec![]).await;
+    assert_finds(&app, "Muller", vec![]).await;
+    assert_finds(&app, "zoe", vec![]).await;
 }
 
 async fn combined_with_availability(db: Database) {
@@ -201,9 +253,10 @@ async fn combined_with_availability(db: Database) {
         (found, total),
         (sorted(vec![f.hobbit, f.hobbit_cookbook]), 2)
     );
-    // The fallback path combines the same way.
     let (found, total) = search(&app, "zo", "&availability=on_loan").await;
     assert_eq!((found, total), (vec![], 0));
+    let (found, total) = search(&app, "\"", "&availability=available").await;
+    assert_eq!((found, total), (vec![f.hello], 1));
 }
 
 async fn index_follows_updates_and_deletes(db: Database) {
@@ -261,14 +314,7 @@ async fn books_from_before_the_migration_are_found_after_it(pool: SqlitePool) {
     // SQLite-only: it is about the SQLite migration set (FTS5 index added over existing rows).
     let app = TestApp::new(pool.clone());
     // The schema as the previous release left it: everything up to the change log.
-    let mut previous = sqlx::migrate!("../../migrations/sqlite");
-    let migrations = previous
-        .iter()
-        .filter(|m| m.version <= 20261011000000)
-        .cloned()
-        .collect();
-    previous.migrations = std::borrow::Cow::Owned(migrations);
-    previous.run(&pool).await.unwrap();
+    migrate_up_to(&pool, 20261011000000).await;
     let has_index: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'books_fts')")
             .fetch_one(&pool)
@@ -279,7 +325,7 @@ async fn books_from_before_the_migration_are_found_after_it(pool: SqlitePool) {
     let f = fixture(&app).await;
 
     // Now the full set, as `library-web` runs it at startup. It also proves the
-    // bundled SQLite has FTS5 and the trigram tokenizer.
+    // bundled SQLite has FTS5 and the unicode61 tokenizer.
     library_web::db::migrate(&pool.clone().into())
         .await
         .unwrap();
@@ -288,4 +334,46 @@ async fn books_from_before_the_migration_are_found_after_it(pool: SqlitePool) {
     assert_finds(&app, "tolkien", vec![f.hobbit, f.fellowship]).await;
     assert_finds(&app, "978-0-261-10221-7", vec![f.hobbit]).await;
     assert_finds(&app, "Café", vec![f.cafe]).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_prefix_index_replaces_the_trigram_index_over_existing_books(pool: SqlitePool) {
+    let app = TestApp::new(pool.clone());
+    // The previous release: a trigram index kept in sync by its triggers.
+    migrate_up_to(&pool, 20261012000000).await;
+    let f = fixture(&app).await;
+    assert_eq!(
+        search(&app, "obbit", "").await.0,
+        sorted(vec![f.hobbit, f.hobbit_cookbook]),
+        "trigram: substring"
+    );
+
+    library_web::db::migrate(&pool.clone().into())
+        .await
+        .unwrap();
+
+    // Existing rows are in the new index; the substring no longer matches.
+    assert_finds(&app, "obbit", vec![]).await;
+    assert_finds(&app, "hob", vec![f.hobbit, f.hobbit_cookbook]).await;
+    // The triggers were recreated for the new table.
+    let new_id = insert_book(&app, "Neuromancer", "William Gibson", None).await;
+    assert_finds(&app, "neuro", vec![new_id]).await;
+    app.scalar(
+        "DELETE FROM books WHERE id = $1 RETURNING id",
+        &[new_id.into()],
+    )
+    .await;
+    assert_finds(&app, "neuro", vec![]).await;
+}
+
+/// Apply only the migrations up to and including `version`.
+async fn migrate_up_to(pool: &SqlitePool, version: i64) {
+    let mut migrator = sqlx::migrate!("../../migrations/sqlite");
+    let migrations = migrator
+        .iter()
+        .filter(|m| m.version <= version)
+        .cloned()
+        .collect();
+    migrator.migrations = std::borrow::Cow::Owned(migrations);
+    migrator.run(pool).await.unwrap();
 }

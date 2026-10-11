@@ -11,7 +11,7 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 use super::domain::BookFields;
 use super::repo::{BookFilter, BookRecord, BookRepository, DeleteBookOutcome, UpdateBookOutcome};
 use crate::count_cache::CountCache;
-use crate::db::{RepoError, escape_like, from_timestamp, to_timestamp};
+use crate::db::{RepoError, escape_like, from_timestamp, isbn_prefix, search_words, to_timestamp};
 use crate::pagination::PageParams;
 
 // SQL fragments shared by several queries. They are macros (not `const`s)
@@ -109,6 +109,22 @@ fn fts_phrase(text: &str) -> String {
     format!("\"{}\"", text.replace('"', "\"\""))
 }
 
+/// The FTS5 expression for the words of a search: every word is a prefix of a
+/// word in some column (`"anc"*`), ANDed, plus `OR isbn : "digits"*` for `q`
+/// typed as an ISBN with separators. Words are letters and digits only (see
+/// `search_words`) and quoted, so no query text is FTS syntax.
+fn fts_expression(words: &[&str], isbn_prefix: Option<&str>) -> String {
+    let words: Vec<String> = words
+        .iter()
+        .map(|word| format!("{}*", fts_phrase(word)))
+        .collect();
+    let mut expr = format!("{{title author isbn}} : ({})", words.join(" AND "));
+    if let Some(digits) = isbn_prefix {
+        expr.push_str(&format!(" OR isbn : {}*", fts_phrase(digits)));
+    }
+    expr
+}
+
 /// Append the `WHERE` clause for `filter`. Used for both the page query and the
 /// count query so they can never disagree.
 ///
@@ -119,14 +135,10 @@ fn fts_phrase(text: &str) -> String {
 fn push_filter(builder: &mut QueryBuilder<Sqlite>, filter: &BookFilter) {
     builder.push(" WHERE 1 = 1");
     if let Some(q) = &filter.q {
-        // ISBNs are stored without spaces or hyphens, so also match `q` with
-        // those removed.
-        let digits: String = q.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
-        // The trigram index cannot match text shorter than 3 characters, so
-        // those searches keep the scan. (`chars()`, not bytes: "é" is 1.)
-        let too_short = q.chars().count() < 3
-            || (!digits.is_empty() && digits != *q && digits.chars().count() < 3);
-        if too_short {
+        let words = search_words(q);
+        if words.is_empty() {
+            // Nothing but punctuation: no word to look up, so match it as plain
+            // text in a scan (rare, and it keeps the old result for such queries).
             let pattern = format!("%{}%", escape_like(q));
             builder.push(" AND (b.title LIKE ");
             builder.push_bind(pattern.clone());
@@ -136,6 +148,7 @@ fn push_filter(builder: &mut QueryBuilder<Sqlite>, filter: &BookFilter) {
             builder.push_bind(pattern);
             builder.push(" ESCAPE '\\'");
             // Skipped when nothing is left, or `%%` would match all.
+            let digits: String = q.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
             if !digits.is_empty() {
                 builder.push(" OR b.isbn LIKE ");
                 builder.push_bind(format!("%{}%", escape_like(&digits)));
@@ -143,13 +156,9 @@ fn push_filter(builder: &mut QueryBuilder<Sqlite>, filter: &BookFilter) {
             }
             builder.push(")");
         } else {
-            // Same meaning as the scan above, through the `books_fts` trigram
-            // index. One difference: trigram folds the case of all Unicode,
-            // `LIKE` only ASCII.
-            let mut expr = format!("{{title author isbn}} : {}", fts_phrase(q));
-            if !digits.is_empty() && digits != *q {
-                expr.push_str(&format!(" OR isbn : {}", fts_phrase(&digits)));
-            }
+            // The `books_fts` word-prefix index. Like the tokenizer it folds the
+            // case of all Unicode.
+            let expr = fts_expression(&words, isbn_prefix(q).as_deref());
             builder.push(" AND b.id IN (SELECT rowid FROM books_fts WHERE books_fts MATCH ");
             builder.push_bind(expr);
             builder.push(")");

@@ -11,7 +11,7 @@ use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use super::domain::BookFields;
 use super::repo::{BookFilter, BookRecord, BookRepository, DeleteBookOutcome, UpdateBookOutcome};
 use crate::count_cache::CountCache;
-use crate::db::{RepoError, escape_like, from_timestamp, to_timestamp};
+use crate::db::{RepoError, escape_like, from_timestamp, isbn_prefix, search_words, to_timestamp};
 use crate::pagination::PageParams;
 
 // SQL fragments shared by several queries; macros for the same reason as in
@@ -102,29 +102,55 @@ impl TryFrom<BookRow> for BookRecord {
     }
 }
 
+/// The `to_tsquery` text for the words of a search: every word a quoted prefix
+/// (`'anc':* & 'ada':*`). Words are letters and digits only (see `search_words`),
+/// so none holds a quote, a backslash or a tsquery operator.
+fn tsquery_text(words: &[&str]) -> String {
+    let words: Vec<String> = words.iter().map(|word| format!("'{word}':*")).collect();
+    words.join(" & ")
+}
+
 /// Append the `WHERE` clause for `filter`, for both the page and the count query.
-/// Same four branches as the SQLite `LIKE` version, with `ILIKE` ("C" collation:
-/// ASCII case folding only, like SQLite); the trigram GIN indexes serve them.
+/// Same meaning as the SQLite version: every word of `q` is a prefix of a word of
+/// title, author or ISBN. `book_search_vector` is the expression of the GIN index
+/// `idx_books_search`; the ISBN form (`q` without separators) is a `LIKE` prefix
+/// that the btree on `isbn` ("C" collation) serves.
 fn push_filter(builder: &mut QueryBuilder<Postgres>, filter: &BookFilter) {
     builder.push(" WHERE 1 = 1");
     if let Some(q) = &filter.q {
-        let pattern = format!("%{}%", escape_like(q));
-        builder.push(" AND (b.title ILIKE ");
-        builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR b.author ILIKE ");
-        builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR b.isbn ILIKE ");
-        builder.push_bind(pattern);
-        builder.push(" ESCAPE '\\'");
-        // ISBNs are stored without spaces or hyphens, so also match `q` with
-        // those removed. Skipped when nothing is left, or `%%` would match all.
-        let digits: String = q.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
-        if !digits.is_empty() {
-            builder.push(" OR b.isbn ILIKE ");
-            builder.push_bind(format!("%{}%", escape_like(&digits)));
+        let words = search_words(q);
+        if words.is_empty() {
+            // Nothing but punctuation: no word to look up, so match it as plain
+            // text in a scan (rare, and it keeps the old result for such queries).
+            let pattern = format!("%{}%", escape_like(q));
+            builder.push(" AND (b.title ILIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" ESCAPE '\\' OR b.author ILIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" ESCAPE '\\' OR b.isbn ILIKE ");
+            builder.push_bind(pattern);
             builder.push(" ESCAPE '\\'");
+            // Skipped when nothing is left, or `%%` would match all.
+            let digits: String = q.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
+            if !digits.is_empty() {
+                builder.push(" OR b.isbn ILIKE ");
+                builder.push_bind(format!("%{}%", escape_like(&digits)));
+                builder.push(" ESCAPE '\\'");
+            }
+            builder.push(")");
+        } else {
+            builder.push(
+                " AND (book_search_vector(b.title, b.author, b.isbn) @@ to_tsquery('simple', ",
+            );
+            builder.push_bind(tsquery_text(&words));
+            builder.push(")");
+            if let Some(digits) = isbn_prefix(q) {
+                // Letters and digits only, so no `LIKE` wildcard; ISBNs hold a capital X.
+                builder.push(" OR b.isbn LIKE ");
+                builder.push_bind(format!("{}%", digits.to_ascii_uppercase()));
+            }
+            builder.push(")");
         }
-        builder.push(")");
     }
     match filter.availability {
         Availability::All => {}
@@ -143,14 +169,6 @@ async fn count_books(pool: &PgPool, filter: &BookFilter) -> Result<u64, RepoErro
     push_filter(&mut count, filter);
     let total: i64 = count.build_query_scalar().fetch_one(pool).await?;
     u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))
-}
-
-/// Whether the trigram indexes can serve a search for `q`: they need 3 characters
-/// in every `ILIKE` pattern, the one with spaces and hyphens removed included.
-/// (SQLite's `too_short` is the same rule.)
-fn trigram_usable(q: &str) -> bool {
-    let digits = q.chars().filter(|c| !matches!(c, ' ' | '-')).count();
-    q.chars().count() >= 3 && (digits == 0 || digits >= 3)
 }
 
 /// Fetch one book. Takes a connection so it works both on the pool and inside
@@ -180,36 +198,16 @@ impl BookRepository for PostgresBookRepository {
         // reading only ids; the columns and the correlated subquery are computed
         // for the page's rows only, not for every skipped row.
         let mut select = QueryBuilder::<Postgres>::new(concat!(book_columns!(), " FROM ("));
-        // The keyset condition as a clause; `alias` is the table or CTE the page
-        // query reads `title` and `id` from.
-        let push_after = |select: &mut QueryBuilder<Postgres>, alias: &str, clause: &str| {
-            if let Some((title, id)) = &after {
-                select.push(format!(" {clause} ({alias}.title, {alias}.id) > ("));
-                select.push_bind(title.clone());
-                select.push(", ");
-                select.push_bind(*id);
-                select.push(")");
-            }
-        };
-        if filter.q.as_deref().is_some_and(trigram_usable) {
-            // A search the trigram indexes can serve is fenced into a materialized
-            // CTE: find the matches with the indexes, then sort just those. Left to
-            // itself the planner often walks the whole `(title, id)` index in order
-            // and applies the ILIKE to every row, hoping to meet 20 matches early;
-            // for a rare term that is a full index scan (20-50 ms at 50k books).
-            // A shorter term has no index: there the ordered walk, which stops after
-            // 20 matches, is the better plan.
-            select.push("WITH f AS MATERIALIZED (SELECT b.id, b.title FROM books b");
-            push_filter(&mut select, filter);
-            select.push(") SELECT f.id FROM f");
-            push_after(&mut select, "f", "WHERE");
-            select.push(" ORDER BY f.title ASC, f.id ASC");
-        } else {
-            select.push("SELECT b.id FROM books b");
-            push_filter(&mut select, filter);
-            push_after(&mut select, "b", "AND");
-            select.push(" ORDER BY b.title ASC, b.id ASC");
+        select.push("SELECT b.id FROM books b");
+        push_filter(&mut select, filter);
+        if let Some((title, id)) = after {
+            select.push(" AND (b.title, b.id) > (");
+            select.push_bind(title);
+            select.push(", ");
+            select.push_bind(id);
+            select.push(")");
         }
+        select.push(" ORDER BY b.title ASC, b.id ASC");
         select.push(" LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");
@@ -339,21 +337,5 @@ impl BookRepository for PostgresBookRepository {
             .await?;
         tx.commit().await?;
         Ok(DeleteBookOutcome::Deleted)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn trigram_indexes_need_three_characters_in_every_pattern() {
-        assert!(trigram_usable("Dune"));
-        assert!(trigram_usable("abc"));
-        assert!(trigram_usable("a b c")); // 3 characters once spaces are removed
-        assert!(trigram_usable("---")); // nothing left for the ISBN pattern, the others are 3 long
-        assert!(!trigram_usable("ab"));
-        assert!(!trigram_usable("a b")); // ISBN pattern "ab" is too short
-        assert!(!trigram_usable("é"));
     }
 }

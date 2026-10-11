@@ -160,7 +160,7 @@ async fn search_matches_title_author_isbn_case_insensitively(db: Database) {
     assert_eq!(titles(&page), ["The Rust Book"]);
     let (_, _, page) = app.get("/api/books?q=herbert", None).await;
     assert_eq!(titles(&page), ["Dune"]);
-    let (_, _, page) = app.get("/api/books?q=0131", None).await;
+    let (_, _, page) = app.get("/api/books?q=97801311", None).await;
     assert_eq!(titles(&page), ["Dune"]);
     let (_, _, page) = app.get("/api/books?q=%20%20", None).await;
     assert_eq!(page["total"], 2);
@@ -183,7 +183,7 @@ async fn search_matches_isbn_typed_with_hyphens_or_spaces(db: Database) {
     assert_eq!(titles(&page), ["Dune"]);
     let (_, _, page) = app.get("/api/books?q=978%200131", None).await;
     assert_eq!(titles(&page), ["Dune"]);
-    // Only separators left after stripping: not a match-everything pattern.
+    // Only separators: no word, matched as plain text, not as a match-everything pattern.
     let (_, _, page) = app.get("/api/books?q=-", None).await;
     assert_eq!(page["total"], 0);
 }
@@ -216,7 +216,7 @@ async fn search_treats_wildcards_literally(db: Database) {
 
     let (_, _, page) = app.get("/api/books?q=%25", None).await;
     assert_eq!(titles(&page), ["100% Rust"]);
-    let (_, _, page) = app.get("/api/books?q=e_c", None).await;
+    let (_, _, page) = app.get("/api/books?q=snake_c", None).await;
     assert_eq!(titles(&page), ["snake_case"]);
     let (_, _, page) = app.get("/api/books?q=%5C", None).await;
     assert_eq!(titles(&page), ["back\\slash"]);
