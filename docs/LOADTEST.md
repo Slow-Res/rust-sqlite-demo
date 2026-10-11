@@ -283,6 +283,7 @@ Environment overrides (defaults in brackets):
 | `SEED_VUS` (16) | k6 VUs that seed |
 | `SESSION_POOL` (50) | sessions logged in at setup in the rps model |
 | `NODE_CPUS` (6,7), `CENTRAL_CPUS` (8-13), `K6_CPUS` (0-3) | core sets; they may not overlap or include 14-15 |
+| `PREFIX` (`lt-`) | name prefix of every resource of one box (compose projects, containers, networks, volumes, `loadtest/results/.state-<PREFIX>`); must start with `lt-` and end with `-`, e.g. `lt-pg-`. `down` removes only that prefix. See "Two boxes in parallel" |
 | `LT_MODE` (`web`) | `web` or `node`, see Modes |
 | `LT_DB` (`sqlite`) | `sqlite` or `postgres`, web mode only |
 | `WEB_IMAGE` (`sqlite-production/web:lt`) | the web image of web mode (build it with `make loadtest-image`) |
@@ -291,8 +292,24 @@ Environment overrides (defaults in brackets):
 | `MAX_LEVEL` (100000) | the search gives up above this level |
 | `SAMPLE_S` (5) | sampling tick during a level |
 | `DRAIN_TIMEOUT_S` (900) | longest wait for the sync worker to drain |
-| `RESULTS_DIR` | results directory (default `loadtest/results/<UTC timestamp>`, with `-sqlite` or `-postgres` appended in web mode) |
+| `RESULTS_DIR` | results directory (default `loadtest/results/<UTC timestamp>`, with `-sqlite` or `-postgres` appended in web mode, and `-<prefix>` when `PREFIX` is not `lt-`) |
 | `LT_ADMIN_PASSWORD` (`loadtest-local-only`) | password of the local-only `admin` account |
+
+### Two boxes in parallel
+
+Web mode can run two boxes at once, for example SQLite and Postgres, on different cores.
+Give each its own `PREFIX`, `NODE_CPUS` and `K6_CPUS`:
+
+```
+PREFIX=lt- LT_DB=sqlite NODE_CPUS=6,7 K6_CPUS=0-2 scripts/loadtest.sh up
+PREFIX=lt-pg- LT_DB=postgres NODE_CPUS=10,11 K6_CPUS=3-5 scripts/loadtest.sh up
+```
+
+Pass the same `PREFIX` to every later command (`users`, `rps`, `search`, `down`) of that box.
+Cores 6-9 and 10-13 are separate E-core clusters with their own L2, so the boxes do not
+share a cache. They do share the laptop's power budget, so absolute numbers can be a bit
+lower than in a solo run, but the comparison between the two boxes stays fair. Node mode
+publishes fixed host ports, so it supports one box at a time.
 
 A harness failure (a query or jq program fails, k6 dies, Postgres cannot be read) ends the
 script with exit 2 and a message. It is never reported as a failed level. Whatever was

@@ -14,8 +14,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-export PREFIX=lt-
-export SHARED_NETWORK=lt-sqlite-prod
+# PREFIX names every resource of one box (projects, containers, networks, volumes, state
+# dir), so two boxes (PREFIX=lt- and PREFIX=lt-pg-) can run side by side. It always starts
+# with lt- and ends with -.
+PREFIX="${PREFIX:-lt-}"
+[[ $PREFIX =~ ^lt-([a-z0-9-]*-)?$ ]] || { echo "LOADTEST: usage: PREFIX must start with lt- and end with -, e.g. lt- or lt-pg- (got '$PREFIX')" >&2; exit 2; }
+export PREFIX
+export SHARED_NETWORK="${PREFIX}sqlite-prod"
 export POSTGRES_HOST_PORT=5436
 export PROMETHEUS_HOST_PORT=9092
 export HTTP_PORT_BASE=4200
@@ -63,6 +68,7 @@ MAX_LEVEL="${MAX_LEVEL:-100000}"   # the search gives up above this
 
 RESULTS_ROOT=loadtest/results
 STATE_DIR=$RESULTS_ROOT/.state
+[ "$PREFIX" = lt- ] || STATE_DIR=$RESULTS_ROOT/.state-$PREFIX
 SAMPLER_PID=
 EVENTS_PID=
 WORK=$(mktemp -d)
@@ -76,7 +82,7 @@ on_exit() {
   trap - EXIT
   [ -z "$SAMPLER_PID" ] || kill "$SAMPLER_PID" 2>/dev/null || true
   [ -z "$EVENTS_PID" ] || kill "$EVENTS_PID" 2>/dev/null || true
-  docker rm -f "lt-k6-$$" >/dev/null 2>&1 || true
+  docker rm -f "${PREFIX}k6-$$" >/dev/null 2>&1 || true
   # Whatever ended the run early, keep what was measured.
   if [ -n "$RUN_DIR" ] && [ "$SUMMARY_DONE" != true ] && [ -s "$RUN_DIR/levels.jsonl" ]; then
     write_summary "$RUN_DIR" "$RUN_DIR/levels.jsonl" "$RUN_RESULT" "${ABORT_REASON:-interrupted or failed (exit $rc)}" >&2 || true
@@ -208,7 +214,7 @@ k6_run() {
   local out=$1 script=$2
   shift 2
   [[ $out == /* ]] || out=$PWD/$out
-  docker run --rm --name "lt-k6-$$" --cpuset-cpus "$K6_CPUS" --network "$K6_NETWORK" --user "$(id -u):$(id -g)" \
+  docker run --rm --name "${PREFIX}k6-$$" --cpuset-cpus "$K6_CPUS" --network "$K6_NETWORK" --user "$(id -u):$(id -g)" \
     -v "$PWD/loadtest:/lt:ro" -v "$out:/out" -e BASE_URL="$BASE_URL" -e OUT=/out \
     -e LT_ADMIN_USER -e LT_ADMIN_PASSWORD "$@" "$K6_IMAGE" run --quiet "/lt/$script"
 }
@@ -338,10 +344,10 @@ cmd_up() {
 cmd_down() {
   # Every step runs, even if an earlier one fails.
   # One down cleans whatever exists, whichever mode made it.
-  docker compose -p "${PREFIX}web" -f deploy/compose/local/loadtest.web.yml -f deploy/compose/local/loadtest.web-pg.yml down -v || echo "warning: could not remove the lt-web project" >&2
-  node_compose down -v || echo "warning: could not remove the lt-node1 project" >&2
-  central down -v || echo "warning: could not remove the lt-central project" >&2
-  docker rm -f $(docker ps -aq --filter "name=^lt-k6-") >/dev/null 2>&1 || true
+  docker compose -p "${PREFIX}web" -f deploy/compose/local/loadtest.web.yml -f deploy/compose/local/loadtest.web-pg.yml down -v || echo "warning: could not remove the ${PREFIX}web project" >&2
+  node_compose down -v || echo "warning: could not remove the ${PREFIX}node1 project" >&2
+  central down -v || echo "warning: could not remove the ${PREFIX}central project" >&2
+  docker rm -f $(docker ps -aq --filter "name=^${PREFIX}k6-") >/dev/null 2>&1 || true
   rm -rf "$STATE_DIR" || echo "warning: could not remove $STATE_DIR" >&2
   echo "load-test cluster removed (results in $RESULTS_ROOT are kept)"
 }
@@ -358,7 +364,7 @@ sample_loop() {
   while :; do
     t=$next
     names=("${NODE_CONTAINERS[@]}")
-    if [ "$(docker inspect -f '{{.State.Running}}' "lt-k6-$$" 2>/dev/null)" = true ]; then names+=("lt-k6-$$"); fi
+    if [ "$(docker inspect -f '{{.State.Running}}' "${PREFIX}k6-$$" 2>/dev/null)" = true ]; then names+=("${PREFIX}k6-$$"); fi
     (docker stats --no-stream --format '{{json .}}' "${names[@]}" 2>/dev/null | jq -cs . >"$WORK/s.stats") &
     if [ "$LT_MODE" = node ]; then
       (prom 'sync_pending_changes' >"$WORK/s.pending") &
@@ -476,7 +482,7 @@ write_summary() {
 }
 
 new_results_dir() {
-  local dir="${RESULTS_DIR:-$RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)$([ "$LT_MODE" = web ] && echo "-$LT_DB")}"
+  local dir="${RESULTS_DIR:-$RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)$([ "$LT_MODE" = web ] && echo "-$LT_DB")$([ "$PREFIX" = lt- ] || echo "-${PREFIX%-}")}"
   mkdir -p "$dir" || die "cannot create the results directory $dir"
   echo "$dir"
 }
