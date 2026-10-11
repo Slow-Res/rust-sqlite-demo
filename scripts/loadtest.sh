@@ -39,6 +39,7 @@ RAMP="${RAMP:-60}" HOLD="${HOLD:-300}"
 P95_MS="${P95_MS:-500}" P99_MS="${P99_MS:-1000}" ERR_PCT="${ERR_PCT:-1}" DROP_PCT="${DROP_PCT:-1}"
 PAUSE_S="${PAUSE_S:-30}"           # between levels, after the sync worker has drained
 SAMPLE_S="${SAMPLE_S:-5}"
+SESSION_POOL="${SESSION_POOL:-50}"   # rps model: sessions logged in at setup
 DRAIN_TIMEOUT_S="${DRAIN_TIMEOUT_S:-900}"
 MAX_LEVEL="${MAX_LEVEL:-100000}"   # the search gives up above this
 
@@ -47,16 +48,29 @@ STATE_DIR=$RESULTS_ROOT/.state
 SAMPLER_PID=
 EVENTS_PID=
 WORK=$(mktemp -d)
-cleanup() {
+RUN_DIR=          # results of the running command, for the summary of an aborted run
+RUN_RESULT=null   # the search result so far, as JSON
+SUMMARY_DONE=false
+ABORT_REASON=
+LEVEL_PASS=       # set by run_level: true or false
+on_exit() {
+  local rc=$?
+  trap - EXIT
   [ -z "$SAMPLER_PID" ] || kill "$SAMPLER_PID" 2>/dev/null || true
   [ -z "$EVENTS_PID" ] || kill "$EVENTS_PID" 2>/dev/null || true
   docker rm -f "lt-k6-$$" >/dev/null 2>&1 || true
+  # Whatever ended the run early, keep what was measured.
+  if [ -n "$RUN_DIR" ] && [ "$SUMMARY_DONE" != true ] && [ -s "$RUN_DIR/levels.jsonl" ]; then
+    write_summary "$RUN_DIR" "$RUN_DIR/levels.jsonl" "$RUN_RESULT" "${ABORT_REASON:-interrupted or failed (exit $rc)}" >&2 || true
+  fi
   rm -rf "$WORK"
+  exit "$rc"
 }
-trap cleanup EXIT
+trap on_exit EXIT
+trap 'exit 130' INT TERM
 
 step() { printf '\n==> %s\n' "$*"; }
-die() { echo "LOADTEST: $*" >&2; exit 2; }
+die() { ABORT_REASON="$*"; echo "LOADTEST: $*" >&2; exit 2; }
 now() { date +%s.%N; }
 elapsed_since() { awk -v a="$(now)" -v b="$1" 'BEGIN { printf "%.1f", a - b }'; }
 
@@ -228,27 +242,41 @@ cmd_up() {
 }
 
 cmd_down() {
-  node_compose down -v
-  central down -v
+  # Every step runs, even if an earlier one fails.
+  node_compose down -v || echo "warning: could not remove the lt-node1 project" >&2
+  central down -v || echo "warning: could not remove the lt-central project" >&2
   docker rm -f $(docker ps -aq --filter "name=^lt-k6-") >/dev/null 2>&1 || true
-  rm -rf "$STATE_DIR"
+  rm -rf "$STATE_DIR" || echo "warning: could not remove $STATE_DIR" >&2
   echo "load-test cluster removed (results in $RESULTS_ROOT are kept)"
 }
 
+
 # ------------------------------------------------------------------- levels
 
-# Samples every SAMPLE_S seconds, as JSON lines: container CPU and memory, the
-# sync worker's backlog and Litestream's position and upload counter.
+# Samples on a fixed SAMPLE_S tick, as JSON lines: container CPU and memory (the
+# node's, and k6's while it runs), the sync worker's backlog, and Litestream's
+# position and upload counter. The queries run at the same time, so a slow
+# `docker stats` (about 2 s) does not stretch the tick.
 sample_loop() {
-  local file=$1 t stats
+  local file=$1 t next=$(now) names pids delay
   while :; do
-    t=$(now)
-    stats=$(docker stats --no-stream --format '{{json .}}' "${NODE_CONTAINERS[@]}" 2>/dev/null | jq -cs .) || stats='[]'
-    jq -cn --arg t "$t" --argjson stats "${stats:-[]}" \
-      --argjson pending "$(prom 'sync_pending_changes')" --argjson lag "$(prom 'sync_lag_seconds')" \
-      --argjson puts "$(prom 'sum(litestream_replica_operation_total{operation="PUT"})')" --argjson txid "$(prom 'litestream_txid')" \
-      '{t: ($t | tonumber), stats: $stats, pending: $pending, lag: $lag, puts: $puts, txid: $txid}' >>"$file"
-    sleep "$SAMPLE_S"
+    t=$next
+    names=("${NODE_CONTAINERS[@]}")
+    if [ "$(docker inspect -f '{{.State.Running}}' "lt-k6-$$" 2>/dev/null)" = true ]; then names+=("lt-k6-$$"); fi
+    (docker stats --no-stream --format '{{json .}}' "${names[@]}" 2>/dev/null | jq -cs . >"$WORK/s.stats") &
+    (prom 'sync_pending_changes' >"$WORK/s.pending") &
+    (prom 'sync_lag_seconds' >"$WORK/s.lag") &
+    (prom 'sum(litestream_replica_operation_total{operation="PUT"})' >"$WORK/s.puts") &
+    (prom 'litestream_txid' >"$WORK/s.txid") &
+    wait
+    jq -cn --arg t "$t" --argjson stats "$(cat "$WORK/s.stats")" \
+      --argjson pending "$(cat "$WORK/s.pending")" --argjson lag "$(cat "$WORK/s.lag")" \
+      --argjson puts "$(cat "$WORK/s.puts")" --argjson txid "$(cat "$WORK/s.txid")" \
+      '{t: ($t | tonumber), stats: $stats, pending: $pending, lag: $lag, puts: $puts, txid: $txid}' >>"$file" || true
+    next=$(awk -v n="$next" -v s="$SAMPLE_S" 'BEGIN { printf "%.3f", n + s }')
+    delay=$(awk -v n="$next" -v c="$(now)" -v s="$SAMPLE_S" 'BEGIN { d = n - c; if (d < 0) { d = 0; n = c } printf "%.3f", d }')
+    # A tick that ran over starts the next one at once; it does not queue up.
+    sleep "$delay"
   done
 }
 
@@ -259,23 +287,24 @@ restart_state() {
   done | jq -cs .
 }
 
-# run_level users|rps <value> <dir>: one level. Writes <dir>/level.json.
-# Returns 0 for pass, 1 for fail. Anything that stops the test from measuring
-# (k6 died, no summary) ends the script with 2.
+# run_level users|rps <value> <dir>: one level. Writes <dir>/level.json and sets
+# LEVEL_PASS to true or false. A failing level is a result; anything that stops
+# the test from measuring (k6 died, no summary, a failed query or jq program)
+# ends the script with `die`, never as a failed level.
 run_level() {
-  local kind=$1 value=$2 dir=$3 env_args started finished rc=0 drain restarts_before restarts_after rows_before rows_after
+  local kind=$1 value=$2 dir=$3 env_args started finished rc=0 drain restarts_before restarts_after rows_before rows_after setup_ms setup_json
   mkdir -p "$dir"
   # shellcheck disable=SC1091
   . "$STATE_DIR/seed.env" 2>/dev/null || die "no seeded cluster: scripts/loadtest.sh up first"
   curl -fsS "$HOST_URL/api/health" >/dev/null || die "node1 is not answering on $HOST_URL"
-  if [ "$kind" = users ]; then env_args=(-e MODE=users -e USERS="$value"); else env_args=(-e MODE=rps -e RPS="$value"); fi
+  if [ "$kind" = users ]; then env_args=(-e MODE=users -e USERS="$value"); else env_args=(-e MODE=rps -e RPS="$value" -e SESSION_POOL="$SESSION_POOL"); fi
 
   printf '\n==> level %s %s: ramp %ss, hold %ss\n' "$kind" "$value" "$RAMP" "$HOLD"
   # A node that is still coming back from an earlier crash would blame this
   # level for a restart that is not its own.
   wait_until 180 "node1 healthy" curl -fsS "$HOST_URL/api/health"
-  restarts_before=$(restart_state)
-  rows_before=$(db_rows)
+  restarts_before=$(restart_state) || die "cannot read the container state"
+  rows_before=$(db_rows) || die "cannot read the row counts before the level (API or Postgres)"
   : >"$dir/samples.jsonl"
   sample_loop "$dir/samples.jsonl" &
   SAMPLER_PID=$!
@@ -299,23 +328,26 @@ run_level() {
   wait_drain "$finished"
   drain=$(elapsed_since "$finished")
   wait_until 180 "node1 healthy" curl -fsS "$HOST_URL/api/health"
-  restarts_after=$(restart_state)
+  restarts_after=$(restart_state) || die "cannot read the container state"
   kill "$EVENTS_PID" 2>/dev/null || true
   wait "$EVENTS_PID" 2>/dev/null || true
-  rows_after=$(db_rows)
-  local setup_ms
+  EVENTS_PID=
+  rows_after=$(db_rows) || die "cannot read the row counts after the level (API or Postgres)"
   setup_ms=$(sed -n 's/.*LT_SETUP_DONE \([0-9]*\) .*/\1/p' "$dir/k6.log" | head -1)
-  [ -n "$setup_ms" ] || die "k6 did not report its start (log: $dir/k6.log)"
+  setup_json=$(sed -n 's/.*LT_SETUP_DONE [0-9]* \(.*\)" source=console.*/\1/p' "$dir/k6.log" | head -1 | sed 's/\\"/"/g')
+  [ -n "$setup_ms" ] && jq -e . >/dev/null 2>&1 <<<"$setup_json" || die "k6 did not report its start (log: $dir/k6.log)"
 
   jq -n --slurpfile k6 "$dir/k6-summary.json" --slurpfile samples "$dir/samples.jsonl" --slurpfile events "$dir/events.jsonl" \
     --arg kind "$kind" --argjson value "$value" --argjson ramp "$RAMP" --argjson hold "$HOLD" \
     --argjson start_s "$(awk -v ms="$setup_ms" 'BEGIN { printf "%.3f", ms / 1000 }')" --argjson drain "$drain" \
+    --argjson setup "$setup_json" \
     --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
     --argjson before "$restarts_before" --argjson after "$restarts_after" \
     --argjson rows_before "$rows_before" --argjson rows_after "$rows_after" \
-    -f loadtest/level.jq >"$dir/level.json"
-  jq -r -f loadtest/level-line.jq "$dir/level.json"
-  [ "$(jq .pass "$dir/level.json")" = true ]
+    -f "loadtest/level.jq" >"$dir/level.json" || die "could not compute the level result (loadtest/level.jq; inputs in $dir)"
+  jq -e '.pass | type == "boolean"' "$dir/level.json" >/dev/null 2>&1 || die "level.json is empty or malformed ($dir/level.json)"
+  jq -r -f loadtest/level-line.jq "$dir/level.json" || die "could not print the level result"
+  LEVEL_PASS=$(jq -r .pass "$dir/level.json")
 }
 
 pause_between_levels() {
@@ -323,65 +355,77 @@ pause_between_levels() {
   sleep "$PAUSE_S"
 }
 
-# write_summary <dir> <levels-file> [search-result-json]
+# write_summary <dir> <levels-file> [search-result-json] [aborted-reason]
 write_summary() {
-  local dir=$1 levels=$2 result=${3:-null}
-  jq -s --argjson result "$result" --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
+  local dir=$1 levels=$2 result=${3:-null} aborted=${4:-}
+  jq -s --argjson result "$result" --arg aborted "$aborted" --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
     --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg node_cpus "$NODE_CPUS" \
-    -f loadtest/summary.jq "$levels" >"$dir/summary.json"
-  jq -r -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md"
+    -f loadtest/summary.jq "$levels" >"$dir/summary.json" || return 1
+  jq -r -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
+  SUMMARY_DONE=true
   echo
   echo "results: $dir (summary.md, summary.json, one directory per level)"
 }
 
 new_results_dir() {
   local dir="${RESULTS_DIR:-$RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)}"
-  mkdir -p "$dir"
+  mkdir -p "$dir" || die "cannot create the results directory $dir"
   echo "$dir"
 }
 
 cmd_level() {
-  local kind=$1 value=$2 dir rc=0
+  local kind=$1 value=$2 dir
   [[ $value =~ ^[1-9][0-9]*$ ]] || die "usage: loadtest.sh $kind <positive integer>"
   dir=$(new_results_dir)
-  run_level "$kind" "$value" "$dir/${kind}-${value}" || rc=$?
+  RUN_DIR=$dir
+  : >"$dir/levels.jsonl"
+  run_level "$kind" "$value" "$dir/${kind}-${value}"
   jq -c . "$dir/${kind}-${value}/level.json" >"$dir/levels.jsonl"
-  write_summary "$dir" "$dir/levels.jsonl"
+  write_summary "$dir" "$dir/levels.jsonl" || die "could not write the summary"
   cat "$dir/summary.md"
-  return "$rc"
+  [ "$LEVEL_PASS" = true ]
 }
 
 # ------------------------------------------------------------------- search
 
-# next_level <level> <factor>: level x factor, rounded up, at least level + 1.
+# level x factor, rounded up, at least level + 1.
 scale_up() { awk -v l="$1" -v f="$2" 'BEGIN { n = int(l * f); if (n < l * f) n++; if (n <= l) n = l + 1; print n }'; }
+# 90% of a level, rounded up, always below it, at least 1.
+step_down_10() { awk -v b="$1" 'BEGIN { n = int(b * 0.9); if (n < b * 0.9) n++; if (n >= b) n = b - 1; if (n < 1) n = 1; print n }'; }
+# level / factor, rounded down, always below the level, at least 1.
+scale_down() { awk -v l="$1" -v f="$2" 'BEGIN { n = int(l / f); if (n >= l) n = l - 1; if (n < 1) n = 1; print n }'; }
 
 cmd_search() {
-  local kind=${1:?usage: loadtest.sh search users|rps [START] [FACTOR]}
-  [[ $kind == users || $kind == rps ]] || die "search users|rps"
+  local usage="usage: scripts/loadtest.sh search users|rps [START] [FACTOR]  (START: positive integer, FACTOR: number greater than 1)"
+  local kind=${1:-}
+  [[ $kind == users || $kind == rps ]] || die "$usage"
   local default_start=100
   [ "$kind" = rps ] && default_start=50
   local start=${2:-$default_start} factor=${3:-2}
-  [[ $start =~ ^[1-9][0-9]*$ ]] || die "START must be a positive integer"
-  local dir n=0 last_pass=0 first_fail=0 level rc status="" reason=""
+  [[ $start =~ ^[1-9][0-9]*$ ]] || die "$usage"
+  [[ $factor =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v f="$factor" 'BEGIN { exit !(f > 1) }' || die "$usage"
+  local dir n=0 last_pass=0 first_fail=0 level status="" reason=""
   dir=$(new_results_dir)
+  RUN_DIR=$dir
   : >"$dir/levels.jsonl"
   local rows_start
-  rows_start=$(db_rows)
+  rows_start=$(db_rows) || die "cannot read the row counts (API or Postgres)"
+  RUN_RESULT=$(jq -cn --arg kind "$kind" --argjson rows_start "$rows_start" '{kind: $kind, status: "not finished", best_pass: null, first_fail: null, db_rows_start: $rows_start}')
 
-  # one <level>: run it, record it, pause. Sets rc to 0 (pass) or 1 (fail).
+  # one <level>: run it and record it. Sets LEVEL_PASS.
   one() {
     n=$((n + 1))
-    rc=0
-    run_level "$kind" "$1" "$dir/$(printf '%02d' "$n")-$kind-$1" || rc=$?
-    jq -c --argjson n "$n" '. + {order: $n}' "$dir/$(printf '%02d' "$n")-$kind-$1/level.json" >>"$dir/levels.jsonl"
+    local sub
+    sub="$dir/$(printf '%02d' "$n")-$kind-$1"
+    run_level "$kind" "$1" "$sub"
+    jq -c --argjson n "$n" '. + {order: $n}' "$sub/level.json" >>"$dir/levels.jsonl"
   }
 
   step "search $kind: start $start, factor $factor"
   level=$start
   while :; do
     one "$level"
-    if [ "$rc" = 0 ]; then
+    if [ "$LEVEL_PASS" = true ]; then
       last_pass=$level
       level=$(scale_up "$level" "$factor")
       if ((level > MAX_LEVEL)); then status="no limit found up to $MAX_LEVEL"; break; fi
@@ -393,15 +437,16 @@ cmd_search() {
   done
 
   if [ -z "$status" ] && [ "$last_pass" = 0 ]; then
-    # The first level already fails: step down until one passes.
-    while ((level > 1)); do
+    # The first level already fails: step down until one passes. The level
+    # shrinks every round, so this ends at level 1 at the latest.
+    while [ "$level" -gt 1 ]; do
       pause_between_levels
-      level=$(awk -v l="$level" -v f="$factor" 'BEGIN { n = int(l / f); print (n < 1 ? 1 : n) }')
+      level=$(scale_down "$level" "$factor")
       one "$level"
-      if [ "$rc" = 0 ]; then last_pass=$level; break; fi
+      if [ "$LEVEL_PASS" = true ]; then last_pass=$level; break; fi
       first_fail=$level
     done
-    [ "$last_pass" != 0 ] || status="even level $level fails"
+    [ "$last_pass" != 0 ] || status="no passing level (level $level fails)"
   fi
 
   if [ -z "$status" ]; then
@@ -411,30 +456,38 @@ cmd_search() {
       [ "$level" != "$last_pass" ] && [ "$level" != "$first_fail" ] || break
       pause_between_levels
       one "$level"
-      if [ "$rc" = 0 ]; then last_pass=$level; else first_fail=$level; fi
+      if [ "$LEVEL_PASS" = true ]; then last_pass=$level; else first_fail=$level; fi
     done
     # Confirm the best pass; if it fails, step down 10% and confirm again, at most twice.
     local best=$last_pass attempt confirmed=false
     for attempt in 1 2 3; do
       pause_between_levels
       one "$best"
-      if [ "$rc" = 0 ]; then confirmed=true; break; fi
-      reason="the pass at $best did not repeat"
-      [ "$attempt" = 3 ] && break
-      best=$(awk -v b="$best" 'BEGIN { n = int(b * 0.9); print (n < 1 ? 1 : n) }')
+      if [ "$LEVEL_PASS" = true ]; then confirmed=true; break; fi
+      reason="the pass did not repeat at $best"
+      if [ "$best" -le 1 ] || [ "$attempt" = 3 ]; then break; fi
+      best=$(step_down_10 "$best")
     done
-    if [ "$confirmed" = true ]; then status="confirmed"; last_pass=$best; else status="unconfirmed: $reason"; last_pass=0; fi
+    if [ "$confirmed" = true ]; then status="confirmed"; last_pass=$best; else status="no passing level ($reason)"; last_pass=0; fi
   fi
 
-  local rows_end result
-  rows_end=$(db_rows)
-  result=$(jq -cn --arg status "$status" --argjson best "$last_pass" --argjson first_fail "$first_fail" \
+  local rows_end result best_rps
+  rows_end=$(db_rows) || die "cannot read the row counts after the search (API or Postgres)"
+  best_rps=$(jq -s --argjson best "$last_pass" '[.[] | select(.pass and .level == $best)] | last | .req_per_s // null' "$dir/levels.jsonl")
+  result=$(jq -cn --arg status "$status" --argjson best "$last_pass" --argjson first_fail "$first_fail" --argjson best_rps "${best_rps:-null}" \
     --arg kind "$kind" --argjson rows_start "$rows_start" --argjson rows_end "$rows_end" \
-    '{kind: $kind, status: $status, best_pass: (if $best == 0 then null else $best end), first_fail: (if $first_fail == 0 then null else $first_fail end), db_rows_start: $rows_start, db_rows_end: $rows_end}')
-  write_summary "$dir" "$dir/levels.jsonl" "$result"
+    '{kind: $kind, status: $status, best_pass: (if $best == 0 then null else $best end), best_req_per_s: $best_rps, first_fail: (if $first_fail == 0 then null else $first_fail end), db_rows_start: $rows_start, db_rows_end: $rows_end}')
+  RUN_RESULT=$result
+  write_summary "$dir" "$dir/levels.jsonl" "$result" || die "could not write the summary"
   cat "$dir/summary.md"
   echo
-  echo "SEARCH RESULT ($kind): $status; highest passing level: ${last_pass}; first failing level: ${first_fail}"
+  local unit=users
+  [ "$kind" = rps ] && unit=actions/s
+  if [ "$last_pass" != 0 ]; then
+    echo "SEARCH RESULT ($kind): $status; highest passing level: $last_pass $unit (≈ ${best_rps:-?} req/s); lowest failing level: ${first_fail}"
+  else
+    echo "SEARCH RESULT ($kind): $status; lowest failing level: ${first_fail}"
+  fi
   [ "$last_pass" != 0 ]
 }
 

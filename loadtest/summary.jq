@@ -6,9 +6,10 @@
     pass_rule: {p95_ms_below: $p95, p99_ms_below: $p99, error_pct_below: $err, dropped_pct_below_rps_only: $drop, no_restart_or_oom: true, window: "hold only (ramp excluded)"},
     ramp_s: $ramp,
     hold_s: $hold,
+    aborted: (if $aborted == "" then null else $aborted end),
     search: $result,
     db_rows_start: ($levels | first | .db_rows_before),
     db_rows_end: ($levels | last | .db_rows_after),
-    mix_warnings: ([$levels[] | .level as $l | .mix_warnings[] | "level \($l): \(.)"]),
+    mix_warnings: ([$levels[] | .level as $l | .warnings[] | "level \($l): \(.)"]),
     levels: $levels
   }

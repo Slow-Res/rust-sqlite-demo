@@ -7,6 +7,7 @@ import http from 'k6/http';
 export const BASE_URL = __ENV.BASE_URL || 'http://web:4000';
 // LOCAL-ONLY test credentials. The account lives in a throwaway load-test
 // database that scripts/loadtest.sh creates and deletes.
+export const SESSION_COOKIE = 'library_session';
 export const ADMIN_USER = __ENV.LT_ADMIN_USER || 'admin';
 export const ADMIN_PASSWORD = __ENV.LT_ADMIN_PASSWORD || 'loadtest-local-only';
 

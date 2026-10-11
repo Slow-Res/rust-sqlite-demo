@@ -1,7 +1,7 @@
 # One level's result. Inputs (--arg/--argjson/--slurpfile): k6 (summary), samples
 # (JSON lines of scripts/loadtest.sh), kind, value, ramp, hold, start_s (epoch
 # seconds when k6's scenario started), drain, the p95/p99/err/drop limits,
-# events (docker die/oom events), before/after (container restart state), rows_before, rows_after.
+# setup (the LT_SETUP_DONE data), events (docker die/oom events), before/after (container restart state), rows_before, rows_after.
 # Everything is computed from phase:hold only.
 def r1: if . == null then null else (. * 10 | round) / 10 end;
 def r2: if . == null then null else (. * 100 | round) / 100 end;
@@ -41,16 +41,26 @@ $k6[0].metrics as $m
 # Restarts and OOM kills during the level.
 | ([range(0; ($after | length)) as $i
     | $after[$i] as $a | ($before[$i] // $a) as $b
-    | select($a.restarts > $b.restarts or $a.oom_killed or ($a.running | not))
-    | {container: $a.name, restarts_before: $b.restarts, restarts_after: $a.restarts, oom_killed: $a.oom_killed, running: $a.running}]) as $bad_containers
+    | select($a.restarts > $b.restarts or ($a.oom_killed and ($b.oom_killed | not)) or ($a.running | not))
+    | {container: $a.name, restarts_before: $b.restarts, restarts_after: $a.restarts, oom_killed: ($a.oom_killed and ($b.oom_killed | not)), running: $a.running}]) as $bad_containers
 | ([$events[] | {action: (.Action | split(" ")[0]), container: .Actor.Attributes.name, exit_code: .Actor.Attributes.exitCode}]) as $deaths
 | ([$deaths[] | select(.action == "oom")] | length > 0) as $oom_event
 # Node CPU: the three containers' CPU% summed (200% is the 2 cores), per sample.
-| ([$hs[] | select((.stats | length) == 3) | [.stats[].CPUPerc | rtrimstr("%") | tonumber] | add]) as $cpu
-| ([$hs[].stats[]] | group_by(.Name) | map({key: .[0].Name, value: ([.[].MemUsage | split(" / ")[0] | mib] | max | r1)}) | from_entries) as $mem
+| ([$hs[] | .stats |= map(select(.Name | startswith("lt-node1-"))) | select((.stats | length) == 3) | [.stats[].CPUPerc | rtrimstr("%") | tonumber] | add]) as $cpu
+# The load generator's CPU (k6 has 4 cores: 400%).
+| ([$hs[] | .stats[] | select(.Name | startswith("lt-k6-")) | .CPUPerc | rtrimstr("%") | tonumber]) as $k6cpu
+| ([$hs[].stats[] | select(.Name | startswith("lt-node1-"))] | group_by(.Name) | map({key: .[0].Name, value: ([.[].MemUsage | split(" / ")[0] | mib] | max | r1)}) | from_entries) as $mem
 | ([$hs[] | select(.puts != null)] | group_by(((.t - $t0) / 15) | floor) | map(map(.puts) | max)) as $put_buckets
-| (if ($put_buckets | length) < 2 then null
-   else [range(1; $put_buckets | length) | $put_buckets[.] > $put_buckets[. - 1]] | all end) as $puts_rising
+| (if ($put_buckets | length) < 2 then null else [range(1; $put_buckets | length) | select($put_buckets[.] <= $put_buckets[. - 1])] | length end) as $flat_buckets
+| ([$hs[] | select(.puts != null)] | if length > 0 then (last.puts > first.puts) else null end) as $puts_rose
+# Answers that were not expected for their action, by action and status (hold only).
+| ([$m | to_entries[] | select(.key | test("^unexpected_status\\{phase:hold,action:[a-z_]+,status:[0-9]+\\}$"))
+    | (.key | capture("action:(?<action>[a-z_]+),status:(?<status>[0-9]+)")) + {count: .value.values.count} | select(.count > 0)]) as $unexpected
+| (($unexpected | map(.count) | add) // 0) as $unexpected_named
+| ($err_count - $unexpected_named) as $unexpected_other
+| (v("return_converted_to_borrow{phase:hold}").count // 0) as $converted
+| ($m["actions{phase:hold,intent:return}"].values.count // 0) as $return_actions
+| ($k6cpu | max) as $k6max
 | ([
     (if $reqs == 0 then "no requests in the hold window" else empty end),
     (if $reqs > 0 and (v("http_req_duration{phase:hold}")["p(95)"] >= $p95) then "p95 \(v("http_req_duration{phase:hold}")["p(95)"] | r1) ms >= \($p95) ms" else empty end),
@@ -76,7 +86,14 @@ $k6[0].metrics as $m
     peak_memory_mib: $mem,
     max_sync_pending: ([$hs[].pending | select(. != null)] | max),
     max_sync_lag_s: ([$hs[].lag | select(. != null)] | max | r1),
-    litestream: {puts_start: ([$hs[] | select(.puts != null)] | first | .puts), puts_end: ([$hs[] | select(.puts != null)] | last | .puts), puts_kept_rising: $puts_rising, txid_end: ([$hs[] | select(.txid != null)] | last | .txid)},
+    load_generator_cpu_pct_of_400: {avg: (if ($k6cpu | length) > 0 then ($k6cpu | add / length | r1) else null end), max: ($k6max | r1), samples: ($k6cpu | length)},
+    warnings: ([(if $k6max != null and $k6max > 320 then "load generator at \($k6max | r1)% of 400%: the generator may be the bottleneck" else empty end)] + $mix_warnings),
+    unexpected_statuses: $unexpected,
+    unexpected_other: $unexpected_other,
+    return_converted_to_borrow: {count: $converted, return_actions: $return_actions, share_pct: (if $return_actions > 0 then $converted / $return_actions * 100 | r1 else null end)},
+    session_pool_logged_in_at_setup: ($setup.sessions // 0),
+    auth_requests_in_hold: {login: (v("http_reqs{phase:hold,action:login}").count // 0), me: (v("http_reqs{phase:hold,action:me}").count // 0), logout: (v("http_reqs{phase:hold,action:logout}").count // 0)},
+    litestream: {puts_start: ([$hs[] | select(.puts != null)] | first | .puts), puts_end: ([$hs[] | select(.puts != null)] | last | .puts), puts_rose: $puts_rose, flat_15s_buckets: $flat_buckets, buckets_15s: ($put_buckets | length), txid_end: ([$hs[] | select(.txid != null)] | last | .txid)},
     drain_s: $drain,
     iterations: $iters,
     dropped_iterations: $dropped,

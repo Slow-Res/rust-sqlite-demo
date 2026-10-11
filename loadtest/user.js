@@ -3,7 +3,9 @@
 //                        1-5 s of think time after each, logs out, and starts
 //                        a new session.
 //   MODE=rps    RPS=R    R actions per second (ramping-arrival-rate), one action
-//                        per iteration, no think time. Each VU logs in once.
+//                        per iteration, no think time. No logins during the run:
+//                        setup() logs in SESSION_POOL sessions one after the other
+//                        and each VU uses one of them.
 // Both ramp for RAMP seconds, then hold for HOLD seconds. Every request is
 // tagged phase:ramp|hold|post, action:<name> and kind:read|write|auth. All
 // reported numbers come from phase:hold only.
@@ -18,6 +20,7 @@ const USERS = Number(__ENV.USERS || 20);
 const RPS = Number(__ENV.RPS || 20);
 const RAMP = Number(__ENV.RAMP || 60);
 const HOLD = Number(__ENV.HOLD || 300);
+const SESSION_POOL = Number(__ENV.SESSION_POOL || 50);
 const SEED_BOOKS = Number(__ENV.SEED_BOOKS || 50000);
 const OUT = __ENV.OUT || '/out';
 const PER_PAGE = 20;
@@ -29,8 +32,7 @@ const EXPECT = {
   browse_books: [200], search_books: [200], open_book: [200],
   list_members: [200], open_member: [200], list_loans: [200],
   borrow: [201, 409],            // 409: no copies left, or the member is at the loan limit
-  return: [200, 409],            // 409: the loan was already returned (by another user)
-  return_lookup: [200],          // supporting: a page of active loans to pick one from
+  return: [200, 409],            // only the user's own loans, so 409 (already returned) should not happen
   edit_book_get: [200], edit_book: [200],
   add_book: [201, 409],          // 409: duplicate ISBN (random ISBN, very rare)
   add_member: [201],
@@ -53,6 +55,10 @@ const MIX = [
 
 const errors = new Rate('errors');
 const actions = new Counter('actions'); // intended actions, tag intent
+// Every answer that is not expected for its action: tags action, status (0 =
+// network error or timeout) and phase.
+const unexpected = new Counter('unexpected_status');
+const converted = new Counter('return_converted_to_borrow'); // a return with no own loan to return
 const skipped = new Counter('skipped_actions'); // e.g. a return with no active loan anywhere
 
 // Thresholds that never fail. They exist so k6 keeps hold-only sub-metrics for
@@ -73,6 +79,13 @@ for (const [action, statuses] of Object.entries(EXPECT)) {
   for (const s of statuses) keep(`http_reqs{phase:hold,action:${action},status:${s}}`, 'count>=0');
 }
 for (const [intent] of MIX) keep(`actions{phase:hold,intent:${intent}}`, 'count>=0');
+keep('return_converted_to_borrow{phase:hold}', 'count>=0');
+// k6 keeps a sub-metric only if a threshold names it, so list the statuses worth
+// naming. Anything else still shows in errors{...}; level.jq reports it as "other".
+const STATUSES = [0, 400, 401, 403, 404, 405, 408, 409, 413, 422, 429, 500, 502, 503, 504];
+for (const action of Object.keys(EXPECT)) {
+  for (const status of STATUSES) keep(`unexpected_status{phase:hold,action:${action},status:${status}}`, 'count>=0');
+}
 
 const scenarios = MODE === 'rps'
   ? {
@@ -117,7 +130,20 @@ export function setup() {
   const res = c.login();
   if (res.status !== 200) throw new Error(`setup: login failed with ${res.status}`);
   const total = (path) => http.get(`${c.BASE_URL}${path}`).json('total');
+  // rps: log in a fixed pool of sessions, one after the other (one Argon2 hash at
+  // a time), before the scenario starts. Setup requests carry no phase tag.
+  const sessions = [];
+  if (MODE === 'rps') {
+    const jar = http.cookieJar();
+    for (let i = 0; i < SESSION_POOL; i++) {
+      const r = c.login();
+      const cookie = jar.cookiesForURL(c.BASE_URL)[c.SESSION_COOKIE];
+      if (r.status !== 200 || !cookie) throw new Error(`setup: pool login ${i} failed with ${r.status}`);
+      sessions.push(cookie[0]);
+    }
+  }
   const data = {
+    sessions,
     books: total('/api/books?per_page=1'),
     members: total('/api/members?per_page=1'),
     loans: {
@@ -126,7 +152,7 @@ export function setup() {
       all: total('/api/loans?status=all&per_page=1'),
     },
   };
-  console.log(`LT_SETUP_DONE ${Date.now()} ${JSON.stringify(data)}`);
+  console.log(`LT_SETUP_DONE ${Date.now()} ${JSON.stringify(Object.assign({}, data, { sessions: sessions.length }))}`);
   return data;
 }
 
@@ -141,9 +167,12 @@ function request(method, path, body, action) {
     headers: { 'Content-Type': 'application/json' },
     timeout: '10s',
     responseCallback: CALLBACK[action],
-    tags: { action, kind: kindOf(action), phase: ph },
+    // `name` keeps k6 from making one series per URL (ids, search terms).
+    tags: { name: action, action, kind: kindOf(action), phase: ph },
   });
-  errors.add(!EXPECT[action].includes(res.status), { action, kind: kindOf(action), phase: ph });
+  const bad = !EXPECT[action].includes(res.status);
+  errors.add(bad, { action, kind: kindOf(action), phase: ph });
+  if (bad) unexpected.add(1, { action, status: String(res.status), phase: ph });
   return res;
 }
 
@@ -153,7 +182,7 @@ const json = (res, path) => {
 };
 
 // State one VU keeps across sessions.
-const vu = { loggedIn: false, loans: [], activeTotal: null };
+const vu = { loggedIn: false, ready: false, loans: [] };
 
 function startSession() {
   const res = request('POST', '/api/auth/login', { username: c.ADMIN_USER, password: c.ADMIN_PASSWORD }, 'login');
@@ -188,25 +217,16 @@ const ACTIONS = {
   },
   borrow(d) {
     const res = request('POST', '/api/loans', { book_id: 1 + c.rand(d.books), member_id: 1 + c.rand(d.members) }, 'borrow');
-    if (res.status === 201) {
-      vu.loans.push(json(res, 'id'));
-      if (vu.loans.length > 50) vu.loans.shift();
-    }
+    if (res.status === 201) vu.loans.push(json(res, 'id'));
   },
   return(d) {
-    let id = vu.loans.pop();
+    // Only a loan this VU borrowed itself, so users never fight over loans and
+    // the number of active loans stays steady. With none left, borrow instead.
+    const id = vu.loans.pop();
     if (id === undefined) {
-      // No loan of our own: pick one from a random page of active loans.
-      const total = vu.activeTotal === null ? d.loans.active : vu.activeTotal;
-      const res = get(`/api/loans?status=active&page=${pageOf(total)}&per_page=${PER_PAGE}`, 'return_lookup');
-      const items = json(res, 'items') || [];
-      const newTotal = json(res, 'total');
-      if (newTotal !== undefined) vu.activeTotal = newTotal;
-      if (items.length === 0) {
-        skipped.add(1, { intent: 'return', phase: phase() });
-        return;
-      }
-      id = c.pick(items).id;
+      converted.add(1, { phase: phase() });
+      this.borrow(d);
+      return;
     }
     request('POST', `/api/loans/${id}/return`, null, 'return');
   },
@@ -268,7 +288,11 @@ export function userSession(d) {
 }
 
 export function rpsIteration(d) {
-  if (!vu.loggedIn && !startSession()) return;
+  if (!vu.ready) {
+    // Use one of the sessions logged in by setup(); no login during the run.
+    http.cookieJar().set(c.BASE_URL, c.SESSION_COOKIE, d.sessions[(__VU - 1) % d.sessions.length], { path: '/' });
+    vu.ready = true;
+  }
   act(d);
 }
 

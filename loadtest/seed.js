@@ -3,9 +3,10 @@
 // (PHASE=books|members|loans), started in that order by scripts/loadtest.sh.
 //   books   BOOKS   books: 1-5 copies each, ISBN-13 for 4 in 5
 //   members MEMBERS members
-//   loans   LOANS   loans: loan j borrows book j+1 for member j mod MEMBERS; 9 in 10
-//           are returned straight away, so about 10% stay active (at most
-//           ceil(LOANS/MEMBERS) per member, well below the limit of 5).
+//   loans   LOANS   loans: loan j borrows book j+1 for member j mod MEMBERS. Loan j
+//           stays active when j is a multiple of 10 and it is among the first two
+//           of its member (j < 2 x MEMBERS); the rest are returned straight
+//           away. So about 10% stay active, at most 2 per member (limit 5).
 import http from 'k6/http';
 import exec from 'k6/execution';
 import { Counter } from 'k6/metrics';
@@ -74,7 +75,8 @@ export default function () {
     send('POST', '/api/members', { name: c.memberNameOf(i), email: c.memberEmailOf(i) }, [201]);
   } else {
     const res = send('POST', '/api/loans', { book_id: (i % BOOKS) + 1, member_id: (i % MEMBERS) + 1 }, [201]);
-    if (res.status === 201 && i % 10 !== 0) {
+    const stayActive = i % 10 === 0 && Math.floor(i / MEMBERS) < 2;
+    if (res.status === 201 && !stayActive) {
       send('POST', `/api/loans/${res.json('id')}/return`, null, [200]);
     }
   }
