@@ -4456,9 +4456,9 @@ rm -f data/manual-check.db data/manual-check.db-wal data/manual-check.db-shm
 mkdir -p data && DATABASE_URL=sqlite://data/manual-check.db cargo run -q -p library-web -- seed
 cargo build -q -p sync-worker   # build first, so the 5 s timeout below only covers running
 docker exec sqlite-production-test-pg psql -U postgres -c 'CREATE DATABASE manual_check' 2>/dev/null || true
-NODE_ID=dev POSTGRES_URL=postgres://postgres:test@127.0.0.1:55432/manual_check DATABASE_URL=sqlite://data/dev.db \
+NODE_ID=dev POSTGRES_URL=postgres://postgres:test@127.0.0.1:55432/manual_check DATABASE_URL=sqlite://data/manual-check.db \
   timeout -s TERM 5 cargo run -q -p sync-worker; echo "exit: $?"
-NODE_ID=dev POSTGRES_URL=postgres://postgres:test@127.0.0.1:55432/manual_check DATABASE_URL=sqlite://data/dev.db \
+NODE_ID=dev POSTGRES_URL=postgres://postgres:test@127.0.0.1:55432/manual_check DATABASE_URL=sqlite://data/manual-check.db \
   cargo run -q -p sync-worker -- status
 docker exec sqlite-production-test-pg psql -U postgres -d manual_check -tAc "SELECT count(*) FROM books WHERE node_id = 'dev'"
 docker exec sqlite-production-test-pg psql -U postgres -c 'DROP DATABASE manual_check WITH (FORCE)'
