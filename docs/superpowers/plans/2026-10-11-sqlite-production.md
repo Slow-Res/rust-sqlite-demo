@@ -4789,7 +4789,7 @@ echo "restore gate: $PASSED checks passed"
 make images
 scripts/test-restore-gate.sh
 ```
-Expected: `restore gate: 12 checks passed`. It takes several minutes: in each of the two unreachable-S3 cases, `litestream restore` retries for about 4 minutes before failing. That is the real behaviour, not a hang. If adding `-e AWS_MAX_ATTEMPTS=1` to the `gate` docker run shortens those cases and they still end with "litestream restore failed", keep it, with a comment saying why.
+Expected: `restore gate: 15 checks passed`. It takes several minutes: in each of the two unreachable-S3 cases, `litestream restore` retries for about 4 minutes before failing. That is the real behaviour, not a hang. If adding `-e AWS_MAX_ATTEMPTS=1` to the `gate` docker run shortens those cases and they still end with "litestream restore failed", keep it, with a comment saying why.
 
 If the two "litestream restore failed" checks fail because `litestream restore -if-replica-exists` exits 0 when S3 is unreachable, do not weaken the test. Fix the gate instead. Add a step before step 4 of `restore.sh` that fails when S3 cannot be reached but succeeds when the prefix is merely empty. Try `litestream ltx -config "$CONFIG" "$DB"`, and confirm its behaviour against both an unreachable endpoint and an empty Garage prefix; Task 11 has Garage running, so finish the check there if needed. Write what you found in a comment in `restore.sh`.
 
@@ -5527,7 +5527,7 @@ e2e: images ## End-to-end test on a separate, throwaway cluster
 
 Run: `make e2e`
 Expected:
-- `restore gate: 12 checks passed`;
+- `restore gate: 15 checks passed`;
 - then five `==>` steps;
 - `DRILL PASSED`;
 - `E2E PASSED`.
