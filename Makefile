@@ -1,4 +1,4 @@
-.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check
+.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images
 
 # One-time developer setup. Tools are not installed for you: missing ones are reported.
 setup: ## Check tools, install npm deps, create the dev database
@@ -47,4 +47,10 @@ check: ## Every gate CI runs
 	cargo clippy --workspace --all-targets -- -D warnings
 	$(MAKE) test
 	SQLX_OFFLINE=true cargo build -p library-web
+	@test -z "$$(cargo tree -q -p library-web -i sqlx-postgres 2>/dev/null)" || { echo "library-web must not depend on a Postgres driver"; exit 1; }
 	cd apps/frontend && npm run lint && npm run typecheck && npm test
+
+images: ## Build the three images (tag :dev)
+	docker build -f deploy/docker/Dockerfile --target web -t sqlite-production/web:dev .
+	docker build -f deploy/docker/Dockerfile --target sync-worker -t sqlite-production/sync-worker:dev .
+	docker build -f deploy/docker/litestream.Dockerfile -t sqlite-production/litestream:dev .

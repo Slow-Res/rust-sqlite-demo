@@ -1,0 +1,24 @@
+# Litestream config for one node (spec §7.1). Values come from environment
+# variables; deploy/compose/node.env.example documents them. The access keys
+# come from LITESTREAM_ACCESS_KEY_ID and LITESTREAM_SECRET_ACCESS_KEY.
+
+# Metrics for Prometheus; reachable only inside the Docker network.
+addr: ":9090"
+
+# A full snapshot every day. Snapshots and the changes between them are kept
+# for 3 days: that is how far back a point-in-time restore can go.
+snapshot:
+  interval: 24h
+  retention: 72h
+
+dbs:
+  - path: /data/library.db
+    replica:
+      type: s3
+      bucket: ${LITESTREAM_BUCKET}
+      # One folder per node. Two nodes must never share it (spec S13).
+      path: ${NODE_ID}
+      # Empty for AWS S3; the Garage address locally. Setting an endpoint also
+      # turns on path-style addressing, which Garage needs.
+      endpoint: ${LITESTREAM_ENDPOINT}
+      region: ${LITESTREAM_REGION}

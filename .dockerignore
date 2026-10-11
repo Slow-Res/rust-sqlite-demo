@@ -1,0 +1,10 @@
+# Keep the build context small and the layer cache stable.
+.git
+.github
+.superpowers
+.env
+**/target
+**/node_modules
+**/dist
+data
+docs
