@@ -1,4 +1,4 @@
-.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user
+.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user restore-drill e2e
 
 # One-time developer setup. Tools are not installed for you: missing ones are reported.
 setup: ## Check tools, install npm deps, create the dev database
@@ -78,3 +78,10 @@ seed: ## Sample data on a cluster node: make seed NODE=node1
 
 user: ## Staff account on a cluster node: make user NODE=node1 NAME=alice
 	scripts/cluster.sh exec $(or $(NODE),node1) web library-web create-user $(or $(NAME),admin)
+
+restore-drill: ## Restore a node's backup to a scratch copy and check it: make restore-drill NODE=node2
+	scripts/restore-drill.sh $(or $(NODE),node1)
+
+e2e: images ## End-to-end test on a separate, throwaway cluster
+	scripts/test-restore-gate.sh
+	scripts/e2e.sh
