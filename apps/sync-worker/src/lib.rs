@@ -2,10 +2,17 @@
 //! (spec §6). `main.rs` is a thin shell; everything testable lives here.
 
 pub mod changes;
+pub mod cli;
 pub mod config;
+pub mod http;
+pub mod metrics;
 pub mod mirror;
+pub mod run;
+pub mod schema;
+pub mod status;
 pub mod sync;
 pub mod tables;
+pub mod telemetry;
 
 /// The SQLite migrations, embedded so the worker can check that `library-web`
 /// has applied them all before it ships anything (spec §6.7). The worker never

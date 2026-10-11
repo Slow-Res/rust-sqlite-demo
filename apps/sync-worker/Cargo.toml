@@ -31,3 +31,7 @@ tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "sync-worker"
+path = "src/main.rs"
