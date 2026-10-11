@@ -106,6 +106,17 @@ impl AuthRepository for SqliteAuthRepository {
 
     async fn delete_expired_sessions(&self, now: DateTime<Utc>) -> Result<(), RepoError> {
         let now = to_timestamp(now);
+        // Nearly every login finds nothing to sweep, and a DELETE that deletes
+        // nothing still takes SQLite's write lock, queuing behind other writers.
+        // Reading first costs no lock; only a login that sweeps something writes.
+        let expired: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM sessions WHERE expires_at <= ? LIMIT 1")
+                .bind(now)
+                .fetch_optional(&self.pool)
+                .await?;
+        if expired.is_none() {
+            return Ok(());
+        }
         sqlx::query!("DELETE FROM sessions WHERE expires_at <= ?", now)
             .execute(&self.pool)
             .await?;

@@ -99,8 +99,19 @@ impl AuthRepository for PostgresAuthRepository {
     }
 
     async fn delete_expired_sessions(&self, now: DateTime<Utc>) -> Result<(), RepoError> {
+        let now = to_timestamp(now);
+        // Same as the SQLite adapter: most logins find nothing to sweep, so look
+        // before writing (here it only saves a write transaction).
+        let expired: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM sessions WHERE expires_at <= $1 LIMIT 1")
+                .bind(now)
+                .fetch_optional(&self.pool)
+                .await?;
+        if expired.is_none() {
+            return Ok(());
+        }
         sqlx::query("DELETE FROM sessions WHERE expires_at <= $1")
-            .bind(to_timestamp(now))
+            .bind(now)
             .execute(&self.pool)
             .await?;
         Ok(())
