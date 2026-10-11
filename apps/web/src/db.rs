@@ -182,6 +182,26 @@ pub(crate) fn escape_like(text: &str) -> String {
     out
 }
 
+/// The words of a book search `q`: runs of letters and digits, so whitespace and
+/// punctuation (including `"`, `*`, `:`, `(`, `-` and `_`) separate words and none
+/// of them reaches a query. A book matches when every word is a prefix of some
+/// word of its title, author or ISBN, the same on both backends.
+pub(crate) fn search_words(q: &str) -> Vec<&str> {
+    q.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// `q` with spaces and hyphens removed, when that can be the start of an ISBN
+/// and differs from `q` (ISBNs are stored without separators, so "978-0-261"
+/// finds "9780261..."). `None` when `q` is a single word already (the word
+/// search covers it) or holds anything but ASCII letters and digits.
+pub(crate) fn isbn_prefix(q: &str) -> Option<String> {
+    let digits: String = q.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
+    (digits != q && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_alphanumeric()))
+        .then_some(digits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +225,27 @@ mod tests {
         assert_eq!(escape_like("100%_done\\"), "100\\%\\_done\\\\");
         assert_eq!(escape_like("plain text"), "plain text");
         assert_eq!(escape_like(""), "");
+    }
+
+    #[test]
+    fn search_words_split_on_everything_but_letters_and_digits() {
+        assert_eq!(search_words("J.R.R. Tolkien"), ["J", "R", "R", "Tolkien"]);
+        assert_eq!(search_words("a_b \"c\" d*:(-e"), ["a", "b", "c", "d", "e"]);
+        assert_eq!(search_words("Café Müller 12"), ["Café", "Müller", "12"]);
+        assert!(search_words("%%% --- \"").is_empty());
+        assert!(search_words("").is_empty());
+    }
+
+    #[test]
+    fn isbn_prefix_is_q_without_separators() {
+        assert_eq!(
+            isbn_prefix("978-0-261 10221-7").as_deref(),
+            Some("9780261102217")
+        );
+        assert_eq!(isbn_prefix("0441 172").as_deref(), Some("0441172"));
+        assert_eq!(isbn_prefix("9780261"), None); // one word: the word search covers it
+        assert_eq!(isbn_prefix("- -"), None); // nothing left
+        assert_eq!(isbn_prefix("a.b c"), None); // cannot be in an ISBN
     }
 
     #[test]
