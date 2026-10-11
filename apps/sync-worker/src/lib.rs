@@ -4,6 +4,7 @@
 pub mod changes;
 pub mod config;
 pub mod mirror;
+pub mod sync;
 pub mod tables;
 
 /// The SQLite migrations, embedded so the worker can check that `library-web`

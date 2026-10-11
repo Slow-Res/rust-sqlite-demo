@@ -183,3 +183,39 @@ pub async fn connect_mirror(pg: &TestPg, node_id: &str) -> sync_worker::mirror::
     }
     panic!("the lock for {node_id} was never released");
 }
+
+impl TestSqlite {
+    /// Copy the database as it is right now into a new file (`VACUUM INTO`),
+    /// like a backup taken at this moment, and open the copy.
+    pub async fn backup(&self) -> TestSqlite {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("library.db");
+        sqlx::query("VACUUM INTO ?")
+            .bind(path.display().to_string())
+            .execute(&self.pool)
+            .await
+            .expect("VACUUM INTO");
+        let url = format!("sqlite://{}", path.display());
+        let pool = sqlite_setup::open_pool(&url, 4, false)
+            .await
+            .expect("open backup");
+        TestSqlite { dir, url, pool }
+    }
+}
+
+/// Every synced table holds exactly the same rows in SQLite and in Postgres.
+pub async fn assert_in_sync(sqlite: &SqlitePool, pg: &TestPg, node_id: &str) {
+    let mut conn = pg.connect().await;
+    for table in sync_worker::tables::TABLES {
+        let local = sync_worker::changes::read_all(sqlite, table).await.unwrap();
+        let remote = sync_worker::mirror::read_all(&mut conn, node_id, table)
+            .await
+            .unwrap();
+        assert_eq!(
+            local, remote,
+            "table `{}` differs between SQLite and Postgres",
+            table.name
+        );
+    }
+    conn.close().await.ok();
+}
