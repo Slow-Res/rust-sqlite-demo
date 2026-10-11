@@ -166,3 +166,20 @@ pub async fn insert_loan(pool: &SqlitePool, book_id: i64, member_id: i64) -> i64
     sqlx::query("INSERT INTO loans (book_id, member_id, borrowed_at, due_at, returned_at) VALUES (?, ?, 0, 100, NULL)")
         .bind(book_id).bind(member_id).execute(pool).await.unwrap().last_insert_rowid()
 }
+
+/// Connect a Mirror, retrying for up to 2 s while the node's lock is still
+/// held by a connection that is closing (Postgres releases it a moment after
+/// the client hangs up).
+pub async fn connect_mirror(pg: &TestPg, node_id: &str) -> sync_worker::mirror::Mirror {
+    use sync_worker::mirror::{ConnectError, Mirror};
+    for _ in 0..40 {
+        match Mirror::connect(&pg.options, node_id).await {
+            Ok(mirror) => return mirror,
+            Err(ConnectError::Locked(_)) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await
+            }
+            Err(ConnectError::Other(err)) => panic!("connect failed: {err:#}"),
+        }
+    }
+    panic!("the lock for {node_id} was never released");
+}
