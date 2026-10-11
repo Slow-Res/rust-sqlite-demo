@@ -1,0 +1,44 @@
+[package]
+name = "library-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "library_web"
+path = "src/lib.rs"
+
+[[bin]]
+name = "library-web"
+path = "src/main.rs"
+
+[dependencies]
+library-shared.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { workspace = true, features = ["chrono", "migrate", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["trace", "fs", "timeout", "request-id", "set-header", "limit", "compression-gzip", "util"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+argon2.workspace = true
+cookie.workspace = true
+async-trait.workspace = true
+axum-extra.workspace = true
+hex.workspace = true
+rand.workspace = true
+rpassword.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+
+[lints]
+workspace = true

@@ -1,0 +1,46 @@
+/* Small, framework-neutral rules shared with the Leptos frontend. */
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.toolbar > * {
+  margin-bottom: 0;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.actions > * {
+  margin-bottom: 0;
+}
+
+.pagination {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  justify-content: center;
+}
+
+.error {
+  color: var(--pico-del-color);
+}
+
+tr.overdue td {
+  background-color: #fde8e8;
+  color: #7a1212;
+}
+
+@media (prefers-color-scheme: dark) {
+  tr.overdue td {
+    background-color: #4a1a1a;
+    color: #ffd6d6;
+  }
+}

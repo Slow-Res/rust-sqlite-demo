@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT total_copies FROM books WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "total_copies",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "books",
+            "name": "total_copies"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6a8c2b5d58983c2eb350f2751bc67c36f3bc5122ee884fa33030918afd8e4169"
+}

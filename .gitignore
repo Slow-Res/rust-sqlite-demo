@@ -1,0 +1,8 @@
+# Build output, at any depth (e.g. backend/target/sqlx is created by #[sqlx::test]).
+target/
+# Local SQLite files, at any depth.
+data/
+.env
+node_modules
+dist
+.superpowers/

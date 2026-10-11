@@ -1,0 +1,20 @@
+[package]
+name = "library-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Generates TypeScript bindings; off by default so normal builds skip ts-rs.
+ts = ["dep:ts-rs"]
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true
+ts-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

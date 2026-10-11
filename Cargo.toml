@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/shared", "apps/web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Versions live here once; member crates opt in with `dep.workspace = true`.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ts-rs = { version = "12", features = ["chrono-impl", "serde-compat"] }
+library-shared = { path = "crates/shared" }
+# Base features only. Each member adds what it needs (the web app: chrono,
+# migrate, macros; the worker: postgres). A crate that is built on its own
+# gets only its own features, which keeps Postgres out of the web binary.
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
+argon2 = "0.6"
+cookie = "0.18"
+async-trait = "0.1"
+axum-extra = { version = "0.12", features = ["cookie"] }
+hex = "0.4"
+rand = "0.10"
+rpassword = "7"
+sha2 = "0.11"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
