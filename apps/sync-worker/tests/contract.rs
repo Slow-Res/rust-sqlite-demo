@@ -9,6 +9,21 @@ use common::{TestPg, TestSqlite};
 use sqlx::{AssertSqlSafe, Row};
 use sync_worker::tables::{self, Kind};
 
+async fn primary_key(conn: &mut sqlx::PgConnection, table: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT k.column_name::text FROM information_schema.table_constraints c \
+         JOIN information_schema.key_column_usage k \
+           ON k.constraint_name = c.constraint_name AND k.table_schema = c.table_schema \
+          AND k.table_name = c.table_name \
+         WHERE c.table_schema = 'public' AND c.table_name = $1 AND c.constraint_type = 'PRIMARY KEY' \
+         ORDER BY k.ordinal_position",
+    )
+    .bind(table)
+    .fetch_all(conn)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn synced_tables_match_in_sqlite_postgres_and_the_table_list() {
     let sqlite = TestSqlite::new().await;
@@ -80,6 +95,14 @@ async fn synced_tables_match_in_sqlite_postgres_and_the_table_list() {
             table.name
         );
 
+        // Task 7's upsert relies on `ON CONFLICT (node_id, id)`.
+        assert_eq!(
+            primary_key(&mut conn, table.name).await,
+            ["node_id", "id"],
+            "primary key of Postgres table `{}`",
+            table.name
+        );
+
         let triggers: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
         )
@@ -106,6 +129,22 @@ async fn synced_tables_match_in_sqlite_postgres_and_the_table_list() {
     .await
     .unwrap();
     assert!(other_triggers.is_empty(), "{other_triggers:?}");
+
+    assert_eq!(
+        primary_key(&mut conn, "sync_checkpoints").await,
+        ["node_id"]
+    );
+    let last_token_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable::text FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'sync_checkpoints' AND column_name = 'last_token'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        last_token_nullable, "YES",
+        "sync_checkpoints.last_token must allow NULL"
+    );
 
     drop(conn);
     pg.cleanup().await;
