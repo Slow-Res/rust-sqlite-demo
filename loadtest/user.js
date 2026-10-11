@@ -1,4 +1,4 @@
-// The load test (see docs/LOADTEST.md). Two models, chosen with MODE:
+// The load test (see docs/LOADTEST.md). Three models, chosen with MODE:
 //   MODE=users  USERS=N  N virtual users. Each logs in, does 20-40 actions with
 //                        1-5 s of think time after each, logs out, and starts
 //                        a new session.
@@ -6,7 +6,16 @@
 //                        per iteration, no think time. No logins during the run:
 //                        setup() logs in SESSION_POOL sessions one after the other
 //                        and each VU uses one of them.
-// Both ramp for RAMP seconds, then hold for HOLD seconds. Every request is
+//   MODE=ramp  START, STEP, STEP_S, MAX_USERS  stairs of ramping-vus: START users,
+//                        then STEP more every STEP_S seconds (a 10 s ramp up, then
+//                        a hold). Each user logs in once, when it starts, and keeps
+//                        the session for the whole run (no logout, no new login; a
+//                        401 means the session was lost and it logs in again, counted
+//                        as relogins). One action then think time, same mix as
+//                        MODE=users. Every request is
+//                        tagged step:<k> (k = elapsed / STEP_S, taken when the request
+//                        starts) and scripts/loadtest.sh ramp reads the numbers per step.
+// users and rps ramp for RAMP seconds, then hold for HOLD seconds. Every request is
 // tagged phase:ramp|hold|post, action:<name> and kind:read|write|auth. All
 // reported numbers come from phase:hold only.
 import http from 'k6/http';
@@ -20,6 +29,12 @@ const USERS = Number(__ENV.USERS || 20);
 const RPS = Number(__ENV.RPS || 20);
 const RAMP = Number(__ENV.RAMP || 60);
 const HOLD = Number(__ENV.HOLD || 300);
+const START = Number(__ENV.START || 100);
+const STEP = Number(__ENV.STEP || 100);
+const STEP_S = Number(__ENV.STEP_S || 60);
+const MAX_USERS = Number(__ENV.MAX_USERS || 5000);
+const STEP_RAMP_S = 10; // each step ramps up over this long, then holds
+const P99_MS = Number(__ENV.P99_MS || 1000);
 const SESSION_POOL = Number(__ENV.SESSION_POOL || 50);
 const SEED_BOOKS = Number(__ENV.SEED_BOOKS || 50000);
 const OUT = __ENV.OUT || '/out';
@@ -59,6 +74,7 @@ const actions = new Counter('actions'); // intended actions, tag intent
 // network error or timeout) and phase.
 const unexpected = new Counter('unexpected_status');
 const converted = new Counter('return_converted_to_borrow'); // a return with no own loan to return
+const relogins = new Counter('relogins'); // ramp mode: a login after a 401 (the session was lost), tag step
 const skipped = new Counter('skipped_actions'); // e.g. a return with no active loan anywhere
 
 // Thresholds that never fail. They exist so k6 keeps hold-only sub-metrics for
@@ -87,7 +103,40 @@ for (const action of Object.keys(EXPECT)) {
   for (const status of STATUSES) keep(`unexpected_status{phase:hold,action:${action},status:${status}}`, 'count>=0');
 }
 
-const scenarios = MODE === 'rps'
+// Ramp mode: one set of sub-metrics per step, so k6 keeps them and its REST API
+// serves them while the test runs (the runner stops the test at the first failing
+// step). The p99 threshold never aborts: it is there so the metric's `tainted`
+// flag says whether the step's p99 is over the limit, because the REST API gives
+// no p99. The final numbers come from the end-of-test summary.
+const STEPS = Math.floor((MAX_USERS - START) / STEP) + 1;
+const stepThresholds = {};
+if (MODE === 'ramp') {
+  for (let k = 0; k < STEPS; k++) {
+    stepThresholds[`http_req_duration{step:${k}}`] = [`p(99)<${P99_MS}`];
+    stepThresholds[`http_req_failed{step:${k}}`] = ['rate>=0'];
+    stepThresholds[`http_reqs{step:${k}}`] = ['count>=0'];
+    stepThresholds[`relogins{step:${k}}`] = ['count>=0'];
+  }
+}
+const stairs = [];
+for (let k = 0; k < STEPS; k++) {
+  stairs.push({ target: START + k * STEP, duration: `${STEP_RAMP_S}s` }, { target: START + k * STEP, duration: `${STEP_S - STEP_RAMP_S}s` });
+}
+
+const scenarios = MODE === 'ramp'
+  ? {
+    ramp: {
+      executor: 'ramping-vus',
+      exec: 'rampIteration',
+      startVUs: 0,
+      stages: stairs,
+      gracefulRampDown: '0s',
+      // The runner stops the test with SIGTERM 10 s after the failing step ended,
+      // when every request of that step has finished (10 s timeout).
+      gracefulStop: '2s',
+    },
+  }
+  : MODE === 'rps'
   ? {
     rps: {
       executor: 'ramping-arrival-rate',
@@ -119,7 +168,7 @@ const scenarios = MODE === 'rps'
 
 export const options = {
   scenarios,
-  thresholds,
+  thresholds: MODE === 'ramp' ? stepThresholds : thresholds,
   noCookiesReset: true, // the session cookie must survive between iterations in rps mode
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
@@ -156,7 +205,13 @@ export function setup() {
   return data;
 }
 
+// Ramp mode: the step the request starts in.
+function stepOf() {
+  return Math.floor((Date.now() - exec.scenario.startTime) / (STEP_S * 1000));
+}
+
 function phase() {
+  if (MODE === 'ramp') return 'step'; // no ramp/hold/post phases; user sessions run until k6 stops
   const elapsed = (Date.now() - exec.scenario.startTime) / 1000;
   return elapsed < RAMP ? 'ramp' : elapsed < RAMP + HOLD ? 'hold' : 'post';
 }
@@ -168,11 +223,15 @@ function request(method, path, body, action) {
     timeout: '10s',
     responseCallback: CALLBACK[action],
     // `name` keeps k6 from making one series per URL (ids, search terms).
-    tags: { name: action, action, kind: kindOf(action), phase: ph },
+    tags: MODE === 'ramp'
+      ? { name: action, action, kind: kindOf(action), phase: ph, step: String(stepOf()) }
+      : { name: action, action, kind: kindOf(action), phase: ph },
   });
   const bad = !EXPECT[action].includes(res.status);
   errors.add(bad, { action, kind: kindOf(action), phase: ph });
   if (bad) unexpected.add(1, { action, status: String(res.status), phase: ph });
+  // Ramp mode keeps one session per user: a 401 means it is gone, log in again.
+  if (MODE === 'ramp' && res.status === 401 && action !== 'login') vu.loggedIn = false;
   return res;
 }
 
@@ -182,7 +241,7 @@ const json = (res, path) => {
 };
 
 // State one VU keeps across sessions.
-const vu = { loggedIn: false, ready: false, loans: [] };
+const vu = { loggedIn: false, everLoggedIn: false, ready: false, loans: [] };
 
 function startSession() {
   const res = request('POST', '/api/auth/login', { username: c.ADMIN_USER, password: c.ADMIN_PASSWORD }, 'login');
@@ -285,6 +344,21 @@ export function userSession(d) {
     sleep(1 + Math.random() * 4); // think time, never inside a timed request
   }
   request('POST', '/api/auth/logout', null, 'logout');
+}
+
+// Ramp mode: log in on the first iteration (and after a lost session), then one
+// action and think time per iteration, for as long as k6 runs.
+export function rampIteration(d) {
+  if (!vu.loggedIn) {
+    if (!startSession()) {
+      sleep(5);
+      return;
+    }
+    if (vu.everLoggedIn) relogins.add(1, { step: String(stepOf()) });
+    vu.everLoggedIn = true;
+  }
+  act(d);
+  sleep(1 + Math.random() * 4); // think time, never inside a timed request
 }
 
 export function rpsIteration(d) {

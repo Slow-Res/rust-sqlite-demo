@@ -17,11 +17,12 @@ services:
     image: nginx:1.28.0-alpine
     volumes: [./loadtest-nginx.conf:/etc/nginx/nginx.conf:ro]
     # The same cores as web: it is one box, so nginx competes with the app for
-    # CPU as it would in a deployment. The three memory limits (nginx, web and,
-    # with LT_DB=postgres, Postgres) add up to the box's 4096 MiB.
+    # CPU as it would in a deployment. The memory limits (nginx, web and, with
+    # LT_DB=postgres, Postgres) must add up to the box's 4096 MiB: scripts/loadtest.sh
+    # up refuses to start otherwise. NGINX_MEM, WEB_MEM and PG_MEM change the split.
     cpuset: "${NODE_CPUS:-6,7}"
-    mem_limit: 256m
-    memswap_limit: 256m
+    mem_limit: ${NGINX_MEM:-256m}
+    memswap_limit: ${NGINX_MEM:-256m}
     depends_on:
       web:
         condition: service_healthy
@@ -43,11 +44,12 @@ services:
       RUST_LOG: info
     volumes: [data:/data]
     # The same 2 cores (4.4 GHz efficiency cores) as the whole node of the
-    # full-node mode; 4096 MiB minus nginx's 256. memswap_limit equals
-    # mem_limit, so no swap.
+    # full-node mode; 4096 MiB minus nginx's 256. It holds the app, the SQLite
+    # file and the OS page cache of that file, so it gets nearly all of it.
+    # memswap_limit equals mem_limit, so no swap.
     cpuset: "${NODE_CPUS:-6,7}"
-    mem_limit: 3840m
-    memswap_limit: 3840m
+    mem_limit: ${WEB_MEM:-3840m}
+    memswap_limit: ${WEB_MEM:-3840m}
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:4000/api/health"]
       interval: 10s

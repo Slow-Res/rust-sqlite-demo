@@ -10,6 +10,7 @@
 #   scripts/loadtest.sh up
 #   scripts/loadtest.sh users N | rps R
 #   scripts/loadtest.sh search users|rps [START] [FACTOR]
+#   scripts/loadtest.sh ramp [START] [STEP] [STEP_S]
 #   scripts/loadtest.sh down
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -59,12 +60,35 @@ export LT_ADMIN_PASSWORD="${LT_ADMIN_PASSWORD:-loadtest-local-only}"
 # Seed sizes (up) and the settings of a level.
 BOOKS="${BOOKS:-50000}" MEMBERS="${MEMBERS:-10000}" LOANS="${LOANS:-20000}" SEED_VUS="${SEED_VUS:-16}"
 RAMP="${RAMP:-60}" HOLD="${HOLD:-300}"
-P95_MS="${P95_MS:-500}" P99_MS="${P99_MS:-1000}" ERR_PCT="${ERR_PCT:-1}" DROP_PCT="${DROP_PCT:-1}"
+# ramp mode allows 2% errors (a step of many users logging in at once), the others 1%.
+P95_MS="${P95_MS:-500}" P99_MS="${P99_MS:-1000}" ERR_PCT="${ERR_PCT:-$([ "${1:-}" = ramp ] && echo 2 || echo 1)}" DROP_PCT="${DROP_PCT:-1}"
 PAUSE_S="${PAUSE_S:-30}"           # between levels, after the sync worker has drained
 SAMPLE_S="${SAMPLE_S:-5}"
 SESSION_POOL="${SESSION_POOL:-50}"   # rps model: sessions logged in at setup
 DRAIN_TIMEOUT_S="${DRAIN_TIMEOUT_S:-900}"
 MAX_LEVEL="${MAX_LEVEL:-100000}"   # the search gives up above this
+MAX_USERS="${MAX_USERS:-5000}"     # ramp stops here if no step has failed
+RAMP_UP_S=10                       # ramp: each step ramps up over this long, then holds
+RAMP_EVAL_DELAY_S=10               # ramp: a step is read this long after it ended (requests still in flight)
+
+# The box's memory split (MiB total must be 4096): nginx, the web app and, with
+# LT_DB=postgres, Postgres. Postgres' shared_buffers (25%) and effective_cache_size
+# (75%) follow PG_MEM, so a split cannot leave them at a stale size.
+BOX_MIB=4096
+if [ "$LT_DB" = postgres ]; then DEFAULT_WEB_MEM=1024m; else DEFAULT_WEB_MEM=3840m; fi
+export NGINX_MEM="${NGINX_MEM:-256m}" WEB_MEM="${WEB_MEM:-$DEFAULT_WEB_MEM}" PG_MEM="${PG_MEM:-2816m}"
+# <integer>m or <integer>g (as in compose) to MiB, or an empty string.
+to_mib() {
+  [[ $1 =~ ^([1-9][0-9]*)([mg])$ ]] || return 0
+  if [ "${BASH_REMATCH[2]}" = g ]; then echo "$((BASH_REMATCH[1] * 1024))"; else echo "${BASH_REMATCH[1]}"; fi
+}
+for _v in NGINX_MEM WEB_MEM PG_MEM; do
+  [ -n "$(to_mib "${!_v}")" ] || { echo "LOADTEST: usage: $_v must be an integer with a unit m or g, e.g. 256m (got '${!_v}')" >&2; exit 2; }
+done
+if [ "$LT_DB" = postgres ]; then
+  export PG_SHARED_BUFFERS="$(awk -v m="$(to_mib "$PG_MEM")" 'BEGIN { printf "%d", m * 0.25 + 0.5 }')MB"
+  export PG_EFFECTIVE_CACHE_SIZE="$(awk -v m="$(to_mib "$PG_MEM")" 'BEGIN { printf "%d", m * 0.75 + 0.5 }')MB"
+fi
 
 RESULTS_ROOT=loadtest/results
 STATE_DIR=$RESULTS_ROOT/.state
@@ -209,14 +233,16 @@ db_rows() {
 }
 
 # k6_run <out-dir> <script> [docker run args...]: k6 on its own cores, inside
-# the node's Docker network, so no docker-proxy is on the path.
+# the node's Docker network, so no docker-proxy is on the path. K6_ARGS (an array)
+# are extra arguments for k6 itself.
+K6_ARGS=()
 k6_run() {
   local out=$1 script=$2
   shift 2
   [[ $out == /* ]] || out=$PWD/$out
   docker run --rm --name "${PREFIX}k6-$$" --cpuset-cpus "$K6_CPUS" --network "$K6_NETWORK" --user "$(id -u):$(id -g)" \
     -v "$PWD/loadtest:/lt:ro" -v "$out:/out" -e BASE_URL="$BASE_URL" -e OUT=/out \
-    -e LT_ADMIN_USER -e LT_ADMIN_PASSWORD "$@" "$K6_IMAGE" run --quiet "/lt/$script"
+    -e LT_ADMIN_USER -e LT_ADMIN_PASSWORD "$@" "$K6_IMAGE" run --quiet "${K6_ARGS[@]}" "/lt/$script"
 }
 
 # ---------------------------------------------------------------- up / down
@@ -254,14 +280,14 @@ web_limits_proof() {
       awk '{ printf "%-24s %-7s %-8s %-8s %s\n", substr($1, 2), $2, $3 / 1048576 "m", $4 / 1048576 "m", $5 }'
   done
   total=$(for name in "${NODE_CONTAINERS[@]}"; do docker inspect -f '{{.HostConfig.Memory}}' "$name"; done | awk '{ s += $1 } END { print s / 1048576 }')
-  echo "memory limits of the box add up to ${total} MiB (expected 4096)"
+  echo "memory limits of the box add up to ${total} MiB (expected $BOX_MIB)"
   expected_cpus=$(expand_cpus "$NODE_CPUS" | wc -l)
   echo "nproc in the web container: $(docker exec "$WEB" nproc) (expected $expected_cpus)"
   for name in "${NODE_CONTAINERS[@]}"; do
     [ "$(docker inspect -f '{{.HostConfig.CpusetCpus}}' "$name")" = "$NODE_CPUS" ] || die "$name has the wrong cpuset"
     [ "$(docker inspect -f '{{.HostConfig.Memory}}' "$name")" = "$(docker inspect -f '{{.HostConfig.MemorySwap}}' "$name")" ] || die "$name may use swap"
   done
-  [ "$total" = 4096 ] || die "the box's memory limits add up to ${total} MiB, not 4096"
+  [ "$total" = "$BOX_MIB" ] || die "the box's memory limits add up to ${total} MiB, not $BOX_MIB"
   [ "$(docker exec "$WEB" nproc)" = "$expected_cpus" ] || die "nproc in the web container is not $expected_cpus"
 }
 
@@ -280,6 +306,11 @@ cmd_up() {
     die "a load-test cluster already exists: scripts/loadtest.sh down first"
   fi
   ((LOANS <= BOOKS)) || die "LOANS ($LOANS) must not exceed BOOKS ($BOOKS)"
+  if [ "$LT_MODE" = web ]; then
+    local split_mib=$(($(to_mib "$NGINX_MEM") + $(to_mib "$WEB_MEM")))
+    [ "$LT_DB" = sqlite ] || split_mib=$((split_mib + $(to_mib "$PG_MEM")))
+    [ "$split_mib" = "$BOX_MIB" ] || die "the memory split adds up to $split_mib MiB, not $BOX_MIB (NGINX_MEM=$NGINX_MEM WEB_MEM=$WEB_MEM$([ "$LT_DB" = sqlite ] || echo " PG_MEM=$PG_MEM"))"
+  fi
 
   local create_admin="printf '%s\n' \"\$PW\" | library-web create-user $LT_ADMIN_USER --password-stdin"
   if [ "$LT_MODE" = web ]; then
@@ -360,7 +391,10 @@ cmd_down() {
 # position and upload counter. The queries run at the same time, so a slow
 # `docker stats` (about 2 s) does not stretch the tick.
 sample_loop() {
-  local file=$1 t next=$(now) names pids delay
+  local file=$1 t next=$(now) names pids delay core freq_files=()
+  # Each box core's current frequency (kHz): whether two boxes side by side slow
+  # each other through the laptop's shared power budget.
+  for core in $(expand_cpus "$NODE_CPUS"); do freq_files+=("/sys/devices/system/cpu/cpu$core/cpufreq/scaling_cur_freq"); done
   while :; do
     t=$next
     names=("${NODE_CONTAINERS[@]}")
@@ -374,11 +408,14 @@ sample_loop() {
     else
       echo null | tee "$WORK/s.pending" "$WORK/s.lag" "$WORK/s.puts" "$WORK/s.txid" >/dev/null
     fi
+    (restart_state >"$WORK/s.state" 2>/dev/null || echo null >"$WORK/s.state") &
     wait
+    for core in "${freq_files[@]}"; do cat "$core" 2>/dev/null || echo null; done | jq -cs . >"$WORK/s.freq" || echo null >"$WORK/s.freq"
     jq -cn --arg t "$t" --argjson stats "$(cat "$WORK/s.stats")" \
       --argjson pending "$(cat "$WORK/s.pending")" --argjson lag "$(cat "$WORK/s.lag")" \
       --argjson puts "$(cat "$WORK/s.puts")" --argjson txid "$(cat "$WORK/s.txid")" \
-      '{t: ($t | tonumber), stats: $stats, pending: $pending, lag: $lag, puts: $puts, txid: $txid}' >>"$file" || true
+      --argjson state "$(cat "$WORK/s.state")" --argjson freq "$(cat "$WORK/s.freq")" \
+      '{t: ($t | tonumber), stats: $stats, pending: $pending, lag: $lag, puts: $puts, txid: $txid, state: $state, freq: $freq}' >>"$file" || true
     next=$(awk -v n="$next" -v s="$SAMPLE_S" 'BEGIN { printf "%.3f", n + s }')
     delay=$(awk -v n="$next" -v c="$(now)" -v s="$SAMPLE_S" 'BEGIN { d = n - c; if (d < 0) { d = 0; n = c } printf "%.3f", d }')
     # A tick that ran over starts the next one at once; it does not queue up.
@@ -482,7 +519,7 @@ write_summary() {
 }
 
 new_results_dir() {
-  local dir="${RESULTS_DIR:-$RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)$([ "$LT_MODE" = web ] && echo "-$LT_DB")$([ "$PREFIX" = lt- ] || echo "-${PREFIX%-}")}"
+  local dir="${RESULTS_DIR:-$RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)$([ "$LT_MODE" = web ] && echo "-$LT_DB")${1:+-$1}$([ "$PREFIX" = lt- ] || echo "-${PREFIX%-}")}"
   mkdir -p "$dir" || die "cannot create the results directory $dir"
   echo "$dir"
 }
@@ -605,13 +642,155 @@ cmd_search() {
   [ "$last_pass" != 0 ]
 }
 
+# --------------------------------------------------------------------- ramp
+
+# The k6 REST API's view of step $1, as a document like k6's summary (.metrics),
+# or fail. $2 is k6's address.
+k6_live_doc() {
+  local k=$1 addr=$2 name
+  for name in http_req_duration http_req_failed http_reqs relogins; do
+    curl -fsS --max-time 5 "http://$addr:6565/v1/metrics/$name%7Bstep%3A$k%7D" || return 1
+    echo
+  done | jq -s 'map(.data | {key: .id, value: {values: .attributes.sample, tainted: .attributes.tainted}}) | {metrics: from_entries}'
+}
+
+# ramp_steps <k6 doc file> <from> <to> <live|final>: the step objects, as a JSON array.
+# The sample and event files are still being written, so a half-written last
+# line is skipped.
+ramp_steps() {
+  local doc=$1 from=$2 to=$3 source=$4 dir=$RAMP_DIR
+  jq -cR 'fromjson? | select(.)' "$dir/samples.jsonl" >"$WORK/r.samples"
+  jq -cR 'fromjson? | select(.)' "$dir/events.jsonl" >"$WORK/r.events"
+  jq -n --slurpfile k6 "$doc" --slurpfile samples "$WORK/r.samples" --slurpfile events "$WORK/r.events" \
+    --arg prefix "$PREFIX" --argjson before "$RAMP_STATE_BEFORE" --argjson t0 "$RAMP_T0" --argjson step_s "$RAMP_STEP_S" \
+    --argjson start "$RAMP_START" --argjson step_users "$RAMP_STEP" --argjson from "$from" --argjson to "$to" \
+    --argjson ncont "${#NODE_CONTAINERS[@]}" --argjson p95_limit "$P95_MS" --argjson p99_limit "$P99_MS" --argjson err_limit "$ERR_PCT" \
+    --arg source "$source" -f loadtest/ramp-steps.jq
+}
+
+cmd_ramp() {
+  local usage="usage: scripts/loadtest.sh ramp [START] [STEP] [STEP_S]  (positive integers, STEP_S at least 20; MAX_USERS, default 5000, ends the ramp)"
+  [ "$LT_MODE" = web ] || die "ramp works with LT_MODE=web only"
+  local start=${1:-100} step=${2:-100} step_s=${3:-60} v
+  for v in "$start" "$step" "$step_s" "$MAX_USERS"; do [[ $v =~ ^[1-9][0-9]*$ ]] || die "$usage"; done
+  ((step_s >= RAMP_UP_S * 2)) || die "$usage"
+  ((MAX_USERS >= start)) || die "MAX_USERS ($MAX_USERS) is below START ($start)"
+  local nsteps=$(((MAX_USERS - start) / step + 1))
+  RAMP_START=$start RAMP_STEP=$step RAMP_STEP_S=$step_s
+  # shellcheck disable=SC1091
+  . "$STATE_DIR/seed.env" 2>/dev/null || die "no seeded cluster: scripts/loadtest.sh up first"
+  local dir
+  dir=$(new_results_dir ramp)
+  RAMP_DIR=$dir
+  healthy >/dev/null || die "web is not answering (is the box up?)"
+  wait_until 180 "web healthy" healthy
+  RAMP_STATE_BEFORE=$(restart_state) || die "cannot read the container state"
+  local rows_before
+  rows_before=$(db_rows) || die "cannot read the row counts (API)"
+  echo "rows: $rows_before"
+  : >"$dir/samples.jsonl"
+  sample_loop "$dir/samples.jsonl" &
+  SAMPLER_PID=$!
+  local filters=() name
+  for name in "${NODE_CONTAINERS[@]}"; do filters+=(--filter "container=$name"); done
+  docker events --filter type=container --filter event=die --filter event=oom "${filters[@]}" --format '{{json .}}' >"$dir/events.jsonl" 2>/dev/null &
+  EVENTS_PID=$!
+
+  printf '\n==> ramp: %s users, +%s every %ss up to %s users (%s steps), until a step fails\n' "$start" "$step" "$step_s" "$MAX_USERS" "$nsteps"
+  K6_ARGS=(--address 0.0.0.0:6565)
+  k6_run "$dir" user.js -e MODE=ramp -e START="$start" -e STEP="$step" -e STEP_S="$step_s" -e MAX_USERS="$MAX_USERS" \
+    -e P99_MS="$P99_MS" -e SEED_BOOKS="$SEED_BOOKS" >"$dir/k6.log" 2>&1 &
+  local k6_pid=$!
+  K6_ARGS=()
+  # k6 first starts every VU it may need (MAX_USERS), then runs setup().
+  local setup_ms deadline=$((SECONDS + 600))
+  until setup_ms=$(sed -n 's/.*LT_SETUP_DONE \([0-9]*\) .*/\1/p' "$dir/k6.log" | head -1) && [ -n "$setup_ms" ]; do
+    kill -0 "$k6_pid" 2>/dev/null || { tail -20 "$dir/k6.log" >&2; die "k6 ended before the ramp started (log: $dir/k6.log)"; }
+    ((SECONDS < deadline)) || die "k6 did not start the ramp within 600 s (log: $dir/k6.log)"
+    sleep 1
+  done
+  RAMP_T0=$(awk -v ms="$setup_ms" 'BEGIN { printf "%.3f", ms / 1000 }')
+  local k6_ip
+  k6_ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$K6_NETWORK\").IPAddress}}" "${PREFIX}k6-$$") || die "cannot find k6's address"
+
+  # Evaluate each step RAMP_EVAL_DELAY_S after it ended, from k6's REST API; stop
+  # k6 at the first step that fails the pass rule. Requests still in flight at
+  # that moment are missed, so the report is made from k6's end-of-test summary.
+  echo
+  jq -rn -L loadtest 'include "ramp-lib"; header'
+  local k=0 live_fail="" stop=null live_doc="$WORK/r.live.json" live_steps step_end sigterm_at exit_at
+  : >"$dir/live-steps.jsonl"
+  while ((k < nsteps)); do
+    step_end=$(awk -v t="$RAMP_T0" -v k="$k" -v s="$step_s" 'BEGIN { printf "%.3f", t + (k + 1) * s }')
+    while awk -v n="$(now)" -v d="$step_end" -v e="$RAMP_EVAL_DELAY_S" 'BEGIN { exit !(n < d + e) }'; do
+      kill -0 "$k6_pid" 2>/dev/null || break 2
+      sleep 1
+    done
+    k6_live_doc "$k" "$k6_ip" >"$live_doc" || break # k6 is gone or going
+    live_steps=$(ramp_steps "$live_doc" "$k" "$k" live) || die "could not compute step $k (loadtest/ramp-steps.jq)"
+    jq -c '.[]' <<<"$live_steps" >>"$dir/live-steps.jsonl"
+    jq -r -L loadtest -f loadtest/ramp-line.jq <<<"$(jq -c '.[0]' <<<"$live_steps")"
+    if [ "$(jq -r '.[0].pass' <<<"$live_steps")" != true ]; then
+      live_fail=$k
+      sigterm_at=$(now)
+      docker kill --signal TERM "${PREFIX}k6-$$" >/dev/null 2>&1 || true
+      break
+    fi
+    k=$((k + 1))
+  done
+  # k6 either ran every step or was just told to stop; its summary is written
+  # on the way out.
+  deadline=$((SECONDS + 90))
+  while kill -0 "$k6_pid" 2>/dev/null; do
+    if ((SECONDS >= deadline)); then docker rm -f "${PREFIX}k6-$$" >/dev/null 2>&1 || true; die "k6 did not stop within 90 s"; fi
+    sleep 0.5
+  done
+  exit_at=$(now)
+  local rc=0
+  wait "$k6_pid" || rc=$?
+  kill "$SAMPLER_PID" "$EVENTS_PID" 2>/dev/null || true
+  wait "$SAMPLER_PID" "$EVENTS_PID" 2>/dev/null || true
+  SAMPLER_PID= EVENTS_PID=
+  # k6 exits 99 when a threshold failed (the p99 one is meant to); only a missing summary is an error.
+  [ -s "$dir/k6-summary.json" ] || { tail -20 "$dir/k6.log" >&2; die "k6 produced no summary (exit $rc, log: $dir/k6.log)"; }
+
+  # The steps that are complete: all of them, or up to the step that stopped the run.
+  local last=$((nsteps - 1))
+  if [ -n "$live_fail" ]; then
+    last=$live_fail
+    stop=$(jq -cn --argjson step "$live_fail" --argjson a "$(awk -v s="$sigterm_at" -v e="$step_end" 'BEGIN { printf "%.1f", s - e }')" \
+      --argjson b "$(awk -v s="$exit_at" -v e="$step_end" 'BEGIN { printf "%.1f", s - e }')" '{step: $step, to_sigterm_s: $a, to_exit_s: $b}')
+  elif awk -v n="$exit_at" -v t="$RAMP_T0" -v k="$nsteps" -v s="$step_s" 'BEGIN { exit !(n < t + k * s) }'; then
+    die "k6 stopped before the end of step $((nsteps - 1)) (exit $rc, log: $dir/k6.log)"
+  fi
+  ramp_steps "$dir/k6-summary.json" 0 "$last" final | jq -c '.[]' >"$dir/steps.jsonl" || die "could not compute the steps (loadtest/ramp-steps.jq; inputs in $dir)"
+  # Steps that ended with k6 and were not read live (the last one) get their row now.
+  local printed=$k
+  [ -z "$live_fail" ] || printed=$((k + 1))
+  sed -n "$((printed + 1)),\$p" "$dir/steps.jsonl" | while IFS= read -r line; do jq -r -L loadtest -f loadtest/ramp-line.jq <<<"$line"; done
+  local out
+  out=$(jq -s -L loadtest --arg db "$LT_DB" --arg node_cpus "$NODE_CPUS" --arg k6_cpus "$K6_CPUS" \
+    --arg nginx_mem "$NGINX_MEM" --arg web_mem "$WEB_MEM" --arg pg_mem "$PG_MEM" \
+    --arg pg_shared "${PG_SHARED_BUFFERS:-}" --arg pg_cache "${PG_EFFECTIVE_CACHE_SIZE:-}" \
+    --argjson start "$start" --argjson step_users "$step" --argjson step_s "$step_s" --argjson max_users "$MAX_USERS" \
+    --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson stop "$stop" --argjson live_fail "${live_fail:-null}" \
+    -f loadtest/ramp-summary.jq "$dir/steps.jsonl") || die "could not write the summary (loadtest/ramp-summary.jq)"
+  jq -r .md <<<"$out" >"$dir/summary.md"
+  echo
+  cat "$dir/summary.md"
+  echo "results: $dir (summary.md, steps.jsonl, samples.jsonl, k6-summary.json)"
+  [ "$(jq -r .ok <<<"$out")" = true ]
+}
+
 case "${1:-}" in
   up) cmd_up ;;
   users | rps) cmd_level "$1" "${2:?usage: loadtest.sh $1 N}" ;;
   search) shift; cmd_search "$@" ;;
+  ramp) shift; cmd_ramp "$@" ;;
+  config) web_compose config ;;
   down) cmd_down ;;
   *)
-    echo "usage: scripts/loadtest.sh up | users N | rps R | search users|rps [START] [FACTOR] | down" >&2
+    echo "usage: scripts/loadtest.sh up | users N | rps R | search users|rps [START] [FACTOR] | ramp [START] [STEP] [STEP_S] | config | down" >&2
     exit 2
     ;;
 esac

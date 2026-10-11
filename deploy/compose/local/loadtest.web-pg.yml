@@ -1,7 +1,10 @@
 # LOAD TEST ONLY (scripts/loadtest.sh, LT_DB=postgres): layered on
 # loadtest.web.yml. Runs Postgres inside the same 2 CPU / 4 GB box as nginx and
 # the web app, and points the web app at it. Memory split: nginx 256m + web
-# 2048m + Postgres 1792m = 4096 MiB. LOCAL ONLY credentials.
+# 1024m + Postgres 2816m = 4096 MiB (NGINX_MEM, WEB_MEM, PG_MEM change it; the
+# sum must stay 4096). The database has its own container here, so it gets the
+# most memory: shared_buffers and the OS page cache for its files.
+# LOCAL ONLY credentials.
 services:
   postgres:
     image: postgres:18.6
@@ -10,13 +13,15 @@ services:
       POSTGRES_PASSWORD: library # local only
       POSTGRES_DB: library
     # Only the memory settings differ from the defaults: synchronous_commit=on
-    # and fsync=on stay, so a commit is durable on power loss.
+    # and fsync=on stay, so a commit is durable on power loss. shared_buffers is
+    # 25% and effective_cache_size 75% of PG_MEM; the runner derives them (the
+    # defaults here are those of the default 2816m).
     command:
       - postgres
       - -c
-      - shared_buffers=512MB
+      - shared_buffers=${PG_SHARED_BUFFERS:-704MB}
       - -c
-      - effective_cache_size=1GB
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-2112MB}
       - -c
       - max_connections=50
       - -c
@@ -27,8 +32,8 @@ services:
     # parent of PGDATA (as in central.yml).
     volumes: [pgdata:/var/lib/postgresql]
     cpuset: "${NODE_CPUS:-6,7}"
-    mem_limit: 1792m
-    memswap_limit: 1792m
+    mem_limit: ${PG_MEM:-2816m}
+    memswap_limit: ${PG_MEM:-2816m}
     shm_size: 256m
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "library", "-d", "library"]
@@ -40,8 +45,8 @@ services:
   web:
     environment:
       DATABASE_URL: postgres://library:library@postgres:5432/library # local only
-    mem_limit: 2048m
-    memswap_limit: 2048m
+    mem_limit: ${WEB_MEM:-1024m}
+    memswap_limit: ${WEB_MEM:-1024m}
     depends_on:
       postgres:
         condition: service_healthy

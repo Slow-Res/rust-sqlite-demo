@@ -48,10 +48,21 @@ starve the others invisibly; this way a container that runs out is OOM-killed an
 | Variant | nginx | web | postgres | total |
 |---|---|---|---|---|
 | sqlite | 256m | 3840m | | 4096 MiB |
-| postgres | 256m | 2048m | 1792m | 4096 MiB |
+| postgres | 256m | 1024m | 2816m | 4096 MiB |
 
-Postgres runs with defaults except for memory: `shared_buffers=512MB`,
-`effective_cache_size=1GB`, `max_connections=50`, `work_mem=4MB`,
+Why this split: in the SQLite box the database is a file inside the web container, so that
+container holds the app *and* the SQLite file's OS page cache, and gets nearly everything
+(nginx needs little). In the Postgres box the database has its own container, which holds
+`shared_buffers` and the page cache of Postgres' files, so it gets the most, and the Rust
+app (a few hundred MiB, more with many sessions) keeps 1 GiB. The split is configurable: `NGINX_MEM`,
+`WEB_MEM` and `PG_MEM` (for example `PG_MEM=2048m WEB_MEM=1792m`, a number with `m` or `g`).
+The rule does not change: the box total must be 4096 MiB, and `up` dies with a message
+otherwise. `scripts/loadtest.sh config` prints the rendered compose file of the box
+(`docker compose config`), to see the limits and Postgres flags without starting anything.
+
+Postgres runs with defaults except for memory: `shared_buffers` = 25% of `PG_MEM` and
+`effective_cache_size` = 75% of it, rounded to MB (704MB and 2112MB at 2816m; the runner
+derives them from `PG_MEM` and passes them as flags), `max_connections=50`, `work_mem=4MB`,
 `maintenance_work_mem=128MB` (and `shm_size` 256m). `synchronous_commit=on` and `fsync=on`
 stay, so a Postgres commit is durable on power loss. That is stronger than SQLite's
 `synchronous=NORMAL` (WAL), which can lose the last commits on power loss. Weigh this when
@@ -231,6 +242,77 @@ action and status, with an "other" row for statuses the counter does not name. T
 above 5%, the summary says so at the top: the mix is then not measuring what it claims
 (for example, if most returns hit 409, they are not doing the work of a return).
 
+## Step ramp (`ramp`)
+
+`scripts/loadtest.sh ramp [START] [STEP] [STEP_S]` (web mode only; defaults 100, 100, 60)
+answers a different question from `search`: starting at START users, add STEP users every
+STEP_S seconds, and keep going until one step fails the pass rule or `MAX_USERS` (5000) is
+reached. It is one k6 run (a `ramping-vus` scenario of stairs, in `loadtest/user.js` with
+`MODE=ramp`), not one run per level, so it needs no pause or drain between steps. All
+arguments are positive integers and STEP_S is at least 20. Step *k* has START + k*STEP
+users: a 10 s ramp up by STEP, then a hold for the rest of the step.
+
+**The workload is the same** (the same mix, think times and data as `users`) with one
+difference: **each user logs in once, when it starts, and keeps the session for the whole
+run.** There is no logout and no re-login between sessions; `me`, `login` and `logout`
+leave the steady loop, and the 40% write / 60% read mix of the actions is unchanged. This is
+how real users behave (one login a day), and it stops the simulated users from re-running
+Argon2 about every 90 s, which spends CPU that real traffic would not. New users still log
+in as they arrive: about STEP per step, inside the 10 s ramp (that is why a step's p95 is
+a bit higher than the hold alone would give). If a request returns 401 (the session was
+lost) the user logs in again; the number of re-logins per step is reported.
+
+**Per-step numbers.** Every request is tagged `step` (elapsed time since the scenario
+started divided by STEP_S, taken when the request starts). Step *k*'s p50/p95/p99, error %
+and req/s cover the requests that started in that step only, ramp-up included, not the
+whole run. The pass rule is the same as below with **errors < 2%** in this mode (`ERR_PCT`
+overrides it, 2 by default only here); restarts and OOM kills are recorded per step but are
+not part of the ramp's rule.
+
+**Early stop.** Each step is read 10 s after it ended (so requests that took long have
+finished) from k6's REST API (`--address`, reached through the k6 container's address on
+the box network). The steps' sub-metrics are declared as thresholds that never abort. The
+API has no p99, so the p99 threshold's `tainted` flag says whether the p99 is over its
+limit. The first step that fails stops k6 with SIGTERM, about 10-12 s after that step's
+end, and k6 still writes its summary. Requests in flight at the time of the live reading
+are missing from it, so **the report comes from k6's end-of-test summary per step**: the
+first failing step is the first whose final values fail, and the result is the step before
+it. The partial step after the failing one is dropped. A step failing in the live reading
+but not in the final values is reported as passing, with a note. One line per step is
+printed as it is evaluated, in the format of the table. The last step of a run that reached
+`MAX_USERS` is printed when k6 ends. These live lines use the live numbers (the p99 cell is
+`< 1000` or `>= 1000` there); the table in `summary.md` has the final ones.
+
+**Memory of the load generator.** k6 creates all VUs for the highest step before the test
+starts, so a large `MAX_USERS` costs k6 start-up time and memory. Lower it for a quick run.
+
+**Per-step sampling** uses the same 5 s tick: CPU per container and the box sum (out of
+200%), peak memory per container, k6's CPU, restarts and OOM per box container, and the
+**CPU frequency of each box core** (`/sys/devices/system/cpu/cpuN/cpufreq/scaling_cur_freq`):
+average and minimum per step. When two boxes run side by side, a frequency drop shows that
+they slowed each other through the laptop's shared power budget. Short steps have few samples.
+
+**Output**, in `loadtest/results/<timestamp>-<db>-ramp[-<prefix>]/`: `steps.jsonl` (one
+object per step), `summary.md` (a header naming the stack, the box, the memory split and the
+rule, with "each user logs in once and keeps the session", then one row per step: users,
+req/s, p50/p95/p99, error %, box CPU with its per-container split, peak memory per
+container, k6 CPU, average / minimum frequency in MHz, restarts / OOM, re-logins and PASS or
+FAIL, then the result line), `live-steps.jsonl` (what was read live), `k6-summary.json`,
+`samples.jsonl`, `events.jsonl`, `k6.log`. The result line looks like
+
+```
+ramp result: highest passing step 1300 users (≈ 495 req/s); first failing step 1400 users (p95 612 ms / p99 1034 ms / err 0.5%)
+```
+
+It exits 0 when at least one step passed (also when `MAX_USERS` was reached without a fail),
+and 1 with "no passing step" when step 0 already fails. The two boxes of "Two boxes in
+parallel" can each run a ramp at the same time:
+
+```
+PREFIX=lt- NODE_CPUS=6,7 K6_CPUS=0-2 scripts/loadtest.sh ramp
+PREFIX=lt-pg- LT_DB=postgres NODE_CPUS=10,11 K6_CPUS=3-5 scripts/loadtest.sh ramp
+```
+
 ## The pass rule
 
 A level passes only if all of these hold over its **hold** (the ramp is excluded):
@@ -261,6 +343,7 @@ scripts/loadtest.sh users 100           # one level; exit 0 pass, 1 fail
 scripts/loadtest.sh rps 200
 scripts/loadtest.sh search users        # step up from 100 by x2, then bisect, then confirm
 scripts/loadtest.sh search rps 50 2     # START and FACTOR are optional
+scripts/loadtest.sh ramp 100 100 60     # +100 users a minute until a step fails (START STEP STEP_S)
 scripts/loadtest.sh down                # or: make loadtest-down
 make loadtest                           # up, search users, search rps, down
 ```
@@ -277,7 +360,9 @@ Environment overrides (defaults in brackets):
 | Variable | Meaning |
 |---|---|
 | `RAMP` (60), `HOLD` (300) | seconds of ramp-up and of measured hold |
-| `P95_MS` (500), `P99_MS` (1000), `ERR_PCT` (1) | pass-rule limits; make them impossible to see the fail path |
+| `P95_MS` (500), `P99_MS` (1000), `ERR_PCT` (1; 2 for `ramp`) | pass-rule limits; make them impossible to see the fail path |
+| `MAX_USERS` (5000) | `ramp` stops here if no step failed |
+| `NGINX_MEM` (256m), `WEB_MEM` (3840m; 1024m with Postgres), `PG_MEM` (2816m) | memory split of the box; must add up to 4096 MiB. See "`LT_DB`" |
 | `DROP_PCT` (1) | dropped iterations limit, rps only |
 | `BOOKS` (50000), `MEMBERS` (10000), `LOANS` (20000) | size of the seed, for `up` |
 | `SEED_VUS` (16) | k6 VUs that seed |
@@ -305,7 +390,7 @@ PREFIX=lt- LT_DB=sqlite NODE_CPUS=6,7 K6_CPUS=0-2 scripts/loadtest.sh up
 PREFIX=lt-pg- LT_DB=postgres NODE_CPUS=10,11 K6_CPUS=3-5 scripts/loadtest.sh up
 ```
 
-Pass the same `PREFIX` to every later command (`users`, `rps`, `search`, `down`) of that box.
+Pass the same `PREFIX` to every later command (`users`, `rps`, `search`, `ramp`, `down`) of that box.
 Cores 6-9 and 10-13 are separate E-core clusters with their own L2, so the boxes do not
 share a cache. They do share the laptop's power budget, so absolute numbers can be a bit
 lower than in a solo run, but the comparison between the two boxes stays fair. Node mode
@@ -327,7 +412,8 @@ position and PUT counter, from Prometheus. The queries run at the same time, so 
 maximum of these samples, so a spike shorter than the tick can be missed. A warning is
 printed when k6 used more than 80% of its cores: the load generator may then be the
 bottleneck. After each level it checks `RestartCount`
-and `OOMKilled`.
+and `OOMKilled`. Each sample also holds the current frequency of every box core (kHz, from
+`scaling_cur_freq`) and the restart counts of the box containers; ramp mode reports them per step.
 
 ### Results
 
