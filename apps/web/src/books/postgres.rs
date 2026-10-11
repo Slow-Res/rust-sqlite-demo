@@ -20,15 +20,22 @@ macro_rules! active_loans {
     };
 }
 
-/// `SELECT ... FROM books b`, shaped like [`BookRow`].
-macro_rules! select_books {
+/// The column list of [`BookRow`], including the correlated subquery.
+macro_rules! book_columns {
     () => {
         concat!(
             "SELECT b.id, b.title, b.author, b.isbn, b.published_year, b.total_copies, ",
             "b.total_copies - ",
             active_loans!(),
-            " AS available_copies, b.created_at, b.updated_at FROM books b"
+            " AS available_copies, b.created_at, b.updated_at"
         )
+    };
+}
+
+/// `SELECT ... FROM books b`, shaped like [`BookRow`].
+macro_rules! select_books {
+    () => {
+        concat!(book_columns!(), " FROM books b")
     };
 }
 
@@ -136,12 +143,19 @@ impl BookRepository for PostgresBookRepository {
         push_filter(&mut count, filter);
         let total: i64 = count.build_query_scalar().fetch_one(&self.pool).await?;
 
-        let mut select = QueryBuilder::<Postgres>::new(select_books!());
+        // Paginate first, decorate after: Postgres evaluates the SELECT list for
+        // OFFSET rows too, so the correlated subquery would run for every skipped
+        // row. The inner query picks the page, the outer one computes the columns.
+        let mut select = QueryBuilder::<Postgres>::new(concat!(
+            book_columns!(),
+            " FROM (SELECT b.* FROM books b"
+        ));
         push_filter(&mut select, filter);
         select.push(" ORDER BY b.title ASC, b.id ASC LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");
         select.push_bind(page.offset());
+        select.push(") b ORDER BY b.title ASC, b.id ASC");
         let rows = select
             .build_query_as::<BookRow>()
             .fetch_all(&self.pool)

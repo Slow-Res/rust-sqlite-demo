@@ -1,6 +1,6 @@
 # summary.json into summary.md.
 def n: if . == null then "-" else tostring end;
-def short: sub("^lt-(node1|web)-"; "") | sub("-1$"; "");
+def short: sub("^" + $prefix + "(node1|web)-"; "") | sub("-1$"; "");
 def cpu_of: .box_cpu_pct_of_200 // .node_cpu_pct_of_200;
 def cpu_split: if .mode == "web" then " (" + ([.cpu_by_container_pct | to_entries | sort_by(-.value.avg)[] | "\(.key | short) \(.value.avg | round)"] | join(", ")) + ")" else "" end;
 def row($cells): "| " + ($cells | map(n) | join(" | ")) + " |";

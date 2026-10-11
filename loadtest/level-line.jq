@@ -1,5 +1,5 @@
 # One block per level for the terminal.
-def short: sub("^lt-(node1|web)-"; "") | sub("-1$"; "");
+def short: sub("^" + $prefix + "(node1|web)-"; "") | sub("-1$"; "");
 def gib: . / 1024 | if . < 0.1 then (. * 100 | round) / 100 else (. * 10 | round) / 10 end;
 def split_cpu: [.cpu_by_container_pct | to_entries | sort_by(-.value.avg)[] | "\(.key | short) \(.value.avg | round)"] | join(", ");
 def split_mem: [.peak_memory_mib | to_entries | sort_by(-.value)[] | "\(.key | short) \(.value | gib)"] | join(", ");

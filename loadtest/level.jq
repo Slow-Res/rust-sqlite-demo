@@ -46,13 +46,13 @@ $k6[0].metrics as $m
 | ([$events[] | {action: (.Action | split(" ")[0]), container: .Actor.Attributes.name, exit_code: .Actor.Attributes.exitCode}]) as $deaths
 | ([$deaths[] | select(.action == "oom")] | length > 0) as $oom_event
 # Node CPU: the three containers' CPU% summed (200% is the 2 cores), per sample.
-| ([$hs[] | .stats |= map(select(.Name | startswith("lt-node1-") or startswith("lt-web-"))) | select((.stats | length) == $ncont) | [.stats[].CPUPerc | rtrimstr("%") | tonumber] | add]) as $cpu
+| ([$hs[] | .stats |= map(select(.Name | startswith($prefix + "node1-") or startswith($prefix + "web-"))) | select((.stats | length) == $ncont) | [.stats[].CPUPerc | rtrimstr("%") | tonumber] | add]) as $cpu
 # The load generator's CPU (k6 has 4 cores: 400%).
-| ([$hs[] | .stats[] | select(.Name | startswith("lt-k6-")) | .CPUPerc | rtrimstr("%") | tonumber]) as $k6cpu
-| ([$hs[].stats[] | select(.Name | startswith("lt-node1-") or startswith("lt-web-"))] | group_by(.Name) | map({key: .[0].Name, value: ([.[].MemUsage | split(" / ")[0] | mib] | max | r1)}) | from_entries) as $mem
+| ([$hs[] | .stats[] | select(.Name | startswith($prefix + "k6-")) | .CPUPerc | rtrimstr("%") | tonumber]) as $k6cpu
+| ([$hs[].stats[] | select(.Name | startswith($prefix + "node1-") or startswith($prefix + "web-"))] | group_by(.Name) | map({key: .[0].Name, value: ([.[].MemUsage | split(" / ")[0] | mib] | max | r1)}) | from_entries) as $mem
 # Per container CPU, and the box's memory: the per-sample sum, then its peak.
-| ([$hs[].stats[] | select(.Name | startswith("lt-node1-") or startswith("lt-web-"))] | group_by(.Name) | map({key: .[0].Name, value: ([.[].CPUPerc | rtrimstr("%") | tonumber] | {avg: (add / length | r1), max: (max | r1)})}) | from_entries) as $cpu_by
-| ([$hs[] | .stats |= map(select(.Name | startswith("lt-node1-") or startswith("lt-web-"))) | select((.stats | length) == $ncont) | [.stats[].MemUsage | split(" / ")[0] | mib] | add] | max | r1) as $box_mem
+| ([$hs[].stats[] | select(.Name | startswith($prefix + "node1-") or startswith($prefix + "web-"))] | group_by(.Name) | map({key: .[0].Name, value: ([.[].CPUPerc | rtrimstr("%") | tonumber] | {avg: (add / length | r1), max: (max | r1)})}) | from_entries) as $cpu_by
+| ([$hs[] | .stats |= map(select(.Name | startswith($prefix + "node1-") or startswith($prefix + "web-"))) | select((.stats | length) == $ncont) | [.stats[].MemUsage | split(" / ")[0] | mib] | add] | max | r1) as $box_mem
 | ([$hs[] | select(.puts != null)] | group_by(((.t - $t0) / 15) | floor) | map(map(.puts) | max)) as $put_buckets
 | (if ($put_buckets | length) < 2 then null else [range(1; $put_buckets | length) | select($put_buckets[.] <= $put_buckets[. - 1])] | length end) as $flat_buckets
 | ([$hs[] | select(.puts != null)] | if length > 0 then (last.puts > first.puts) else null end) as $puts_rose

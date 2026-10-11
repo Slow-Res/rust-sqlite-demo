@@ -451,7 +451,7 @@ run_level() {
   [ -n "$setup_ms" ] && jq -e . >/dev/null 2>&1 <<<"$setup_json" || die "k6 did not report its start (log: $dir/k6.log)"
 
   jq -n --slurpfile k6 "$dir/k6-summary.json" --slurpfile samples "$dir/samples.jsonl" --slurpfile events "$dir/events.jsonl" \
-    --arg mode "$LT_MODE" --argjson ncont "${#NODE_CONTAINERS[@]}" \
+    --arg mode "$LT_MODE" --arg prefix "$PREFIX" --argjson ncont "${#NODE_CONTAINERS[@]}" \
     --arg kind "$kind" --argjson value "$value" --argjson ramp "$RAMP" --argjson hold "$HOLD" \
     --argjson start_s "$(awk -v ms="$setup_ms" 'BEGIN { printf "%.3f", ms / 1000 }')" --argjson drain "$drain" \
     --argjson setup "$setup_json" \
@@ -460,7 +460,7 @@ run_level() {
     --argjson rows_before "$rows_before" --argjson rows_after "$rows_after" --argjson nginx_log "$nginx_log" \
     -f "loadtest/level.jq" >"$dir/level.json" || die "could not compute the level result (loadtest/level.jq; inputs in $dir)"
   jq -e '.pass | type == "boolean"' "$dir/level.json" >/dev/null 2>&1 || die "level.json is empty or malformed ($dir/level.json)"
-  jq -r -f loadtest/level-line.jq "$dir/level.json" || die "could not print the level result"
+  jq -r --arg prefix "$PREFIX" -f loadtest/level-line.jq "$dir/level.json" || die "could not print the level result"
   LEVEL_PASS=$(jq -r .pass "$dir/level.json")
 }
 
@@ -475,7 +475,7 @@ write_summary() {
   jq -s --argjson result "$result" --arg aborted "$aborted" --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
     --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" --arg db "$([ "$LT_MODE" = web ] && echo "$LT_DB" || true)" \
     -f loadtest/summary.jq "$levels" >"$dir/summary.json" || return 1
-  jq -r -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
+  jq -r --arg prefix "$PREFIX" -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
   SUMMARY_DONE=true
   echo
   echo "results: $dir (summary.md, summary.json, one directory per level)"

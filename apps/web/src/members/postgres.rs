@@ -9,14 +9,21 @@ use super::repo::{DeleteMemberOutcome, MemberFilter, MemberRecord, MemberReposit
 use crate::db::{RepoError, escape_like, from_timestamp, to_timestamp};
 use crate::pagination::PageParams;
 
-/// `SELECT ... FROM members m`, shaped like [`MemberRow`].
-macro_rules! select_members {
+/// The column list of [`MemberRow`], including the correlated subquery.
+macro_rules! member_columns {
     () => {
         concat!(
             "SELECT m.id, m.name, m.email, ",
             "(SELECT COUNT(*) FROM loans l WHERE l.member_id = m.id AND l.returned_at IS NULL) AS active_loans, ",
-            "m.created_at, m.updated_at FROM members m"
+            "m.created_at, m.updated_at"
         )
+    };
+}
+
+/// `SELECT ... FROM members m`, shaped like [`MemberRow`].
+macro_rules! select_members {
+    () => {
+        concat!(member_columns!(), " FROM members m")
     };
 }
 
@@ -92,12 +99,19 @@ impl MemberRepository for PostgresMemberRepository {
         push_filter(&mut count, filter);
         let total: i64 = count.build_query_scalar().fetch_one(&self.pool).await?;
 
-        let mut select = QueryBuilder::<Postgres>::new(select_members!());
+        // Paginate first, decorate after: Postgres evaluates the SELECT list for
+        // OFFSET rows too, so the correlated subquery would run for every skipped
+        // row. The inner query picks the page, the outer one computes the columns.
+        let mut select = QueryBuilder::<Postgres>::new(concat!(
+            member_columns!(),
+            " FROM (SELECT m.* FROM members m"
+        ));
         push_filter(&mut select, filter);
         select.push(" ORDER BY m.name ASC, m.id ASC LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");
         select.push_bind(page.offset());
+        select.push(") m ORDER BY m.name ASC, m.id ASC");
         let rows = select
             .build_query_as::<MemberRow>()
             .fetch_all(&self.pool)
