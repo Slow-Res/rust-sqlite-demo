@@ -97,11 +97,19 @@ async fn wait_for_title(pg: &TestPg, title: &str) {
 async fn ships_changes_and_stops_cleanly_on_shutdown() {
     let (db, pg) = (TestSqlite::new().await, TestPg::new().await);
     let (task, metrics, token) = start(config(&db.url, &pg));
+    // Let the first cycle copy the empty node, so "hello" must ship as a batch.
+    while metrics.last_success_seconds.get() == 0.0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     insert_book(&db.pool, "hello").await;
     wait_for_title(&pg, "hello").await;
     stop(task, token).await;
-    assert!(metrics.last_success_seconds.get() > 0.0);
-    assert!(metrics.batches.get() + metrics.rows_shipped.get() >= 1);
+    // One batch of one row, and nothing left waiting.
+    assert_eq!(metrics.batches.get(), 1);
+    assert_eq!(metrics.rows_shipped.get(), 1);
+    assert_eq!(metrics.epoch.get(), 1);
+    assert_eq!(metrics.pending_changes.get(), 0);
+    assert_eq!(metrics.errors.get(), 0);
     pg.cleanup().await;
 }
 
@@ -178,6 +186,57 @@ async fn waits_until_web_has_applied_every_migration() {
         .unwrap();
     wait_for_title(&pg, "waiting").await;
     drop(conn);
+    stop(task, token).await;
+    pg.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_lock_held_elsewhere_blocks_shipping_until_it_is_released() {
+    let (db, pg) = (TestSqlite::new().await, TestPg::new().await);
+    let mut holder = pg.connect().await;
+    sqlx::query("SELECT pg_advisory_lock(hashtext('sync:' || $1))")
+        .bind(NODE)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    let (task, metrics, token) = start(config(&db.url, &pg));
+    insert_book(&db.pool, "locked").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut conn = pg.connect().await;
+    let shipped = zero_if_no_table(
+        sqlx::query_scalar("SELECT COUNT(*) FROM books")
+            .fetch_one(&mut conn)
+            .await,
+    );
+    assert_eq!(shipped, 0, "nothing ships while another holds the lock");
+    assert!(metrics.errors.get() >= 1);
+    assert!(
+        metrics.pending_changes.get() >= 1,
+        "the backlog is visible while locked out"
+    );
+    drop(holder);
+    wait_for_title(&pg, "locked").await;
+    drop(conn);
+    stop(task, token).await;
+    pg.cleanup().await;
+}
+
+#[tokio::test]
+async fn backlog_gauges_stay_current_while_postgres_is_unreachable() {
+    let (db, pg) = (TestSqlite::new().await, TestPg::new().await);
+    let mut cfg = config(&db.url, &pg);
+    cfg.postgres = cfg.postgres.port(1);
+    let (task, metrics, token) = start(cfg);
+    insert_book(&db.pool, "stuck").await;
+    for _ in 0..100 {
+        if metrics.pending_changes.get() >= 1 && metrics.lag_seconds.get() > 0.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(metrics.pending_changes.get() >= 1);
+    assert!(metrics.lag_seconds.get() > 0.0);
+    assert!(metrics.errors.get() >= 1);
     stop(task, token).await;
     pg.cleanup().await;
 }

@@ -80,14 +80,28 @@ pub async fn run(
         return Ok(());
     };
     let mut retry = Duration::ZERO;
+    // Last checkpoint position this process saw; survives reconnects so the
+    // backlog gauges stay right while sessions fail.
+    let mut known_seq = 0;
     while !shutdown.is_cancelled() {
         if !wait_for_schema(&sqlite, settings, shutdown).await {
             break;
         }
-        match session(&sqlite, config, settings, metrics, shutdown, &mut retry).await {
+        match session(
+            &sqlite,
+            config,
+            settings,
+            metrics,
+            shutdown,
+            &mut retry,
+            &mut known_seq,
+        )
+        .await
+        {
             Ok(()) => break,
             Err(SessionError::Locked(node)) => {
                 metrics.errors.inc();
+                refresh_backlog(metrics, &sqlite, known_seq).await;
                 tracing::error!(
                     node,
                     "another sync-worker holds this node's lock; is NODE_ID used twice? retrying"
@@ -97,6 +111,7 @@ pub async fn run(
             Err(SessionError::Failed(err)) => {
                 metrics.errors.inc();
                 retry = next_retry(retry, settings);
+                refresh_backlog(metrics, &sqlite, known_seq).await;
                 tracing::warn!(error = format!("{err:#}"), retry_in = ?retry, "sync session failed; retrying");
                 sleep_or_cancel(retry, shutdown).await;
             }
@@ -115,6 +130,7 @@ async fn session(
     metrics: &Metrics,
     shutdown: &CancellationToken,
     retry: &mut Duration,
+    known_seq: &mut i64,
 ) -> Result<(), SessionError> {
     let mirror = match Mirror::connect(&config.postgres, &config.node_id).await {
         Ok(mirror) => mirror,
@@ -130,19 +146,20 @@ async fn session(
             return Ok(());
         }
         let outcome = syncer.cycle().await.map_err(SessionError::Failed)?;
-        record(metrics, &outcome, syncer.checkpoint(), sqlite).await;
+        record_outcome(metrics, &outcome, syncer.checkpoint());
+        if let Some(checkpoint) = syncer.checkpoint() {
+            *known_seq = checkpoint.last_seq;
+        }
+        refresh_backlog(metrics, sqlite, *known_seq).await;
+        metrics.last_success_seconds.set(now_secs());
         *retry = Duration::ZERO;
         wait = next_poll(&outcome, wait, settings);
         sleep_or_cancel(wait, shutdown).await;
     }
 }
 
-async fn record(
-    metrics: &Metrics,
-    outcome: &Outcome,
-    checkpoint: Option<&Checkpoint>,
-    sqlite: &SqlitePool,
-) {
+/// Count the cycle's work and note the epoch of this node's copy.
+fn record_outcome(metrics: &Metrics, outcome: &Outcome, checkpoint: Option<&Checkpoint>) {
     match outcome {
         Outcome::Shipped { rows, .. } => {
             metrics.batches.inc();
@@ -158,20 +175,24 @@ async fn record(
     }
     if let Some(checkpoint) = checkpoint {
         metrics.epoch.set(i64::from(checkpoint.epoch));
-        match changes::pending(sqlite, checkpoint.last_seq).await {
-            Ok(pending) => {
-                metrics.pending_changes.set(pending.count);
-                metrics
-                    .lag_seconds
-                    .set(lag_seconds(pending.oldest_ms, now_ms()));
-            }
-            Err(err) => tracing::warn!(
-                error = format!("{err:#}"),
-                "could not count pending changes"
-            ),
-        }
     }
-    metrics.last_success_seconds.set(now_secs());
+}
+
+/// Set the backlog gauges from SQLite. Also called while sync is failing,
+/// so `sync_lag_seconds` keeps growing and the lag alert can fire.
+async fn refresh_backlog(metrics: &Metrics, sqlite: &SqlitePool, last_seq: i64) {
+    match changes::pending(sqlite, last_seq).await {
+        Ok(pending) => {
+            metrics.pending_changes.set(pending.count);
+            metrics
+                .lag_seconds
+                .set(lag_seconds(pending.oldest_ms, now_ms()));
+        }
+        Err(err) => tracing::warn!(
+            error = format!("{err:#}"),
+            "could not count pending changes"
+        ),
+    }
 }
 
 /// Open the node's database, waiting while the file does not exist yet
@@ -243,6 +264,29 @@ mod tests {
 
     fn settings() -> Settings {
         Settings::production(500)
+    }
+
+    #[test]
+    fn a_resync_is_counted_and_sets_the_epoch() {
+        let m = Metrics::new();
+        let checkpoint = Checkpoint {
+            epoch: 2,
+            last_seq: 0,
+            last_token: None,
+        };
+        let copied = |resync| Outcome::Copied {
+            resync,
+            epoch: 2,
+            archived: 0,
+            copied: 4,
+        };
+        record_outcome(&m, &copied(false), Some(&checkpoint));
+        assert_eq!(
+            (m.resyncs.get(), m.epoch.get(), m.rows_shipped.get()),
+            (0, 2, 4)
+        );
+        record_outcome(&m, &copied(true), Some(&checkpoint));
+        assert_eq!((m.resyncs.get(), m.rows_shipped.get()), (1, 8));
     }
 
     #[test]
