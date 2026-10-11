@@ -53,11 +53,16 @@ FROM runtime AS web
 COPY --from=rust /out/library-web /usr/local/bin/library-web
 COPY --from=frontend /app/apps/frontend/dist /srv/frontend
 # Set COOKIE_SECURE=true when the app is served over HTTPS (node.yml defaults to true).
+# MALLOC_ARENA_MAX: glibc sizes its malloc arenas (up to 8 per core) from the host's CPU
+# count, not the container's, and memory freed in an arena stays there. With many
+# threads on a big host that is a lot of arenas, so the process's RSS stays high
+# after a burst even though Rust freed everything. Two arenas fit a 2-core box.
 ENV DATABASE_URL=sqlite:///data/library.db \
     BIND_ADDR=0.0.0.0:4000 \
     FRONTEND_DIR=/srv/frontend \
     COOKIE_SECURE=false \
-    LOG_FORMAT=json
+    LOG_FORMAT=json \
+    MALLOC_ARENA_MAX=2
 USER app
 EXPOSE 4000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \

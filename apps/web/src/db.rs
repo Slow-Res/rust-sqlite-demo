@@ -9,9 +9,13 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 
 use crate::config::Config;
 
-const SQLITE_MAX_CONNECTIONS: u32 = 8;
+// Ten connections per process on both backends, the pool size of the benchmark
+// the load test follows, so the comparison measures the databases, not the pools.
+// The box has 2 cores: past a handful of connections more of them only queue
+// inside the database (and in Postgres each one is a process with its own memory).
+const SQLITE_MAX_CONNECTIONS: u32 = 10;
 #[cfg(feature = "postgres")]
-const POSTGRES_MAX_CONNECTIONS: u32 = 16;
+const POSTGRES_MAX_CONNECTIONS: u32 = 10;
 
 /// The backend this process runs on, chosen by the `DATABASE_URL` scheme.
 /// SQLite is the product; Postgres exists only so the load test can compare
