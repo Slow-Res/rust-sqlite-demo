@@ -5,6 +5,29 @@ with two numbers: the most simultaneous users, and the most requests per second,
 still meet the pass rule below. `scripts/loadtest.sh` builds a separate cluster, seeds
 it, runs k6 against it, and searches for the highest passing level.
 
+## Modes
+
+`LT_MODE` picks what runs under the limit:
+
+- **`web`** (the default) measures the app alone: the Rust web app with SQLite inside it,
+  project `lt-web`, one container on cores `NODE_CPUS` with 4g of memory (`memswap_limit`
+  4g). There is no Litestream, sync worker, restore gate, Postgres, Garage or Prometheus.
+  There is no sync or Litestream data and no drain wait, and those fields read `n/a`.
+  Sampling is `docker stats` of web and k6 only.
+- **`node`** adds Litestream and the sync worker on the same 2 cores (the limits and the
+  topology below), with Postgres, S3 (Garage) and Prometheus outside the limit.
+
+Note for `web`: nothing prunes `change_log`, so it grows by one row per synced write during
+a run. This is a small extra cost, and real nodes do not have it once the worker runs.
+The compose file is `deploy/compose/local/loadtest.web.yml`, standalone: no restore
+service is needed, because a new named volume takes over the ownership of `/data` (the
+app user, uid 10001) from the image, and web creates the empty database itself. Nothing
+is published on the host; the runner reaches web through the container's address, and
+k6 joins `lt-web_default`. `scripts/loadtest.sh down` removes the projects of both modes.
+
+The sections below describe `node` mode unless they say otherwise; the workload, data,
+error rule and pass rule are the same in both.
+
 ## What it measures, and why
 
 A node is one VM: the web app, Litestream and the sync worker share the VM's CPUs and
@@ -211,6 +234,7 @@ Environment overrides (defaults in brackets):
 | `SEED_VUS` (16) | k6 VUs that seed |
 | `SESSION_POOL` (50) | sessions logged in at setup in the rps model |
 | `NODE_CPUS` (6,7), `CENTRAL_CPUS` (8-13), `K6_CPUS` (0-3) | core sets; they may not overlap or include 14-15 |
+| `LT_MODE` (`web`) | `web` or `node`, see Modes |
 | `K6_IMAGE` (`grafana/k6:1.3.0`), `BASE_URL` (`http://web:4000`) | the k6 image, and where k6 aims, as seen from its container |
 | `PAUSE_S` (30) | pause between levels of a search, after the drain |
 | `MAX_LEVEL` (100000) | the search gives up above this level |

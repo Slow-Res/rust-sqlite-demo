@@ -1,0 +1,37 @@
+# LOAD TEST ONLY (scripts/loadtest.sh, LT_MODE=web, the default): the web app
+# alone, with the SQLite database inside it, on a 2 CPU / 4 GB budget. No
+# Litestream, sync worker, restore gate, Postgres, Garage or Prometheus.
+# Standalone: it does not use node.yml. The service and its settings are the
+# web service of node.yml with the values of local/node1.env, minus every
+# POSTGRES_* and LITESTREAM_* variable. No ports are published; k6 joins the
+# project's default network and the runner reaches web through its container IP.
+#
+# The restore service of node.yml is not needed: the image's /data is owned by
+# the app user (uid 10001), and a new named volume copies that ownership, so web
+# creates and migrates an empty library.db itself.
+services:
+  web:
+    image: ${WEB_IMAGE:-sqlite-production/web:dev}
+    environment:
+      NODE_ID: node1
+      COOKIE_SECURE: "false"
+      SESSION_TTL_HOURS: "168"
+      RUST_LOG: info
+    volumes: [data:/data]
+    # The same 2 cores (4.4 GHz efficiency cores) and 4 GB as the whole node of
+    # the full-node mode; memswap_limit equals mem_limit, so no swap.
+    cpuset: "${NODE_CPUS:-6,7}"
+    mem_limit: 4g
+    memswap_limit: 4g
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:4000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  data: {}

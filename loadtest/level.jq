@@ -1,7 +1,7 @@
 # One level's result. Inputs (--arg/--argjson/--slurpfile): k6 (summary), samples
 # (JSON lines of scripts/loadtest.sh), kind, value, ramp, hold, start_s (epoch
 # seconds when k6's scenario started), drain, the p95/p99/err/drop limits,
-# setup (the LT_SETUP_DONE data), events (docker die/oom events), before/after (container restart state), rows_before, rows_after.
+# mode (web|node), ncont (node containers), setup (the LT_SETUP_DONE data), events (docker die/oom events), before/after (container restart state), rows_before, rows_after.
 # Everything is computed from phase:hold only.
 def r1: if . == null then null else (. * 10 | round) / 10 end;
 def r2: if . == null then null else (. * 100 | round) / 100 end;
@@ -46,10 +46,10 @@ $k6[0].metrics as $m
 | ([$events[] | {action: (.Action | split(" ")[0]), container: .Actor.Attributes.name, exit_code: .Actor.Attributes.exitCode}]) as $deaths
 | ([$deaths[] | select(.action == "oom")] | length > 0) as $oom_event
 # Node CPU: the three containers' CPU% summed (200% is the 2 cores), per sample.
-| ([$hs[] | .stats |= map(select(.Name | startswith("lt-node1-"))) | select((.stats | length) == 3) | [.stats[].CPUPerc | rtrimstr("%") | tonumber] | add]) as $cpu
+| ([$hs[] | .stats |= map(select(.Name | startswith("lt-node1-") or startswith("lt-web-"))) | select((.stats | length) == $ncont) | [.stats[].CPUPerc | rtrimstr("%") | tonumber] | add]) as $cpu
 # The load generator's CPU (k6 has 4 cores: 400%).
 | ([$hs[] | .stats[] | select(.Name | startswith("lt-k6-")) | .CPUPerc | rtrimstr("%") | tonumber]) as $k6cpu
-| ([$hs[].stats[] | select(.Name | startswith("lt-node1-"))] | group_by(.Name) | map({key: .[0].Name, value: ([.[].MemUsage | split(" / ")[0] | mib] | max | r1)}) | from_entries) as $mem
+| ([$hs[].stats[] | select(.Name | startswith("lt-node1-") or startswith("lt-web-"))] | group_by(.Name) | map({key: .[0].Name, value: ([.[].MemUsage | split(" / ")[0] | mib] | max | r1)}) | from_entries) as $mem
 | ([$hs[] | select(.puts != null)] | group_by(((.t - $t0) / 15) | floor) | map(map(.puts) | max)) as $put_buckets
 | (if ($put_buckets | length) < 2 then null else [range(1; $put_buckets | length) | select($put_buckets[.] <= $put_buckets[. - 1])] | length end) as $flat_buckets
 | ([$hs[] | select(.puts != null)] | if length > 0 then (last.puts > first.puts) else null end) as $puts_rose
@@ -70,6 +70,7 @@ $k6[0].metrics as $m
     (if $kind == "rps" and $drop_pct >= $drop then "dropped iterations \($drop_pct | r2)% >= \($drop)%" else empty end)
   ]) as $reasons
 | {
+    mode: $mode,
     level: $value,
     kind: $kind,
     pass: ($reasons | length == 0),

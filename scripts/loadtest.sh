@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Load test of one node limited to 2 CPUs and 4 GB (docs/LOADTEST.md). It starts
-# a separate cluster (projects lt-central and lt-node1, web on port 4201), seeds
-# it through the API, drives it with k6 in Docker and finds the highest load
+# Load test of the web app, or of a whole node, limited to 2 CPUs and 4 GB
+# (docs/LOADTEST.md). LT_MODE=web (default) starts the web app alone (project
+# lt-web); LT_MODE=node starts a node with Litestream and the sync worker
+# (projects lt-central and lt-node1, web on port 4201). Either way it seeds
+# the database through the API, drives it with k6 in Docker and finds the highest load
 # that still meets the pass rule. Your own `make up` cluster and the e2e
 # cluster are not touched. Needs Docker, curl, jq, awk and `make images`.
 #   scripts/loadtest.sh up
@@ -21,11 +23,18 @@ export CENTRAL_CPUS="${CENTRAL_CPUS:-8-13}"   # Postgres, Garage, Prometheus
 K6_CPUS="${K6_CPUS:-0-3}"                     # k6: performance cores (5.1 GHz)
 K6_IMAGE="${K6_IMAGE:-grafana/k6:1.3.0}"
 BASE_URL="${BASE_URL:-http://web:4000}"       # as seen from the k6 container
-K6_NETWORK="${PREFIX}node1_default"
+LT_MODE="${LT_MODE:-web}"
+[[ $LT_MODE == web || $LT_MODE == node ]] || { echo "LOADTEST: LT_MODE must be web or node" >&2; exit 2; }
 HTTP_PORT=$((HTTP_PORT_BASE + 1))
-HOST_URL="http://127.0.0.1:$HTTP_PORT"
 PROM_URL="http://127.0.0.1:$PROMETHEUS_HOST_PORT"
-NODE_CONTAINERS=("${PREFIX}node1-web-1" "${PREFIX}node1-litestream-1" "${PREFIX}node1-sync-worker-1")
+if [ "$LT_MODE" = web ]; then
+  K6_NETWORK="${PREFIX}web_default"
+  NODE_CONTAINERS=("${PREFIX}web-web-1")
+else
+  K6_NETWORK="${PREFIX}node1_default"
+  NODE_CONTAINERS=("${PREFIX}node1-web-1" "${PREFIX}node1-litestream-1" "${PREFIX}node1-sync-worker-1")
+fi
+WEB="${NODE_CONTAINERS[0]}"
 WORKER="${PREFIX}node1-sync-worker-1"
 NODE_FILES=(-f deploy/compose/node.yml -f deploy/compose/local/node.override.yml -f deploy/compose/local/loadtest.node.yml)
 
@@ -84,6 +93,7 @@ wait_until() {
   done
 }
 
+web_compose() { docker compose -p "${PREFIX}web" -f deploy/compose/local/loadtest.web.yml "$@"; }
 node_compose() { HTTP_PORT=$HTTP_PORT docker compose -p "${PREFIX}node1" "${NODE_FILES[@]}" --env-file deploy/compose/local/node1.env "$@"; }
 central() { docker compose -p "${PREFIX}central" -f deploy/compose/central.yml -f deploy/compose/local/loadtest.central.yml "$@"; }
 
@@ -98,12 +108,23 @@ check_cpus() {
   local all
   all=$({
     expand_cpus "$NODE_CPUS" | sed 's/^/node /'
-    expand_cpus "$CENTRAL_CPUS" | sed 's/^/central /'
+    [ "$LT_MODE" = web ] || expand_cpus "$CENTRAL_CPUS" | sed 's/^/central /'
     expand_cpus "$K6_CPUS" | sed 's/^/k6 /'
   })
   echo "$all" | awk '$2 >= 14 { print "core " $2 " (" $1 ") is a 2.5 GHz low-power core"; bad = 1 } END { exit bad }' >&2 || die "never use cores 14 and 15"
   [ -z "$(echo "$all" | awk '{ print $2 }' | sort | uniq -d)" ] || die "NODE_CPUS, CENTRAL_CPUS and K6_CPUS must not share cores"
 }
+
+# Where the runner reaches web from the host: the published port in node mode;
+# in web mode nothing is published, so the container's address on its network.
+host_url() {
+  if [ "$LT_MODE" = node ]; then echo "http://127.0.0.1:$HTTP_PORT"; return; fi
+  local ip
+  ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$K6_NETWORK\").IPAddress}}" "$WEB" 2>/dev/null) || return 1
+  [ -n "$ip" ] || return 1
+  echo "http://$ip:4000"
+}
+healthy() { curl -fsS "$(host_url)/api/health"; }
 
 worker_metric() { docker exec "$WORKER" curl -fsS http://127.0.0.1:9100/metrics | awk -v name="$1" '$1 == name { print $2 }'; }
 # A value from Prometheus (up to one 5 s scrape old), or "null".
@@ -144,10 +165,18 @@ wait_litestream() {
 
 # The size of the database as the API and Postgres see it, as JSON.
 db_rows() {
+  local url
+  url=$(host_url) || return 1
   curl -fsS -c "$WORK/jar" -H 'content-type: application/json' \
-    -d "{\"username\":\"$LT_ADMIN_USER\",\"password\":\"$LT_ADMIN_PASSWORD\"}" "$HOST_URL/api/auth/login" >/dev/null
-  api() { curl -fsS -b "$WORK/jar" "$HOST_URL$1" | jq .total; }
+    -d "{\"username\":\"$LT_ADMIN_USER\",\"password\":\"$LT_ADMIN_PASSWORD\"}" "$url/api/auth/login" >/dev/null
+  api() { curl -fsS -b "$WORK/jar" "$url$1" | jq .total; }
   pg() { docker exec "${PREFIX}central-postgres-1" psql -U sync -d library -tAc "SELECT count(*) FROM $1 WHERE node_id = 'node1'"; }
+  if [ "$LT_MODE" = web ]; then
+    jq -cn --argjson books "$(api '/api/books?per_page=1')" --argjson members "$(api '/api/members?per_page=1')" \
+      --argjson loans "$(api '/api/loans?status=all&per_page=1')" --argjson active "$(api '/api/loans?status=active&per_page=1')" \
+      '{books: $books, members: $members, loans: $loans, active_loans: $active, postgres: null}'
+    return
+  fi
   jq -cn --argjson books "$(api '/api/books?per_page=1')" --argjson members "$(api '/api/members?per_page=1')" \
     --argjson loans "$(api '/api/loans?status=all&per_page=1')" --argjson active "$(api '/api/loans?status=active&per_page=1')" \
     --argjson pg_books "$(pg books)" --argjson pg_members "$(pg members)" --argjson pg_loans "$(pg loans)" \
@@ -190,26 +219,49 @@ node_limits_proof() {
   [ "$(docker exec "${NODE_CONTAINERS[0]}" nproc)" = "$expected_cpus" ] || die "nproc in the web container is not $expected_cpus"
 }
 
+# The web-only proof: cpuset, memory and swap of the one container, and nproc.
+web_limits_proof() {
+  local expected_cpus
+  echo "container                cpuset  memory   memswap  restart"
+  docker inspect -f '{{.Name}} {{.HostConfig.CpusetCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.RestartPolicy.Name}}' "$WEB" |
+    awk '{ printf "%-24s %-7s %-8s %-8s %s\n", substr($1, 2), $2, $3 / 1048576 "m", $4 / 1048576 "m", $5 }'
+  expected_cpus=$(expand_cpus "$NODE_CPUS" | wc -l)
+  echo "nproc in the web container: $(docker exec "$WEB" nproc) (expected $expected_cpus)"
+  [ "$(docker inspect -f '{{.HostConfig.CpusetCpus}}' "$WEB")" = "$NODE_CPUS" ] || die "$WEB has the wrong cpuset"
+  [ "$(docker inspect -f '{{.HostConfig.Memory}}' "$WEB")" = "$(docker inspect -f '{{.HostConfig.MemorySwap}}' "$WEB")" ] || die "$WEB may use swap"
+  [ "$(docker exec "$WEB" nproc)" = "$expected_cpus" ] || die "nproc in the web container is not $expected_cpus"
+}
+
 cmd_up() {
   check_cpus
-  for img in web sync-worker litestream; do
+  local img images=(web sync-worker litestream)
+  [ "$LT_MODE" = node ] || images=(web)
+  for img in "${images[@]}"; do
     docker image inspect "sqlite-production/$img:dev" >/dev/null 2>&1 || die "image sqlite-production/$img:dev is missing: run make images"
   done
   docker image inspect "$K6_IMAGE" >/dev/null 2>&1 || docker pull "$K6_IMAGE" >/dev/null || die "cannot pull $K6_IMAGE"
-  if docker volume inspect "${PREFIX}node1_data" >/dev/null 2>&1 || [ -f "$STATE_DIR/seed.env" ]; then
+  if docker volume inspect "${PREFIX}node1_data" >/dev/null 2>&1 || docker volume inspect "${PREFIX}web_data" >/dev/null 2>&1 || [ -f "$STATE_DIR/seed.env" ]; then
     die "a load-test cluster already exists: scripts/loadtest.sh down first"
   fi
   ((LOANS <= BOOKS)) || die "LOANS ($LOANS) must not exceed BOOKS ($BOOKS)"
 
-  step "start Postgres, Garage and Prometheus (cores $CENTRAL_CPUS)"
-  central up -d --wait postgres
-  central up -d
-  PREFIX="$PREFIX" deploy/garage/init.sh >/dev/null
-  step "start node1 (cores $NODE_CPUS, 4 GB)"
-  ALLOW_FRESH_DB=true node_compose up -d --wait
-  wait_until 120 "node1's worker healthy" docker exec "$WORKER" curl -fsS http://127.0.0.1:9100/health
-  # Local-only test credentials, like the e2e test.
-  node_compose exec -T -e PW="$LT_ADMIN_PASSWORD" web sh -c "printf '%s\n' \"\$PW\" | library-web create-user $LT_ADMIN_USER --password-stdin" >/dev/null
+  local create_admin="printf '%s\n' \"\$PW\" | library-web create-user $LT_ADMIN_USER --password-stdin"
+  if [ "$LT_MODE" = web ]; then
+    step "start the web app alone (cores $NODE_CPUS, 4 GB)"
+    web_compose up -d --wait
+    # Local-only test credentials, like the e2e test.
+    web_compose exec -T -e PW="$LT_ADMIN_PASSWORD" web sh -c "$create_admin" >/dev/null
+  else
+    step "start Postgres, Garage and Prometheus (cores $CENTRAL_CPUS)"
+    central up -d --wait postgres
+    central up -d
+    PREFIX="$PREFIX" deploy/garage/init.sh >/dev/null
+    step "start node1 (cores $NODE_CPUS, 4 GB)"
+    ALLOW_FRESH_DB=true node_compose up -d --wait
+    wait_until 120 "node1's worker healthy" docker exec "$WORKER" curl -fsS http://127.0.0.1:9100/health
+    # Local-only test credentials, like the e2e test.
+    node_compose exec -T -e PW="$LT_ADMIN_PASSWORD" web sh -c "$create_admin" >/dev/null
+  fi
 
   mkdir -p "$STATE_DIR"
   local phase count started
@@ -224,25 +276,37 @@ cmd_up() {
   local seeded_at
   seeded_at=$(now)
 
-  step "wait for the sync worker and Litestream"
-  wait_drain "$seeded_at"
-  echo "sync worker drained after $(elapsed_since "$seeded_at") s"
-  wait_litestream
-  echo "Litestream has uploaded everything ($(elapsed_since "$seeded_at") s after the last write)"
   local rows
-  rows=$(db_rows)
-  echo "rows: $rows"
-  [ "$(jq -c '[.books, .members, .loans]' <<<"$rows")" = "$(jq -c '[.postgres.books, .postgres.members, .postgres.loans]' <<<"$rows")" ] ||
-    die "Postgres does not have every row after the drain"
+  if [ "$LT_MODE" = node ]; then
+    step "wait for the sync worker and Litestream"
+    wait_drain "$seeded_at"
+    echo "sync worker drained after $(elapsed_since "$seeded_at") s"
+    wait_litestream
+    echo "Litestream has uploaded everything ($(elapsed_since "$seeded_at") s after the last write)"
+    rows=$(db_rows)
+    echo "rows: $rows"
+    [ "$(jq -c '[.books, .members, .loans]' <<<"$rows")" = "$(jq -c '[.postgres.books, .postgres.members, .postgres.loans]' <<<"$rows")" ] ||
+      die "Postgres does not have every row after the drain"
+  else
+    rows=$(db_rows) || die "cannot read the row counts from the API"
+    echo "rows: $rows"
+  fi
   printf 'SEED_BOOKS=%s\nSEED_MEMBERS=%s\nSEED_LOANS=%s\n' "$BOOKS" "$MEMBERS" "$LOANS" >"$STATE_DIR/seed.env"
 
   step "limit proof"
-  node_limits_proof
-  printf '\nload-test cluster ready: web %s, Prometheus %s, Postgres 127.0.0.1:%s\n' "$HOST_URL" "$PROM_URL" "$POSTGRES_HOST_PORT"
+  if [ "$LT_MODE" = web ]; then
+    web_limits_proof
+    printf '\nload-test web app ready (mode web): %s\n' "$(host_url)"
+  else
+    node_limits_proof
+    printf '\nload-test cluster ready: web http://127.0.0.1:%s, Prometheus %s, Postgres 127.0.0.1:%s\n' "$HTTP_PORT" "$PROM_URL" "$POSTGRES_HOST_PORT"
+  fi
 }
 
 cmd_down() {
   # Every step runs, even if an earlier one fails.
+  # One down cleans whatever exists, whichever mode made it.
+  web_compose down -v || echo "warning: could not remove the lt-web project" >&2
   node_compose down -v || echo "warning: could not remove the lt-node1 project" >&2
   central down -v || echo "warning: could not remove the lt-central project" >&2
   docker rm -f $(docker ps -aq --filter "name=^lt-k6-") >/dev/null 2>&1 || true
@@ -264,10 +328,14 @@ sample_loop() {
     names=("${NODE_CONTAINERS[@]}")
     if [ "$(docker inspect -f '{{.State.Running}}' "lt-k6-$$" 2>/dev/null)" = true ]; then names+=("lt-k6-$$"); fi
     (docker stats --no-stream --format '{{json .}}' "${names[@]}" 2>/dev/null | jq -cs . >"$WORK/s.stats") &
-    (prom 'sync_pending_changes' >"$WORK/s.pending") &
-    (prom 'sync_lag_seconds' >"$WORK/s.lag") &
-    (prom 'sum(litestream_replica_operation_total{operation="PUT"})' >"$WORK/s.puts") &
-    (prom 'litestream_txid' >"$WORK/s.txid") &
+    if [ "$LT_MODE" = node ]; then
+      (prom 'sync_pending_changes' >"$WORK/s.pending") &
+      (prom 'sync_lag_seconds' >"$WORK/s.lag") &
+      (prom 'sum(litestream_replica_operation_total{operation="PUT"})' >"$WORK/s.puts") &
+      (prom 'litestream_txid' >"$WORK/s.txid") &
+    else
+      echo null | tee "$WORK/s.pending" "$WORK/s.lag" "$WORK/s.puts" "$WORK/s.txid" >/dev/null
+    fi
     wait
     jq -cn --arg t "$t" --argjson stats "$(cat "$WORK/s.stats")" \
       --argjson pending "$(cat "$WORK/s.pending")" --argjson lag "$(cat "$WORK/s.lag")" \
@@ -296,13 +364,13 @@ run_level() {
   mkdir -p "$dir"
   # shellcheck disable=SC1091
   . "$STATE_DIR/seed.env" 2>/dev/null || die "no seeded cluster: scripts/loadtest.sh up first"
-  curl -fsS "$HOST_URL/api/health" >/dev/null || die "node1 is not answering on $HOST_URL"
+  healthy >/dev/null || die "web is not answering (is the cluster up?)"
   if [ "$kind" = users ]; then env_args=(-e MODE=users -e USERS="$value"); else env_args=(-e MODE=rps -e RPS="$value" -e SESSION_POOL="$SESSION_POOL"); fi
 
   printf '\n==> level %s %s: ramp %ss, hold %ss\n' "$kind" "$value" "$RAMP" "$HOLD"
   # A node that is still coming back from an earlier crash would blame this
   # level for a restart that is not its own.
-  wait_until 180 "node1 healthy" curl -fsS "$HOST_URL/api/health"
+  wait_until 180 "web healthy" healthy
   restarts_before=$(restart_state) || die "cannot read the container state"
   rows_before=$(db_rows) || die "cannot read the row counts before the level (API or Postgres)"
   : >"$dir/samples.jsonl"
@@ -325,9 +393,13 @@ run_level() {
 
   # A node killed during the level may restart only after k6 has finished (Docker
   # backs off between restarts), so look at the restart count after the node is back.
-  wait_drain "$finished"
-  drain=$(elapsed_since "$finished")
-  wait_until 180 "node1 healthy" curl -fsS "$HOST_URL/api/health"
+  if [ "$LT_MODE" = node ]; then
+    wait_drain "$finished"
+    drain=$(elapsed_since "$finished")
+  else
+    drain=null # no sync worker in web mode
+  fi
+  wait_until 180 "web healthy" healthy
   restarts_after=$(restart_state) || die "cannot read the container state"
   kill "$EVENTS_PID" 2>/dev/null || true
   wait "$EVENTS_PID" 2>/dev/null || true
@@ -338,6 +410,7 @@ run_level() {
   [ -n "$setup_ms" ] && jq -e . >/dev/null 2>&1 <<<"$setup_json" || die "k6 did not report its start (log: $dir/k6.log)"
 
   jq -n --slurpfile k6 "$dir/k6-summary.json" --slurpfile samples "$dir/samples.jsonl" --slurpfile events "$dir/events.jsonl" \
+    --arg mode "$LT_MODE" --argjson ncont "${#NODE_CONTAINERS[@]}" \
     --arg kind "$kind" --argjson value "$value" --argjson ramp "$RAMP" --argjson hold "$HOLD" \
     --argjson start_s "$(awk -v ms="$setup_ms" 'BEGIN { printf "%.3f", ms / 1000 }')" --argjson drain "$drain" \
     --argjson setup "$setup_json" \
@@ -359,7 +432,7 @@ pause_between_levels() {
 write_summary() {
   local dir=$1 levels=$2 result=${3:-null} aborted=${4:-}
   jq -s --argjson result "$result" --arg aborted "$aborted" --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
-    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg node_cpus "$NODE_CPUS" \
+    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" \
     -f loadtest/summary.jq "$levels" >"$dir/summary.json" || return 1
   jq -r -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
   SUMMARY_DONE=true

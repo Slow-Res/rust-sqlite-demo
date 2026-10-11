@@ -1,12 +1,12 @@
 # summary.json into summary.md.
 def n: if . == null then "-" else tostring end;
-def short: sub("^lt-node1-"; "") | sub("-1$"; "");
+def short: sub("^lt-(node1|web)-"; "") | sub("-1$"; "");
 def row($cells): "| " + ($cells | map(n) | join(" | ")) + " |";
 def table($head; $rows): row($head) + "\n|" + ($head | map("---") | join("|")) + "|\n" + ($rows | map(row(.)) | join("\n"));
 
 "# Load test summary\n\n"
 + (if .aborted != null then "**ABORTED: \(.aborted)** (the levels below finished before that)\n\n" else "" end)
-+ "Node: \(.node.cpu_limit), \(.node.memory_limit), cores \(.node.cpus). Ramp \(.ramp_s) s, hold \(.hold_s) s; every number is from the hold window only.\n"
++ (if .node.mode == "web" then "Web only (Rust + SQLite), 2 CPUs, 4 GB, cores \(.node.cpus)." else "Node: \(.node.cpu_limit), \(.node.memory_limit), cores \(.node.cpus)." end) + " Ramp \(.ramp_s) s, hold \(.hold_s) s; every number is from the hold window only.\n"
 + "Pass rule: p95 < \(.pass_rule.p95_ms_below) ms, p99 < \(.pass_rule.p99_ms_below) ms, errors < \(.pass_rule.error_pct_below)%, no restart or OOM kill"
 + (if any(.levels[]; .kind == "rps") then ", dropped iterations < \(.pass_rule.dropped_pct_below_rps_only)%" else "" end) + ".\n\n"
 + (if .search != null then "**Search (\(.search.kind)): \(.search.status). Highest passing level: \(.search.best_pass | n) \(if .search.kind == "rps" then "actions/s" else "users" end)\(if .search.best_req_per_s != null then " (≈ \(.search.best_req_per_s) req/s)" else "" end). Lowest failing level: \(.search.first_fail | n).**\n\n" else "" end)
@@ -20,10 +20,10 @@ def table($head; $rows): row($head) + "\n|" + ($head | map("---") | join("|")) +
       .req_per_s, .latency_ms.p50, .latency_ms.p95, .latency_ms.p99, .error_pct,
       "\(.node_cpu_pct_of_200.avg | n) / \(.node_cpu_pct_of_200.max | n)",
       (.peak_memory_mib | to_entries | map("\(.key | short) \(.value)") | join(", ")),
-      "\(.max_sync_pending | n) / \(.max_sync_lag_s | n)",
-      (if .litestream.puts_rose == null then "n/a" else "\(if .litestream.puts_rose then "yes" else "no" end); \(.litestream.flat_15s_buckets | n)/\(.litestream.buckets_15s)" end),
+      (if .mode == "web" then "n/a" else "\(.max_sync_pending | n) / \(.max_sync_lag_s | n)" end),
+      (if .mode == "web" or .litestream.puts_rose == null then "n/a" else "\(if .litestream.puts_rose then "yes" else "no" end); \(.litestream.flat_15s_buckets | n)/\(.litestream.buckets_15s)" end),
       "\(.load_generator_cpu_pct_of_400.avg | n) / \(.load_generator_cpu_pct_of_400.max | n)",
-      .drain_s,
+      (if .mode == "web" then "n/a" else .drain_s end),
       (if .kind == "rps" then "\(.dropped_iterations) (\(.dropped_pct)%)" else "-" end)
     ]])
 + "\n\n## Latency per action (hold p95 / p99 ms)\n\n"
