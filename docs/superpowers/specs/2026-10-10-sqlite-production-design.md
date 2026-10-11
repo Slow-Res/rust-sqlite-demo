@@ -579,7 +579,7 @@ POSTGRES_URL=… NODE_ID=dev cargo run -p sync-worker
 **The cluster: `make up`.**
 1. Builds the three images, tagged `sqlite-production/{web,sync-worker,litestream}:dev`.
 2. Starts `central.yml` as compose project `central`:
-   - `postgres:18.6`, published on `127.0.0.1:5433`;
+   - `postgres:18.6`, published on `127.0.0.1:5435` (5433 and 5434 are often taken by other local Postgres containers; the e2e cluster uses 5434);
    - `dxflrs/garage:v2.4.1`;
    - `prom/prometheus:v3.13.4` on `127.0.0.1:9090`.
 3. Runs `deploy/garage/init.sh`, which is idempotent. It sets up the single-node layout,

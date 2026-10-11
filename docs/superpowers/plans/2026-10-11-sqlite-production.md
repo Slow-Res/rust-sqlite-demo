@@ -55,7 +55,7 @@
   | local nodes on the host | 4001, 4002, 4003 |
   | Litestream metrics | 9090 |
   | worker health and metrics | 9100 |
-  | cluster Postgres on the host | `127.0.0.1:5433` |
+  | cluster Postgres on the host | `127.0.0.1:5435` |
   | test Postgres | `127.0.0.1:55432` |
   | Prometheus on the host | `127.0.0.1:9090` |
 
@@ -5025,7 +5025,7 @@ services:
       POSTGRES_PASSWORD: local-dev-only
       POSTGRES_DB: library
     ports:
-      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5435}:5432"
     volumes:
       - pgdata:/var/lib/postgresql
     healthcheck:
