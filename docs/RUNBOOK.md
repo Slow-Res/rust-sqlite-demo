@@ -182,10 +182,12 @@ you can go.
 
 2. Delete the database **and** its `-wal`, `-shm` and Litestream folder, all four.
    Removing only `library.db` would leave a WAL that SQLite replays into the restored
-   file:
+   file. This runs in the `litestream` service, so it uses the node's own image and
+   volume:
 
    ```bash
-   docker run --rm -v <node>_data:/data --entrypoint sh sqlite-production/litestream:dev \
+   docker compose -p <node> -f node.yml --env-file node.env run --rm --no-deps \
+     --entrypoint sh litestream \
      -c 'rm -rf /data/library.db /data/library.db-wal /data/library.db-shm /data/.library.db-litestream'
    ```
 
@@ -208,6 +210,11 @@ Expect a resync: the restored log is older than Postgres's checkpoint. Read
 - `check-db` passes (see [Check a database](#check-a-database-for-corruption)) and the
   data is as it was at that time.
 - `sync-worker status` shows a higher `epoch` than before.
+- Litestream is backing up again. After one new write on the node, the node's
+  `litestream_replica_operation_total{operation="PUT"}` rises in Prometheus.
+- After a quiet moment (no writes for about 10 s), `scripts/restore-drill.sh <node> --strict`
+  passes, so the new write is in the backup. This was tested on the local cluster: after
+  the restore Litestream carried on without an extra step, and the strict drill passed.
 
 ## After a resync
 
@@ -314,7 +321,10 @@ How `LitestreamStalled` works (see [alerts.yml](../deploy/monitoring/alerts.yml)
 - It fires when `litestream_txid` changes more than once in 5 minutes while the
   node's `litestream_replica_operation_total{operation="PUT"}` does not increase.
 - It also fires when no PUT series exists yet, for example when Litestream restarted
-  during the outage.
+  during the outage. This branch also needs `litestream_txid` to change more than once
+  in 5 minutes.
+- Either branch must hold for 5 minutes (`for: 5m`) before the alert fires, so
+  expect it up to about 10 minutes after the uploads stop.
 - A live test showed that the PUT counter counts only successful uploads, and that
   `litestream_sync_error_count` stays 0 during an S3 outage, so that error counter is
   not a usable signal.
@@ -428,14 +438,16 @@ the `.library.db-litestream` folder. SQLite would replay the old WAL into a new 
 1. List the volume:
 
    ```bash
-   docker run --rm -v <node>_data:/data --entrypoint sh sqlite-production/litestream:dev -c 'ls -la /data'
+   docker compose -p <node> -f node.yml --env-file node.env run --rm --no-deps \
+     --entrypoint sh litestream -c 'ls -la /data'
    ```
 
 2. Decide where the data should come from. Usually it is S3.
 3. To restore from S3, delete the leftover files too:
 
    ```bash
-   docker run --rm -v <node>_data:/data --entrypoint sh sqlite-production/litestream:dev \
+   docker compose -p <node> -f node.yml --env-file node.env run --rm --no-deps \
+     --entrypoint sh litestream \
      -c 'rm -rf /data/library.db /data/library.db-wal /data/library.db-shm /data/.library.db-litestream'
    ```
 
@@ -458,6 +470,14 @@ Locally: `make restore-drill NODE=node2`. On a VM, from a checkout of this repo:
 
 ```bash
 scripts/restore-drill.sh <node> /path/to/node.env
+```
+
+The script reads `LITESTREAM_IMAGE` and `WEB_IMAGE` from your shell, not from
+`node.env`. If `node.env` sets registry tags for them, export both first, or the
+script uses the local `:dev` images:
+
+```bash
+export LITESTREAM_IMAGE=<the value in node.env> WEB_IMAGE=<the value in node.env>
 ```
 
 The script ([restore-drill.sh](../scripts/restore-drill.sh)):

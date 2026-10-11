@@ -65,11 +65,13 @@ make reset                    # stop everything and delete all its data (asks fi
 |---|---|
 | `make test` | The Rust tests. It starts a throwaway Postgres in Docker (port 55432) for the worker tests. |
 | `make check` | Every CI gate except the end-to-end test: format, clippy, tests, the "web has no Postgres driver" check, generated TypeScript types, and the React lint, typecheck and tests. |
-| `make e2e` | Builds the images, then runs the restore-gate test and the full cluster scenarios on a separate, throwaway cluster. It does not touch your `make up` cluster. |
+| `make e2e` | Builds the images, then runs the restore-gate test (15 checks) and the full cluster scenarios on a separate, throwaway cluster. It does not touch your `make up` cluster. |
 
-`make e2e` takes about 15-25 minutes. The restore-gate test
-([test-restore-gate.sh](scripts/test-restore-gate.sh)) alone takes about 8 minutes,
-because its unreachable-S3 cases make Litestream retry before it gives up. The
+`make e2e` took about 9 minutes here with the images already built; a first run that
+builds them takes longer. The restore-gate test
+([test-restore-gate.sh](scripts/test-restore-gate.sh)) is most of that, about 8
+minutes, because its unreachable-S3 cases make Litestream retry before it gives up.
+It ends with `restore gate: 15 checks passed`. The
 scenarios ([e2e.sh](scripts/e2e.sh)) cover writes on every node, a lost disk, a node
 with no backup, Postgres down, and the restore drill.
 

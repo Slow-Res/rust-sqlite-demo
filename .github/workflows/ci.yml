@@ -72,7 +72,8 @@ jobs:
     name: Images, restore gate and end-to-end
     runs-on: ubuntu-latest
     # The restore-gate test alone takes about 8 minutes (Litestream retries
-    # against an unreachable S3), and a full `make e2e` takes 15-25 minutes.
+    # against an unreachable S3), and a full `make e2e` took about 9 minutes locally with the
+    # images built. CI builds them cold on a slower runner, so allow much more.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

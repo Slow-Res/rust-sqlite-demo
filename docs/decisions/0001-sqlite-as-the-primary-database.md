@@ -31,7 +31,9 @@ Alternatives we looked at:
 |---|---|
 | One Postgres with read replicas | Every request needs the network and one central server. It does not match "each VM is self-sufficient" or "works without Postgres". |
 | Litestream alone | It is a good physical backup, but nobody can query the data across branches, and there is no second, independent copy. |
-| PowerSync or ElectricSQL | They are built for two-way sync between many clients and a server. We only need one direction, and each node owns its data, so they add more than the job needs. |
+| PowerSync or ElectricSQL | They sync a central database out to many clients' local databases, with writes going back through the app's backend. Here each node owns its data and the flow is node to Postgres, so they solve a different problem. |
+
+The spec does not name these alternatives, so the reasons above are this project's own.
 
 ## Consequences
 
