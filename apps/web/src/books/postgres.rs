@@ -145,6 +145,14 @@ async fn count_books(pool: &PgPool, filter: &BookFilter) -> Result<u64, RepoErro
     u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))
 }
 
+/// Whether the trigram indexes can serve a search for `q`: they need 3 characters
+/// in every `ILIKE` pattern, the one with spaces and hyphens removed included.
+/// (SQLite's `too_short` is the same rule.)
+fn trigram_usable(q: &str) -> bool {
+    let digits = q.chars().filter(|c| !matches!(c, ' ' | '-')).count();
+    q.chars().count() >= 3 && (digits == 0 || digits >= 3)
+}
+
 /// Fetch one book. Takes a connection so it works both on the pool and inside
 /// a transaction.
 async fn fetch_book(conn: &mut PgConnection, id: i64) -> Result<Option<BookRecord>, RepoError> {
@@ -171,12 +179,14 @@ impl BookRepository for PostgresBookRepository {
         // reading only ids; the columns and the correlated subquery are computed
         // for the page's rows only, not for every skipped row.
         let mut select = QueryBuilder::<Postgres>::new(concat!(book_columns!(), " FROM ("));
-        if filter.q.is_some() {
-            // A search is fenced into a materialized CTE: find the matches with
-            // the trigram indexes, then sort just those. Left to itself the
-            // planner often walks the whole `(title, id)` index in order and
-            // applies the ILIKE to every row, hoping to meet 20 matches early;
+        if filter.q.as_deref().is_some_and(trigram_usable) {
+            // A search the trigram indexes can serve is fenced into a materialized
+            // CTE: find the matches with the indexes, then sort just those. Left to
+            // itself the planner often walks the whole `(title, id)` index in order
+            // and applies the ILIKE to every row, hoping to meet 20 matches early;
             // for a rare term that is a full index scan (20-50 ms at 50k books).
+            // A shorter term has no index: there the ordered walk, which stops after
+            // 20 matches, is the better plan.
             select.push("WITH f AS MATERIALIZED (SELECT b.id, b.title FROM books b");
             push_filter(&mut select, filter);
             select.push(") SELECT f.id FROM f ORDER BY f.title ASC, f.id ASC");
@@ -314,5 +324,21 @@ impl BookRepository for PostgresBookRepository {
             .await?;
         tx.commit().await?;
         Ok(DeleteBookOutcome::Deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigram_indexes_need_three_characters_in_every_pattern() {
+        assert!(trigram_usable("Dune"));
+        assert!(trigram_usable("abc"));
+        assert!(trigram_usable("a b c")); // 3 characters once spaces are removed
+        assert!(trigram_usable("---")); // nothing left for the ISBN pattern, the others are 3 long
+        assert!(!trigram_usable("ab"));
+        assert!(!trigram_usable("a b")); // ISBN pattern "ab" is too short
+        assert!(!trigram_usable("é"));
     }
 }
