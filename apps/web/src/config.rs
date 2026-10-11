@@ -24,6 +24,8 @@ pub struct Config {
     pub cookie_secure: bool,
     pub session_ttl_hours: i64,
     pub log_format: LogFormat,
+    /// This node's name (spec §9); shown by /api/health.
+    pub node_id: String,
 }
 
 impl Config {
@@ -50,6 +52,13 @@ impl Config {
             Some(other) => bail!("LOG_FORMAT must be `pretty` or `json`, got `{other}`"),
         };
 
+        let node_id = get("NODE_ID").unwrap_or_else(|| "local".to_owned());
+        if !library_shared::is_valid_node_id(&node_id) {
+            bail!(
+                "NODE_ID must be 1-40 characters of a-z, 0-9 and `-`, starting with a letter or digit; got `{node_id}`"
+            );
+        }
+
         Ok(Self {
             database_url: get("DATABASE_URL")
                 .unwrap_or_else(|| "sqlite://data/library.db".to_owned()),
@@ -60,6 +69,7 @@ impl Config {
             cookie_secure: parse_or(&get, "COOKIE_SECURE", false)?,
             session_ttl_hours,
             log_format,
+            node_id,
         })
     }
 }
@@ -100,6 +110,20 @@ mod tests {
         assert!(!config.cookie_secure);
         assert_eq!(config.session_ttl_hours, 168);
         assert_eq!(config.log_format, LogFormat::Pretty);
+    }
+
+    #[test]
+    fn node_id_defaults_to_local() {
+        let config = Config::from_lookup(lookup(&[])).unwrap();
+        assert_eq!(config.node_id, "local");
+    }
+
+    #[test]
+    fn bad_node_id_is_refused_with_its_name() {
+        for bad in ["", "Node1", "a/b", "node1\nx"] {
+            let err = Config::from_lookup(lookup(&[("NODE_ID", bad)])).unwrap_err();
+            assert!(err.to_string().contains("NODE_ID"), "{err}");
+        }
     }
 
     #[test]

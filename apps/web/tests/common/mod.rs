@@ -201,7 +201,7 @@ impl TestApp {
     }
 }
 
-fn test_config() -> Config {
+pub fn test_config() -> Config {
     Config {
         // Unused: the pool comes from `#[sqlx::test(...)]`, not from this URL.
         database_url: "sqlite::memory:".to_owned(),
@@ -210,6 +210,7 @@ fn test_config() -> Config {
         cookie_secure: false,
         session_ttl_hours: 168,
         log_format: LogFormat::Pretty,
+        node_id: "test-node".to_owned(),
     }
 }
 

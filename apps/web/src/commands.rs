@@ -11,6 +11,8 @@ use crate::config::Config;
 use crate::db;
 use crate::error::AppError;
 use crate::seed::{self, SeedReport};
+use sqlite_setup::CheckReport;
+use sqlx::SqlitePool;
 
 /// `create-user`: add a librarian account to the database.
 ///
@@ -58,6 +60,72 @@ pub async fn seed(config: Config) -> anyhow::Result<()> {
             loans,
         } => println!("Seeded {books} books, {members} members and {loans} loans"),
         SeedReport::Skipped => println!("database already has data; skipping"),
+    }
+    Ok(())
+}
+
+/// Tables whose row counts `check-db` prints, so a restored copy can be
+/// compared with the live database.
+const COUNTED_TABLES: [(&str, &str); 4] = [
+    ("books", "SELECT COUNT(*) FROM books"),
+    ("members", "SELECT COUNT(*) FROM members"),
+    ("loans", "SELECT COUNT(*) FROM loans"),
+    ("users", "SELECT COUNT(*) FROM users"),
+];
+
+/// What `check-db` found.
+#[derive(Debug)]
+pub struct DbInspection {
+    pub report: CheckReport,
+    pub counts: Vec<(&'static str, i64)>,
+}
+
+pub async fn inspect(pool: &SqlitePool) -> anyhow::Result<DbInspection> {
+    let report = sqlite_setup::check(pool).await?;
+    let mut counts = Vec::new();
+    for (table, sql) in COUNTED_TABLES {
+        let count: i64 = sqlx::query_scalar(sql)
+            .fetch_one(pool)
+            .await
+            .with_context(|| format!("counting {table}"))?;
+        counts.push((table, count));
+    }
+    Ok(DbInspection { report, counts })
+}
+
+pub fn render(database_url: &str, inspection: &DbInspection) -> String {
+    let mut out = format!("database: {database_url}\n");
+    let section = |out: &mut String, name: &str, errors: &[String]| {
+        if errors.is_empty() {
+            out.push_str(&format!("{name}: ok\n"));
+        }
+        for error in errors {
+            out.push_str(&format!("{name}: {error}\n"));
+        }
+    };
+    section(&mut out, "integrity", &inspection.report.integrity_errors);
+    section(
+        &mut out,
+        "foreign keys",
+        &inspection.report.foreign_key_errors,
+    );
+    for (table, count) in &inspection.counts {
+        out.push_str(&format!("{table}: {count}\n"));
+    }
+    out
+}
+
+/// `check-db`: look for corruption and broken references, and print row
+/// counts (spec §5 S15). It never creates or migrates the database, because it
+/// is used on restored copies, which must be inspected exactly as they are.
+pub async fn check_db(config: Config) -> anyhow::Result<()> {
+    let pool = sqlite_setup::open_pool(&config.database_url, 1, false).await?;
+    let inspection = inspect(&pool).await;
+    pool.close().await;
+    let inspection = inspection?;
+    print!("{}", render(&config.database_url, &inspection));
+    if !inspection.report.is_ok() {
+        bail!("database check failed");
     }
     Ok(())
 }

@@ -38,11 +38,50 @@ pub struct ApiErrorBody {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Health {
     pub status: String,
+    /// Which node answered (spec §8): handy when checking sticky routing.
+    pub node_id: String,
+    pub version: String,
+}
+
+/// A node name: 1-40 characters of `a-z`, `0-9` and `-`, not starting with
+/// `-`. It becomes the node's S3 folder and its Postgres `node_id`, so
+/// anything else (slashes, spaces, capitals, newlines) is refused.
+pub fn is_valid_node_id(id: &str) -> bool {
+    let allowed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let mut chars = id.chars();
+    matches!(chars.next(), Some(first) if allowed(first))
+        && id.len() <= 40
+        && chars.all(|c| allowed(c) || c == '-')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_ids_that_are_accepted() {
+        for id in ["local", "node1", "node-2", "a", "0branch", &"a".repeat(40)] {
+            assert!(is_valid_node_id(id), "{id:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn node_ids_that_are_refused() {
+        for id in [
+            "",
+            "-node",
+            "Node1",
+            "node_1",
+            "node 1",
+            "a/b",
+            "../x",
+            "node1\nx",
+            "nöde",
+            &"a".repeat(41),
+        ] {
+            assert!(!is_valid_node_id(id), "{id:?} should be refused");
+        }
+    }
 
     #[test]
     fn page_round_trips() {

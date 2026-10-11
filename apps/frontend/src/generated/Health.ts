@@ -3,4 +3,8 @@
 /**
  * Body of `GET /api/health`.
  */
-export type Health = { status: string, };
+export type Health = { status: string, 
+/**
+ * Which node answered (spec §8): handy when checking sticky routing.
+ */
+node_id: string, version: string, };

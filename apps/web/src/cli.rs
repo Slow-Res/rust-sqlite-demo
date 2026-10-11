@@ -24,6 +24,9 @@ pub enum Command {
     },
     /// Insert sample books, members and loans into an empty database.
     Seed,
+    /// Check the database for corruption and broken references and print row
+    /// counts. Never creates or migrates it (used on restored copies).
+    CheckDb,
 }
 
 impl Cli {
@@ -59,6 +62,14 @@ mod tests {
     fn seed_subcommand() {
         let cli = Cli::parse_from(["library-web", "seed"]);
         assert_eq!(cli.command(), Command::Seed);
+    }
+
+    #[test]
+    fn check_db_subcommand() {
+        assert_eq!(
+            Cli::parse_from(["library-web", "check-db"]).command(),
+            Command::CheckDb
+        );
     }
 
     #[test]

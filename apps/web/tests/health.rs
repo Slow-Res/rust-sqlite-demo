@@ -13,7 +13,10 @@ async fn health_is_ok(pool: SqlitePool) {
     let app = TestApp::new(pool);
     let (status, headers, body) = app.get("/api/health", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({ "status": "ok" }));
+    assert_eq!(
+        body,
+        json!({ "status": "ok", "node_id": "test-node", "version": env!("CARGO_PKG_VERSION") })
+    );
     assert!(headers.contains_key("x-request-id"));
     assert_eq!(headers["x-content-type-options"], "nosniff");
 }
