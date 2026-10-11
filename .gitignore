@@ -6,3 +6,5 @@ data/
 node_modules
 dist
 .superpowers/
+# Load test results (scripts/loadtest.sh)
+loadtest/results/
