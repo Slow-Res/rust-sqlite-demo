@@ -23,6 +23,10 @@ services:
     cpuset: "${NODE_CPUS:-6,7}"
     mem_limit: ${NGINX_MEM:-256m}
     memswap_limit: ${NGINX_MEM:-256m}
+    # One fd per client connection plus one per upstream request; Docker's
+    # default soft limit of 1024 capped the box at about 2,100 users.
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
     depends_on:
       web:
         condition: service_healthy
@@ -53,6 +57,9 @@ services:
     cpuset: "${NODE_CPUS:-6,7}"
     mem_limit: ${WEB_MEM:-3840m}
     memswap_limit: ${WEB_MEM:-3840m}
+    # Many connections from nginx, plus the database files and sockets.
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:4000/api/health"]
       interval: 10s
