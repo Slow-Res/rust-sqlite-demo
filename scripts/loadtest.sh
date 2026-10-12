@@ -36,6 +36,20 @@ LT_MODE="${LT_MODE:-web}"
 LT_DB="${LT_DB:-sqlite}"
 [[ $LT_DB == sqlite || $LT_DB == postgres ]] || { echo "LOADTEST: LT_DB must be sqlite or postgres" >&2; exit 2; }
 [[ $LT_MODE == web || $LT_DB == sqlite ]] || { echo "LOADTEST: usage: LT_DB=postgres works only with LT_MODE=web (node mode has its own Postgres)" >&2; exit 2; }
+# LT_APP picks the web app: the Rust one (default) or the Rails comparison app
+# (apps/rails, image library-rails:lt). Rails uses the same Postgres box, nginx, data and k6 script.
+LT_APP="${LT_APP:-rust}"
+[[ $LT_APP == rust || $LT_APP == rails ]] || { echo "LOADTEST: LT_APP must be rust or rails" >&2; exit 2; }
+[[ $LT_APP == rust || ( $LT_DB == postgres && $LT_MODE == web ) ]] || { echo "LOADTEST: usage: LT_APP=rails needs LT_DB=postgres and LT_MODE=web" >&2; exit 2; }
+# Puma workers and threads per worker; the Active Record pool is RAILS_THREADS per worker.
+RAILS_WORKERS="${RAILS_WORKERS:-2}" RAILS_THREADS="${RAILS_THREADS:-5}"
+APP_DESC=rust
+if [ "$LT_APP" = rails ]; then
+  [[ $RAILS_WORKERS =~ ^[1-9][0-9]{0,2}$ ]] || { echo "LOADTEST: usage: RAILS_WORKERS must be a positive integer, e.g. 2 (got '$RAILS_WORKERS')" >&2; exit 2; }
+  [[ $RAILS_THREADS =~ ^[1-9][0-9]{0,2}$ ]] || { echo "LOADTEST: usage: RAILS_THREADS must be a positive integer, e.g. 5 (got '$RAILS_THREADS')" >&2; exit 2; }
+  APP_DESC="rails ($RAILS_WORKERS workers x $RAILS_THREADS threads, YJIT)"
+  export WEB_CONCURRENCY=$RAILS_WORKERS RAILS_MAX_THREADS=$RAILS_THREADS
+fi
 # As seen from the k6 container: through nginx in web mode, as a client would.
 if [ "$LT_MODE" = web ]; then BASE_URL="${BASE_URL:-http://nginx:80}"; else BASE_URL="${BASE_URL:-http://web:4000}"; fi
 HTTP_PORT=$((HTTP_PORT_BASE + 1))
@@ -45,8 +59,9 @@ if [ "$LT_MODE" = web ]; then
   # web first: WEB is NODE_CONTAINERS[0].
   NODE_CONTAINERS=("${PREFIX}web-web-1" "${PREFIX}web-nginx-1")
   [ "$LT_DB" = sqlite ] || NODE_CONTAINERS+=("${PREFIX}web-postgres-1")
-  # The app image built by `make loadtest-image` (it has the postgres feature).
-  export WEB_IMAGE="${WEB_IMAGE:-sqlite-production/web:lt}"
+  # The app image built by `make loadtest-image` (it has the postgres feature), or
+  # by `make loadtest-rails-image` with LT_APP=rails.
+  if [ "$LT_APP" = rails ]; then export WEB_IMAGE="${WEB_IMAGE:-library-rails:lt}"; else export WEB_IMAGE="${WEB_IMAGE:-sqlite-production/web:lt}"; fi
 else
   K6_NETWORK="${PREFIX}node1_default"
   NODE_CONTAINERS=("${PREFIX}node1-web-1" "${PREFIX}node1-litestream-1" "${PREFIX}node1-sync-worker-1")
@@ -87,6 +102,7 @@ MIX="${MIX:-nosearch}"               # action mix: nosearch = no book search (br
 DB_POOL="${DB_POOL:-}"
 [[ -z $DB_POOL || $DB_POOL =~ ^[1-9][0-9]{0,4}$ ]] || { echo "LOADTEST: usage: DB_POOL must be a positive integer, e.g. 20 (got '$DB_POOL')" >&2; exit 2; }
 [[ -z $DB_POOL || $LT_MODE == web ]] || { echo "LOADTEST: usage: DB_POOL works only with LT_MODE=web" >&2; exit 2; }
+[[ -z $DB_POOL || $LT_APP == rust ]] || { echo "LOADTEST: usage: DB_POOL does not apply to LT_APP=rails (the pool is RAILS_WORKERS x RAILS_THREADS)" >&2; exit 2; }
 PG_WORK_MEM="${PG_WORK_MEM:-4MB}"
 [[ $PG_WORK_MEM =~ ^[1-9][0-9]*(kB|MB|GB)$ ]] || { echo "LOADTEST: usage: PG_WORK_MEM must be an integer with a unit kB, MB or GB, e.g. 16MB (got '$PG_WORK_MEM')" >&2; exit 2; }
 if [ -n "$DB_POOL" ]; then export DATABASE_MAX_CONNECTIONS="$DB_POOL"; else unset DATABASE_MAX_CONNECTIONS; fi
@@ -118,6 +134,7 @@ if [ "$LT_DB" = postgres ]; then
   # Every pool connection is a backend, and the runner's own psql calls need a few more.
   # 50 is enough for a pool up to 30; a bigger one raises the limit with it.
   _pool=${DB_POOL:-10}
+  [ "$LT_APP" = rust ] || _pool=$((RAILS_WORKERS * RAILS_THREADS))
   export PG_MAX_CONNECTIONS=$((_pool + 20 > 50 ? _pool + 20 : 50))
   export PG_SHARED_BUFFERS="$(awk -v m="$(to_mib "$PG_MEM")" 'BEGIN { printf "%d", m * 0.25 + 0.5 }')MB"
   export PG_EFFECTIVE_CACHE_SIZE="$(awk -v m="$(to_mib "$PG_MEM")" 'BEGIN { printf "%d", m * 0.75 + 0.5 }')MB"
@@ -171,6 +188,7 @@ wait_until() {
 
 WEB_FILES=(-f deploy/compose/local/loadtest.web.yml)
 [ "$LT_DB" = sqlite ] || WEB_FILES+=(-f deploy/compose/local/loadtest.web-pg.yml)
+[ "$LT_APP" = rust ] || WEB_FILES+=(-f deploy/compose/local/loadtest.web-rails.yml)
 web_compose() { docker compose -p "${PREFIX}web" "${WEB_FILES[@]}" "$@"; }
 node_compose() { HTTP_PORT=$HTTP_PORT docker compose -p "${PREFIX}node1" "${NODE_FILES[@]}" --env-file deploy/compose/local/node1.env "$@"; }
 central() { docker compose -p "${PREFIX}central" -f deploy/compose/central.yml -f deploy/compose/local/loadtest.central.yml "$@"; }
@@ -411,13 +429,17 @@ cmd_seed_cache() {
 
 cmd_up() {
   check_cpus
+  local RUST_IMAGE=${RUST_IMAGE:-sqlite-production/web:lt}
   local img images=(web sync-worker litestream)
   if [ "$LT_MODE" = node ]; then
     for img in "${images[@]}"; do
       docker image inspect "sqlite-production/$img:dev" >/dev/null 2>&1 || die "image sqlite-production/$img:dev is missing: run make images"
     done
   else
-    docker image inspect "$WEB_IMAGE" >/dev/null 2>&1 || die "image $WEB_IMAGE is missing: run make loadtest-image"
+    docker image inspect "$WEB_IMAGE" >/dev/null 2>&1 || die "image $WEB_IMAGE is missing: run make $([ "$LT_APP" = rails ] && echo loadtest-rails-image || echo loadtest-image)"
+    # Rails runs no migrations and has no create-user: a database that is not restored is
+    # first migrated and given the admin by the Rust image (below).
+    [ "$LT_APP" = rust ] || docker image inspect "$RUST_IMAGE" >/dev/null 2>&1 || die "image $RUST_IMAGE is missing (it migrates the database and creates the admin for LT_APP=rails): run make loadtest-image"
   fi
   docker image inspect "$K6_IMAGE" >/dev/null 2>&1 || docker pull "$K6_IMAGE" >/dev/null || die "cannot pull $K6_IMAGE"
   if docker volume inspect "${PREFIX}node1_data" >/dev/null 2>&1 || docker volume inspect "${PREFIX}web_data" >/dev/null 2>&1 || docker volume inspect "${PREFIX}web_pgdata" >/dev/null 2>&1 || [ -f "$STATE_DIR/seed.env" ]; then
@@ -443,12 +465,20 @@ cmd_up() {
       step "restore the seeded database from a snapshot"
       seed_cache_restore "$cache_file"
     fi
-    step "start nginx and the web app ($LT_DB) in one box (cores $NODE_CPUS, 4 GB)"
+    if [ "$LT_APP" = rails ] && [ "$restore" != true ]; then
+      # An empty database: the Rust image migrates it (migrations/web-postgres) and creates the admin.
+      step "migrate the empty database and create the admin with the Rust image"
+      web_compose up -d --wait postgres || die "Postgres did not become healthy"
+      local pg_url=postgres://library:library@postgres:5432/library # local only, as in loadtest.web-pg.yml
+      docker run --rm -i --cpuset-cpus "$NODE_CPUS" --network "$K6_NETWORK" -e PW="$LT_ADMIN_PASSWORD" -e DATABASE_URL="$pg_url" \
+        "$RUST_IMAGE" sh -c "$create_admin" >/dev/null || die "could not migrate the database and create the admin with $RUST_IMAGE"
+    fi
+    step "start nginx and the web app ($LT_APP, $LT_DB) in one box (cores $NODE_CPUS, 4 GB)"
     # A web that cannot start (for example an image without the postgres
     # feature) restarts forever, so bound the wait and show why.
     web_compose up -d --wait --wait-timeout 180 || { web_compose logs --tail 20 web >&2 || true; die "the box did not become healthy (web logs above)"; }
     # Local-only test credentials, like the e2e test. A snapshot already has the account.
-    [ "$restore" = true ] || web_compose exec -T -e PW="$LT_ADMIN_PASSWORD" web sh -c "$create_admin" >/dev/null
+    [ "$restore" = true ] || [ "$LT_APP" = rails ] || web_compose exec -T -e PW="$LT_ADMIN_PASSWORD" web sh -c "$create_admin" >/dev/null
   else
     step "start Postgres, Garage and Prometheus (cores $CENTRAL_CPUS)"
     central up -d --wait postgres
@@ -499,7 +529,7 @@ cmd_up() {
   step "limit proof"
   if [ "$LT_MODE" = web ]; then
     web_limits_proof
-    printf '\nload-test box ready (mode web, %s): k6 target %s, web %s\n' "$LT_DB" "$BASE_URL" "$(host_url)"
+    printf '\nload-test box ready (mode web, %s, app: %s): k6 target %s, web %s\n' "$LT_DB" "$APP_DESC" "$BASE_URL" "$(host_url)"
   else
     node_limits_proof
     printf '\nload-test cluster ready: web http://127.0.0.1:%s, Prometheus %s, Postgres 127.0.0.1:%s\n' "$HTTP_PORT" "$PROM_URL" "$POSTGRES_HOST_PORT"
@@ -749,7 +779,7 @@ pause_between_levels() {
 write_summary() {
   local dir=$1 levels=$2 result=${3:-null} aborted=${4:-}
   jq -s --argjson result "$result" --arg aborted "$aborted" --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
-    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg paging "$PAGING" --arg mix "$MIX" --arg db_pool "$DB_POOL" --arg pg_work_mem "$PG_WORK_MEM" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" --arg db "$([ "$LT_MODE" = web ] && echo "$LT_DB" || true)" \
+    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg paging "$PAGING" --arg mix "$MIX" --arg db_pool "$DB_POOL" --arg app "$LT_APP" --arg app_desc "$APP_DESC" --arg pg_work_mem "$PG_WORK_MEM" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" --arg db "$([ "$LT_MODE" = web ] && echo "$LT_DB" || true)" \
     --argjson clock "$RUN_CLOCK" --argjson cool "$RUN_COOL" \
     -f loadtest/summary.jq "$levels" >"$dir/summary.json" || return 1
   jq -r -L loadtest --arg prefix "$PREFIX" -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
@@ -759,7 +789,7 @@ write_summary() {
 }
 
 new_results_dir() {
-  local dir="${RESULTS_DIR:-$RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)$([ "$LT_MODE" = web ] && echo "-$LT_DB")${1:+-$1}$([ "$PREFIX" = lt- ] || echo "-${PREFIX%-}")}"
+  local dir="${RESULTS_DIR:-$RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)$([ "$LT_MODE" = web ] && echo "-$LT_DB")$([ "$LT_APP" = rust ] || echo "-$LT_APP")${1:+-$1}$([ "$PREFIX" = lt- ] || echo "-${PREFIX%-}")}"
   mkdir -p "$dir" || die "cannot create the results directory $dir"
   echo "$dir"
 }
@@ -1055,7 +1085,7 @@ cmd_ramp() {
     jq . <<<"$warmup" >"$dir/warmup.json"
   fi
   local out
-  out=$(jq -s -L loadtest --arg db "$LT_DB" --arg paging "$PAGING" --arg mix "$MIX" --arg db_pool "$DB_POOL" --arg pg_work_mem "$PG_WORK_MEM" --arg node_cpus "$NODE_CPUS" --arg k6_cpus "$K6_CPUS" \
+  out=$(jq -s -L loadtest --arg db "$LT_DB" --arg paging "$PAGING" --arg mix "$MIX" --arg db_pool "$DB_POOL" --arg app "$LT_APP" --arg app_desc "$APP_DESC" --arg pg_work_mem "$PG_WORK_MEM" --arg node_cpus "$NODE_CPUS" --arg k6_cpus "$K6_CPUS" \
     --arg nginx_mem "$NGINX_MEM" --arg web_mem "$WEB_MEM" --arg pg_mem "$PG_MEM" \
     --arg pg_shared "${PG_SHARED_BUFFERS:-}" --arg pg_cache "${PG_EFFECTIVE_CACHE_SIZE:-}" \
     --argjson start "$start" --argjson step_users "$step" --argjson step_s "$step_s" --argjson max_users "$MAX_USERS" \
@@ -1076,7 +1106,7 @@ case "${1:-}" in
   ramp) shift; cmd_ramp "$@" ;;
   seed-cache) shift; cmd_seed_cache "$@" ;;
   clockcheck) preflight; echo "now: package $(pkg_temp_c) C, throttle $(read_throttle)" ;;
-  config) web_compose config ;;
+  config) echo "# app: $APP_DESC"; web_compose config ;;
   down) cmd_down ;;
   *)
     echo "usage: scripts/loadtest.sh up | users N | rps R | search users|rps [START] [FACTOR] | ramp [START] [STEP] [STEP_S] | clockcheck | seed-cache list|clear | config | down" >&2
