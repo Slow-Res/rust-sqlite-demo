@@ -12,6 +12,7 @@
 #   scripts/loadtest.sh search users|rps [START] [FACTOR]
 #   scripts/loadtest.sh ramp [START] [STEP] [STEP_S]     (WARMUP_S=120: an unjudged warm-up first)
 #   scripts/loadtest.sh clockcheck
+#   scripts/loadtest.sh seed-cache list|clear   (the seeded-database snapshots, see SEED_CACHE)
 #   scripts/loadtest.sh down
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -61,6 +62,12 @@ export LT_ADMIN_PASSWORD="${LT_ADMIN_PASSWORD:-loadtest-local-only}"
 # Seed sizes (up) and the settings of a level.
 BOOKS="${BOOKS:-50000}" MEMBERS="${MEMBERS:-10000}" LOANS="${LOANS:-20000}" SEED_VUS="${SEED_VUS:-16}"
 RAMP="${RAMP:-60}" HOLD="${HOLD:-300}"
+# SEED_CACHE=1 (web mode): the first `up` of a seed saves the seeded database as a tar under
+# SEED_CACHE_DIR and every later `up` of the same seed restores it instead of seeding;
+# 0 always seeds and never saves or restores.
+SEED_CACHE="${SEED_CACHE:-1}"
+[[ $SEED_CACHE == 0 || $SEED_CACHE == 1 ]] || { echo "LOADTEST: usage: SEED_CACHE must be 0 or 1 (got '$SEED_CACHE')" >&2; exit 2; }
+SEED_CACHE_DIR=loadtest/.seed-cache
 # ramp mode allows 2% errors (a step of many users logging in at once), the others 1%.
 P95_MS="${P95_MS:-500}" P99_MS="${P99_MS:-1000}" ERR_PCT="${ERR_PCT:-$([ "${1:-}" = ramp ] && echo 2 || echo 1)}" DROP_PCT="${DROP_PCT:-1}"
 PAUSE_S="${PAUSE_S:-30}"           # between levels, after the sync worker has drained
@@ -121,6 +128,7 @@ STATE_DIR=$RESULTS_ROOT/.state
 [ "$PREFIX" = lt- ] || STATE_DIR=$RESULTS_ROOT/.state-$PREFIX
 SAMPLER_PID=
 EVENTS_PID=
+SEED_PART=        # the snapshot being written, removed if the run ends before it is complete
 WORK=$(mktemp -d)
 RUN_DIR=          # results of the running command, for the summary of an aborted run
 RUN_RESULT=null   # the search result so far, as JSON
@@ -135,6 +143,7 @@ on_exit() {
   [ -z "$SAMPLER_PID" ] || kill "$SAMPLER_PID" 2>/dev/null || true
   [ -z "$EVENTS_PID" ] || kill "$EVENTS_PID" 2>/dev/null || true
   docker rm -f "${PREFIX}k6-$$" >/dev/null 2>&1 || true
+  [ -z "$SEED_PART" ] || rm -f "$SEED_PART"
   # Whatever ended the run early, keep what was measured.
   if [ -n "$RUN_DIR" ] && [ "$SUMMARY_DONE" != true ] && [ -s "$RUN_DIR/levels.jsonl" ]; then
     write_summary "$RUN_DIR" "$RUN_DIR/levels.jsonl" "$RUN_RESULT" "${ABORT_REASON:-interrupted or failed (exit $rc)}" >&2 || true
@@ -319,6 +328,87 @@ web_limits_proof() {
   [ "$(docker exec "$WEB" nproc)" = "$expected_cpus" ] || die "nproc in the web container is not $expected_cpus"
 }
 
+# ------------------------------------------------------------ seed snapshot
+
+# Web mode keeps the seeded database in one named volume (Postgres' data, or the SQLite
+# file in /data). A snapshot is a tar of that volume, taken with the box stopped so it is
+# consistent, and put back before the database first starts. Node mode has its own
+# Postgres, Garage and Litestream state and does not use it.
+seed_cache_on() { [ "$SEED_CACHE" = 1 ] && [ "$LT_MODE" = web ]; }
+
+# The service whose image runs the tar (it must be on the box already) and the volume it
+# archives; GNU tar of the Postgres image needs --numeric-owner (uid 999), busybox does not.
+seed_cache_service() { if [ "$LT_DB" = postgres ]; then echo postgres; else echo nginx; fi; }
+seed_cache_volume() { if [ "$LT_DB" = postgres ]; then echo "${PREFIX}web_pgdata"; else echo "${PREFIX}web_data"; fi; }
+seed_cache_image() { web_compose config --format json | jq -er ".services.$(seed_cache_service).image"; }
+seed_cache_tar_opts() { if [ "$LT_DB" = postgres ]; then echo --numeric-owner; fi; }
+
+# The snapshot file of the current settings. The name has the sizes; the hash covers all else
+# that changes the data: the seed script and what it imports, the migrations of this
+# backend, the image of the database (its ID, so a rebuilt tag is a different key) and the
+# staff login (its hash is in the database).
+seed_cache_file() {
+  local img id migrations=migrations/sqlite hash
+  img=$(seed_cache_image) || die "cannot read the compose file for the seed snapshot key"
+  docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img" >/dev/null || die "cannot pull $img"
+  id=$(docker image inspect -f '{{.Id}}' "$img") || die "cannot inspect $img"
+  [ "$LT_DB" = sqlite ] || migrations=migrations/web-postgres
+  hash=$({
+    printf 'db=%s books=%s members=%s loans=%s\nadmin=%s\npassword=%s\nimage=%s %s\n' "$LT_DB" "$BOOKS" "$MEMBERS" "$LOANS" "$LT_ADMIN_USER" "$LT_ADMIN_PASSWORD" "$img" "$id"
+    cat loadtest/seed.js loadtest/common.js
+    (cd "$migrations" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum)
+  } | sha256sum | cut -c1-16)
+  echo "$SEED_CACHE_DIR/seed-$LT_DB-b$BOOKS-m$MEMBERS-l$LOANS-$hash.tar"
+}
+
+# Put the snapshot into the (new) volume before the database starts: `create` makes the
+# volume with compose's own labels and starts nothing.
+seed_cache_restore() {
+  local file=$1 started opts=()
+  started=$(now)
+  read -ra opts <<<"$(seed_cache_tar_opts)"
+  web_compose create >/dev/null || die "cannot create the box's volumes"
+  docker run --rm -i --user 0 -v "$(seed_cache_volume):/v" "$(seed_cache_image)" tar -xf - -C /v "${opts[@]}" <"$file" ||
+    die "could not restore $file (scripts/loadtest.sh down; seed-cache clear to seed again)"
+  echo "seed: restored snapshot $file ($(elapsed_since "$started") s)"
+}
+
+# Stop the whole box (a clean shutdown: Postgres checkpoints), archive the volume to a
+# temp name, rename it, and start the box again. The tar goes through stdout so the file
+# belongs to the runner's user.
+seed_cache_save() {
+  local file=$1 started opts=()
+  started=$(now)
+  read -ra opts <<<"$(seed_cache_tar_opts)"
+  step "save the seeded database as a snapshot"
+  mkdir -p "$SEED_CACHE_DIR"
+  web_compose stop -t 120 >/dev/null || die "could not stop the box to save the snapshot"
+  if [ "$LT_DB" = postgres ] && [ "$(docker inspect -f '{{.State.ExitCode}}' "${PREFIX}web-postgres-1")" != 0 ]; then
+    die "Postgres did not shut down cleanly, no snapshot saved"
+  fi
+  SEED_PART="$file.part"
+  docker run --rm --user 0 -v "$(seed_cache_volume):/v:ro" "$(seed_cache_image)" tar -cf - -C /v "${opts[@]}" . >"$SEED_PART" ||
+    die "could not write the snapshot $file"
+  mv "$SEED_PART" "$file"
+  SEED_PART=
+  web_compose up -d --wait --wait-timeout 180 || { web_compose logs --tail 20 web >&2 || true; die "the box did not become healthy after the snapshot (web logs above)"; }
+  echo "seed: saved snapshot $file ($(du -h "$file" | cut -f1), $(elapsed_since "$started") s)"
+}
+
+cmd_seed_cache() {
+  case "${1:-}" in
+    list)
+      [ -n "$(find "$SEED_CACHE_DIR" -maxdepth 1 -type f 2>/dev/null)" ] || { echo "no snapshots in $SEED_CACHE_DIR"; return 0; }
+      (cd "$SEED_CACHE_DIR" && ls -lh --time-style=long-iso -- * | awk '{ print $5, $6, $7, $8 }')
+      ;;
+    clear)
+      find "$SEED_CACHE_DIR" -maxdepth 1 -type f -print -delete 2>/dev/null || true
+      echo "snapshots cleared ($SEED_CACHE_DIR)"
+      ;;
+    *) die "usage: scripts/loadtest.sh seed-cache list|clear" ;;
+  esac
+}
+
 cmd_up() {
   check_cpus
   local img images=(web sync-worker litestream)
@@ -340,14 +430,25 @@ cmd_up() {
     [ "$split_mib" = "$BOX_MIB" ] || die "the memory split adds up to $split_mib MiB, not $BOX_MIB (NGINX_MEM=$NGINX_MEM WEB_MEM=$WEB_MEM$([ "$LT_DB" = sqlite ] || echo " PG_MEM=$PG_MEM"))"
   fi
 
+  # A snapshot of this seed, if there is one (web mode): restore it instead of seeding.
+  local cache_file= restore=false
+  if seed_cache_on; then
+    cache_file=$(seed_cache_file)
+    [ ! -f "$cache_file" ] || restore=true
+  fi
+
   local create_admin="printf '%s\n' \"\$PW\" | library-web create-user $LT_ADMIN_USER --password-stdin"
   if [ "$LT_MODE" = web ]; then
+    if [ "$restore" = true ]; then
+      step "restore the seeded database from a snapshot"
+      seed_cache_restore "$cache_file"
+    fi
     step "start nginx and the web app ($LT_DB) in one box (cores $NODE_CPUS, 4 GB)"
     # A web that cannot start (for example an image without the postgres
     # feature) restarts forever, so bound the wait and show why.
     web_compose up -d --wait --wait-timeout 180 || { web_compose logs --tail 20 web >&2 || true; die "the box did not become healthy (web logs above)"; }
-    # Local-only test credentials, like the e2e test.
-    web_compose exec -T -e PW="$LT_ADMIN_PASSWORD" web sh -c "$create_admin" >/dev/null
+    # Local-only test credentials, like the e2e test. A snapshot already has the account.
+    [ "$restore" = true ] || web_compose exec -T -e PW="$LT_ADMIN_PASSWORD" web sh -c "$create_admin" >/dev/null
   else
     step "start Postgres, Garage and Prometheus (cores $CENTRAL_CPUS)"
     central up -d --wait postgres
@@ -362,14 +463,17 @@ cmd_up() {
 
   mkdir -p "$STATE_DIR"
   local phase count started
-  for phase in books members loans; do
-    case $phase in books) count=$BOOKS ;; members) count=$MEMBERS ;; loans) count=$LOANS ;; esac
-    step "seed $count $phase through the API ($SEED_VUS VUs)"
-    started=$(now)
-    k6_run "$STATE_DIR" seed.js -e PHASE="$phase" -e BOOKS="$BOOKS" -e MEMBERS="$MEMBERS" -e LOANS="$LOANS" -e SEED_VUS="$SEED_VUS" \
-      >"$STATE_DIR/seed-$phase.log" 2>&1 || { tail -20 "$STATE_DIR/seed-$phase.log" >&2; die "seeding $phase failed (log: $STATE_DIR/seed-$phase.log)"; }
-    echo "$phase seeded in $(elapsed_since "$started") s"
-  done
+  if [ "$restore" != true ]; then
+    [ -z "$cache_file" ] || echo "seed: no snapshot, seeding (will save $cache_file)"
+    for phase in books members loans; do
+      case $phase in books) count=$BOOKS ;; members) count=$MEMBERS ;; loans) count=$LOANS ;; esac
+      step "seed $count $phase through the API ($SEED_VUS VUs)"
+      started=$(now)
+      k6_run "$STATE_DIR" seed.js -e PHASE="$phase" -e BOOKS="$BOOKS" -e MEMBERS="$MEMBERS" -e LOANS="$LOANS" -e SEED_VUS="$SEED_VUS" \
+        >"$STATE_DIR/seed-$phase.log" 2>&1 || { tail -20 "$STATE_DIR/seed-$phase.log" >&2; die "seeding $phase failed (log: $STATE_DIR/seed-$phase.log)"; }
+      echo "$phase seeded in $(elapsed_since "$started") s"
+    done
+  fi
   local seeded_at
   seeded_at=$(now)
 
@@ -389,6 +493,8 @@ cmd_up() {
     echo "rows: $rows"
   fi
   printf 'SEED_BOOKS=%s\nSEED_MEMBERS=%s\nSEED_LOANS=%s\n' "$BOOKS" "$MEMBERS" "$LOANS" >"$STATE_DIR/seed.env"
+  # A restored box was just checked by the rows line above; a freshly seeded one is saved now.
+  if [ -n "$cache_file" ] && [ "$restore" != true ]; then seed_cache_save "$cache_file"; fi
 
   step "limit proof"
   if [ "$LT_MODE" = web ]; then
@@ -968,11 +1074,12 @@ case "${1:-}" in
   users | rps) cmd_level "$1" "${2:?usage: loadtest.sh $1 N}" ;;
   search) shift; cmd_search "$@" ;;
   ramp) shift; cmd_ramp "$@" ;;
+  seed-cache) shift; cmd_seed_cache "$@" ;;
   clockcheck) preflight; echo "now: package $(pkg_temp_c) C, throttle $(read_throttle)" ;;
   config) web_compose config ;;
   down) cmd_down ;;
   *)
-    echo "usage: scripts/loadtest.sh up | users N | rps R | search users|rps [START] [FACTOR] | ramp [START] [STEP] [STEP_S] | clockcheck | config | down" >&2
+    echo "usage: scripts/loadtest.sh up | users N | rps R | search users|rps [START] [FACTOR] | ramp [START] [STEP] [STEP_S] | clockcheck | seed-cache list|clear | config | down" >&2
     exit 2
     ;;
 esac

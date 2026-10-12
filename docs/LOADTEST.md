@@ -188,6 +188,25 @@ Before any measurement, `up` waits until the sync worker has shipped everything
 Litestream has uploaded it (its position, `litestream_txid`, and its upload counter have
 stopped moving). It also checks that Postgres holds as many rows as the API reports.
 
+**Seed snapshot (web mode).** Seeding 500,000 books, 100,000 members and 200,000 loans takes
+about 7 minutes, and a run changes the data (books are added and deleted, loans made), so
+every run must start from the same freshly seeded state. The first `up` of a seed therefore
+seeds, stops the box cleanly and saves the database volume (the Postgres data directory, or the
+SQLite file) as a tar in `loadtest/.seed-cache/` (gitignored), then starts the box again.
+Every later `up` of the same seed restores that tar into the new volume before the database
+starts, so the web app's migrations find nothing to do, and skips the seed. It prints
+`seed: restored snapshot <file> (N s)` or `seed: no snapshot, seeding (will save <file>)`, and
+the `rows:` line comes from the restored data through the API either way. The file name
+carries `LT_DB`, `BOOKS`, `MEMBERS`, `LOANS` and a hash of everything else that changes the
+data: `loadtest/seed.js` and `common.js`, the migrations of the backend, the ID of the database
+image and the staff login (`LT_ADMIN_USER`, `LT_ADMIN_PASSWORD`). Changing any of them seeds
+afresh and saves a new snapshot; old ones stay until `seed-cache clear`. Not in the key: the
+web image (an app change that alters what the API writes needs `seed-cache clear` or
+`SEED_CACHE=0`), `SEED_VUS` and the box settings. A snapshot is written under a temporary
+name and renamed, so a killed run leaves no half file. A snapshot is about the size of the
+database (several GB at the large seed); `PREFIX` boxes share the directory. Node mode
+does not use it. The SQLite variant uses the same code, but only the Postgres variant has been run end to end.
+
 The data is never reset between levels, so the database grows during a run. The
 summaries state the row counts at the start and the end.
 
@@ -406,6 +425,7 @@ scripts/loadtest.sh rps 200
 scripts/loadtest.sh search users        # step up from 100 by x2, then bisect, then confirm
 scripts/loadtest.sh search rps 50 2     # START and FACTOR are optional
 scripts/loadtest.sh ramp 100 100 60     # +100 users a minute until a step fails (START STEP STEP_S)
+scripts/loadtest.sh seed-cache list     # the saved seed snapshots (clear: delete them)
 scripts/loadtest.sh down                # or: make loadtest-down
 make loadtest                           # up, search users, search rps, down
 ```
@@ -431,6 +451,7 @@ Environment overrides (defaults in brackets):
 | `DROP_PCT` (1) | dropped iterations limit, rps only |
 | `BOOKS` (50000), `MEMBERS` (10000), `LOANS` (20000) | size of the seed, for `up` |
 | `SEED_VUS` (16) | k6 VUs that seed |
+| `SEED_CACHE` (1) | web mode: `1` saves the seeded database as a snapshot under `loadtest/.seed-cache/` and restores it on every later `up` of the same seed instead of seeding; `0` always seeds and never saves or restores. `scripts/loadtest.sh seed-cache list` or `clear` lists or deletes the snapshots. See "Data" |
 | `SESSION_POOL` (50) | sessions logged in at setup in the rps model |
 | `PAGING` (`cursor`) | `cursor`: "next page" browsing with `after`; `offset`: random deep `page=N`. See "Browsing and paging" |
 | `MIX` (`nosearch`) | `nosearch`: no book search, browse available (11%) and delete book (4%) instead; `search`: the earlier mix with `search_books` (15%). See "The action mix". The summary header names it (`summary.json` has `mix`; older summaries have none and were run with `search`) |

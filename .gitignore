@@ -8,3 +8,5 @@ dist
 .superpowers/
 # Load test results (scripts/loadtest.sh)
 loadtest/results/
+# Load test seed snapshots (scripts/loadtest.sh, SEED_CACHE)
+loadtest/.seed-cache/
