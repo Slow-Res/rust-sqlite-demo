@@ -12,6 +12,7 @@ def unit: if .kind == "rps" then "actions/s" else "users" end;
    else "  max sync pending \(.max_sync_pending) lag \(.max_sync_lag_s) s  Litestream PUTs rose: \(.litestream.puts_rose) (flat 15 s buckets \(.litestream.flat_15s_buckets)/\(.litestream.buckets_15s))  drain \(.drain_s) s  dropped \(.dropped_iterations)\n" end)
 + "  active loans at the start: \(.db_rows_before.active_loans)  session pool logged in at setup: \(.session_pool_logged_in_at_setup)  login/me/logout in hold: \(.auth_requests_in_hold.login)/\(.auth_requests_in_hold.me)/\(.auth_requests_in_hold.logout)\n"
 + "  returns converted to a borrow (own stack empty): \(.return_converted_to_borrow.count) of \(.return_converted_to_borrow.return_actions) (\(.return_converted_to_borrow.share_pct // "-")%)\n"
++ (if .delete_converted_to_add.delete_actions > 0 then "  deletes converted to an add (own books empty): \(.delete_converted_to_add.count) of \(.delete_converted_to_add.delete_actions) (\(.delete_converted_to_add.share_pct // "-")%)\n" else "" end)
 + "  per action (hold p95/p99 ms, requests):\n"
 + ([.per_action | to_entries[] | "    \(.key | . + (" " * (16 - length)))  \(.value.p95 // "-") / \(.value.p99 // "-")  n=\(.value.requests)\(if .value.errors > 0 then "  errors=\(.value.errors)" else "" end)"] | join("\n"))
 + "\n  expected non-2xx outcomes: " + (if (.non_2xx_outcomes | length) == 0 then "none" else ([.non_2xx_outcomes[] | "\(.action) \(.status) \(.share_pct)%"] | join(", ")) end)

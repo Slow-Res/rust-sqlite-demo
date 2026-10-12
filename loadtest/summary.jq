@@ -7,6 +7,7 @@
     node: {mode: $mode, cpus: $node_cpus, cpu_limit: "2 CPUs (cores shared by web, Litestream, sync-worker)", memory_limit: "4 GB: web 3g, litestream 512m, sync-worker 512m, restore 512m"},
     pass_rule: {p95_ms_below: $p95, p99_ms_below: $p99, error_pct_below: $err, dropped_pct_below_rps_only: $drop, no_restart_or_oom: true, window: "hold only (ramp excluded)"},
     paging: $paging,
+    mix: $mix,
     ramp_s: $ramp,
     hold_s: $hold,
     aborted: (if $aborted == "" then null else $aborted end),

@@ -62,6 +62,8 @@ $k6[0].metrics as $m
 | (($unexpected | map(.count) | add) // 0) as $unexpected_named
 | ($err_count - $unexpected_named) as $unexpected_other
 | (v("return_converted_to_borrow{phase:hold}").count // 0) as $converted
+| (v("delete_converted_to_add{phase:hold}").count // 0) as $del_converted
+| ($m["actions{phase:hold,intent:delete_book}"].values.count // 0) as $delete_actions
 | ($m["actions{phase:hold,intent:return}"].values.count // 0) as $return_actions
 | ($k6cpu | max) as $k6max
 | ([
@@ -99,6 +101,7 @@ $k6[0].metrics as $m
     unexpected_statuses: $unexpected,
     unexpected_other: $unexpected_other,
     return_converted_to_borrow: {count: $converted, return_actions: $return_actions, share_pct: (if $return_actions > 0 then $converted / $return_actions * 100 | r1 else null end)},
+    delete_converted_to_add: {count: $del_converted, delete_actions: $delete_actions, share_pct: (if $delete_actions > 0 then $del_converted / $delete_actions * 100 | r1 else null end)},
     session_pool_logged_in_at_setup: ($setup.sessions // 0),
     auth_requests_in_hold: {login: (v("http_reqs{phase:hold,action:login}").count // 0), me: (v("http_reqs{phase:hold,action:me}").count // 0), logout: (v("http_reqs{phase:hold,action:logout}").count // 0)},
     litestream: {puts_start: ([$hs[] | select(.puts != null)] | first | .puts), puts_end: ([$hs[] | select(.puts != null)] | last | .puts), puts_rose: $puts_rose, flat_15s_buckets: $flat_buckets, buckets_15s: ($put_buckets | length), txid_end: ([$hs[] | select(.txid != null)] | last | .txid)},
@@ -107,7 +110,7 @@ $k6[0].metrics as $m
     dropped_iterations: $dropped,
     dropped_pct: ($drop_pct | r2),
     request_split: {requests: $kinds, read_pct: (if $reqs > 0 then $kinds.read / $reqs * 100 | r1 else null end), write_pct: (if $reqs > 0 then $kinds.write / $reqs * 100 | r1 else null end), auth_pct: (if $reqs > 0 then $kinds.auth / $reqs * 100 | r1 else null end)},
-    intended_split: {actions: $intents, read_pct: (if $intent_total > 0 then (($intents | to_entries | map(select(.key | IN("browse_books", "search_books", "open_book", "members", "list_loans")) | .value) | add // 0) / $intent_total * 100 | r1) else null end), write_pct: (if $intent_total > 0 then (($intents | to_entries | map(select(.key | IN("borrow", "return", "edit_book", "add_book", "add_member", "edit_member")) | .value) | add // 0) / $intent_total * 100 | r1) else null end)},
+    intended_split: {actions: $intents, read_pct: (if $intent_total > 0 then (($intents | to_entries | map(select(.key | IN("browse_books", "search_books", "browse_available", "open_book", "members", "list_loans")) | .value) | add // 0) / $intent_total * 100 | r1) else null end), write_pct: (if $intent_total > 0 then (($intents | to_entries | map(select(.key | IN("borrow", "return", "edit_book", "add_book", "delete_book", "add_member", "edit_member")) | .value) | add // 0) / $intent_total * 100 | r1) else null end)},
     per_action: $per_action,
     non_2xx_outcomes: $non2xx,
     mix_warnings: $mix_warnings,

@@ -8,7 +8,7 @@ def table($head; $rows): row($head) + "\n|" + ($head | map("---") | join("|")) +
 
 "# Load test summary\n\n"
 + (if .aborted != null then "**ABORTED: \(.aborted)** (the levels below finished before that)\n\n" else "" end)
-+ (if .node.mode == "web" then "web only: nginx + Rust + \(if .db == "postgres" then "Postgres" else "SQLite" end), 2 CPUs, 4 GB, cores \(.node.cpus)." else "Node: \(.node.cpu_limit), \(.node.memory_limit), cores \(.node.cpus)." end) + " Browsing: \(.paging // "offset") paging. Ramp \(.ramp_s) s, hold \(.hold_s) s; every number is from the hold window only.\n"
++ (if .node.mode == "web" then "web only: nginx + Rust + \(if .db == "postgres" then "Postgres" else "SQLite" end), 2 CPUs, 4 GB, cores \(.node.cpus)." else "Node: \(.node.cpu_limit), \(.node.memory_limit), cores \(.node.cpus)." end) + " Browsing: \(.paging // "offset") paging. Mix: \(.mix // "search"). Ramp \(.ramp_s) s, hold \(.hold_s) s; every number is from the hold window only.\n"
 + "Pass rule: p95 < \(.pass_rule.p95_ms_below) ms, p99 < \(.pass_rule.p99_ms_below) ms, errors < \(.pass_rule.error_pct_below)%, no restart or OOM kill"
 + (if any(.levels[]; .kind == "rps") then ", dropped iterations < \(.pass_rule.dropped_pct_below_rps_only)%" else "" end) + ".\n\n"
 + (if .search != null then "**Search (\(.search.kind)): \(.search.status). Highest passing level: \(.search.best_pass | n) \(if .search.kind == "rps" then "actions/s" else "users" end)\(if .search.best_req_per_s != null then " (≈ \(.search.best_req_per_s) req/s)" else "" end). Lowest failing level: \(.search.first_fail | n).**\n\n" else "" end)

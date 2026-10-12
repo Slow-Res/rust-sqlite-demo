@@ -21,6 +21,10 @@
 //                        the next page (`after`), else for page 1, which resets the cursor.
 //   PAGING=offset  a random page=N of the whole list (OFFSET up to ~50,000), as in the
 //                        earlier runs.
+// The action mix follows MIX:
+//   MIX=nosearch   (default) no book search: browse_available (11%) and delete_book
+//                        (4%, a book the VU added itself) take its 15%.
+//   MIX=search     the earlier mix, with search_books (15%) and neither new action.
 // users and rps ramp for RAMP seconds, then hold for HOLD seconds. Every request is
 // tagged phase:ramp|hold|post, action:<name> and kind:read|write|auth. All
 // reported numbers come from phase:hold only.
@@ -47,24 +51,27 @@ const OUT = __ENV.OUT || '/out';
 const PER_PAGE = 20;
 const PAGING = __ENV.PAGING || 'cursor';
 if (PAGING !== 'cursor' && PAGING !== 'offset') throw new Error(`PAGING must be cursor or offset (got '${PAGING}')`);
+const MIX_NAME = __ENV.MIX || 'nosearch';
+if (MIX_NAME !== 'nosearch' && MIX_NAME !== 'search') throw new Error(`MIX must be nosearch or search (got '${MIX_NAME}')`);
 const NEXT_PAGE_P = 0.75; // cursor paging: chance of "next page" when the VU has a cursor
 
 // Every request kind with the statuses it may return. Anything else, a 5xx, a
 // timeout or a network error is an error. 409 is a normal business answer.
 const EXPECT = {
   login: [200], me: [200], logout: [204],
-  browse_books: [200], search_books: [200], open_book: [200],
+  browse_books: [200], search_books: [200], browse_available: [200], open_book: [200],
   list_members: [200], open_member: [200], list_loans: [200],
   borrow: [201, 409],            // 409: no copies left, or the member is at the loan limit
   return: [200, 409],            // only the user's own loans, so 409 (already returned) should not happen
   edit_book_get: [200], edit_book: [200],
   add_book: [201, 409],          // 409: duplicate ISBN (random ISBN, very rare)
+  delete_book: [204, 409],       // 409: another user borrowed the book (book_has_active_loans); 404 is an error
   add_member: [201],
   edit_member_get: [200], edit_member: [200],
 };
 const KIND = {
   login: 'auth', me: 'auth', logout: 'auth',
-  borrow: 'write', return: 'write', edit_book: 'write', add_book: 'write', add_member: 'write', edit_member: 'write',
+  borrow: 'write', return: 'write', edit_book: 'write', add_book: 'write', delete_book: 'write', add_member: 'write', edit_member: 'write',
 };
 const kindOf = (action) => KIND[action] || 'read';
 const CALLBACK = {};
@@ -72,10 +79,24 @@ for (const a of Object.keys(EXPECT)) CALLBACK[a] = http.expectedStatuses(...EXPE
 
 // What the user intends to do, and how often (percent). The sub-requests it
 // needs (a GET before a PUT, a page of active loans before a return) come on top.
-const MIX = [
-  ['browse_books', 20], ['search_books', 15], ['open_book', 10], ['members', 8], ['list_loans', 7],
-  ['borrow', 13], ['return', 13], ['edit_book', 5], ['add_book', 4], ['add_member', 3], ['edit_member', 2],
-];
+const MIXES = {
+  search: [
+    ['browse_books', 20], ['search_books', 15], ['open_book', 10], ['members', 8], ['list_loans', 7],
+    ['borrow', 13], ['return', 13], ['edit_book', 5], ['add_book', 4], ['add_member', 3], ['edit_member', 2],
+  ],
+  // Book search sorts and counts every match, so it grows with the data and
+  // dominates the database time. This mix swaps it for one more read and one more
+  // write; add_book and delete_book keep the books table about the same size.
+  nosearch: [
+    ['browse_books', 20], ['browse_available', 11], ['open_book', 10], ['members', 8], ['list_loans', 7],
+    ['borrow', 13], ['return', 13], ['edit_book', 5], ['add_book', 4], ['delete_book', 4], ['add_member', 3], ['edit_member', 2],
+  ],
+};
+const MIX = MIXES[MIX_NAME];
+for (const [name, mix] of Object.entries(MIXES)) {
+  const sum = mix.reduce((n, [, share]) => n + share, 0);
+  if (sum !== 100) throw new Error(`MIX ${name}: shares add up to ${sum}, not 100`);
+}
 
 const errors = new Rate('errors');
 const actions = new Counter('actions'); // intended actions, tag intent
@@ -83,6 +104,7 @@ const actions = new Counter('actions'); // intended actions, tag intent
 // network error or timeout) and phase.
 const unexpected = new Counter('unexpected_status');
 const converted = new Counter('return_converted_to_borrow'); // a return with no own loan to return
+const deleteConverted = new Counter('delete_converted_to_add'); // a delete with no own book to delete
 const relogins = new Counter('relogins'); // ramp mode: a login after a 401 (the session was lost), tag step
 const skipped = new Counter('skipped_actions'); // e.g. a return with no active loan anywhere
 
@@ -105,6 +127,7 @@ for (const [action, statuses] of Object.entries(EXPECT)) {
 }
 for (const [intent] of MIX) keep(`actions{phase:hold,intent:${intent}}`, 'count>=0');
 keep('return_converted_to_borrow{phase:hold}', 'count>=0');
+keep('delete_converted_to_add{phase:hold}', 'count>=0');
 // k6 keeps a sub-metric only if a threshold names it, so list the statuses worth
 // naming. Anything else still shows in errors{...}; level.jq reports it as "other".
 const STATUSES = [0, 400, 401, 403, 404, 405, 408, 409, 413, 422, 429, 500, 502, 503, 504];
@@ -250,8 +273,9 @@ const json = (res, path) => {
 };
 
 // State one VU keeps across sessions.
+// `loans`, `books`: ids of the loans borrowed and the books added by this VU.
 // `cursors`: the last next_cursor of each list (PAGING=cursor).
-const vu = { loggedIn: false, everLoggedIn: false, ready: false, loans: [], cursors: {} };
+const vu = { loggedIn: false, everLoggedIn: false, ready: false, loans: [], books: [], cursors: {} };
 
 function startSession() {
   const res = request('POST', '/api/auth/login', { username: c.ADMIN_USER, password: c.ADMIN_PASSWORD }, 'login');
@@ -288,6 +312,10 @@ const ACTIONS = {
     // A word from the seeded titles or authors, or one whole seeded title.
     const q = Math.random() < 0.6 ? c.pick(c.SEARCH_WORDS) : c.titleOf(c.rand(SEED_BOOKS));
     get(`/api/books?q=${encodeURIComponent(q)}&per_page=${PER_PAGE}`, 'search_books');
+  },
+  browse_available(d) {
+    // availability=available: the snake_case value of the Availability enum.
+    browse('books:available', '/api/books?availability=available', d.books, 'browse_available');
   },
   open_book(d) {
     get(`/api/books/${1 + c.rand(d.books)}`, 'open_book');
@@ -326,13 +354,24 @@ const ACTIONS = {
     }, 'edit_book');
   },
   add_book() {
-    request('POST', '/api/books', {
+    const res = request('POST', '/api/books', {
       title: `${c.pick(c.SEARCH_WORDS)} ${c.pick(c.SEARCH_WORDS)} ${c.rand(1e6)}`,
       author: `${c.pick(c.SEARCH_WORDS)} ${c.pick(c.SEARCH_WORDS)}`,
       isbn: c.randomIsbn(),
       published_year: 1900 + c.rand(126),
       total_copies: 1 + c.rand(5),
     }, 'add_book');
+    if (res.status === 201) vu.books.push(json(res, 'id'));
+  },
+  delete_book() {
+    // Only a book this VU added itself. With none left, add one instead.
+    const id = vu.books.pop();
+    if (id === undefined) {
+      deleteConverted.add(1, { phase: phase() });
+      this.add_book();
+      return;
+    }
+    request('DELETE', `/api/books/${id}`, null, 'delete_book');
   },
   add_member() {
     const n = `${exec.vu.idInTest}-${Date.now()}-${c.rand(1e9)}`;

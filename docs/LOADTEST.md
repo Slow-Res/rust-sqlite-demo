@@ -192,12 +192,16 @@ summaries state the row counts at the start and the end.
 
 ## The action mix
 
-A user action is an intent. Each is picked by these shares:
+A user action is an intent. `MIX` (see "Overrides") picks the table. `MIX=nosearch`, the
+default, has no book search: book search sorts every match by title and counts them
+exactly, so it grows with the data and was about 80% of the Postgres time. Its 15% goes
+to one more read, browsing the available books, and one more write, deleting a book.
+Each action is picked by these shares:
 
 | Kind | Action | Share |
 |---|---|---|
 | read | browse books: the next page, or page 1 (see "Browsing and paging") | 20% |
-| read | search books (a word from seeded titles/authors, or one whole seeded title) | 15% |
+| read | browse available books (`GET /api/books?availability=available`, same next-page browsing, its own cursor) | 11% |
 | read | open a random book | 10% |
 | read | list members (next page or page 1), or open a member | 8% |
 | read | list loans (active, returned or all; next page or page 1) | 7% |
@@ -205,10 +209,16 @@ A user action is an intent. Each is picked by these shares:
 | write | return a loan | 13% |
 | write | edit a book | 5% |
 | write | add a book | 4% |
+| write | delete a book | 4% |
 | write | add a member | 3% |
 | write | edit a member | 2% |
 
-So 60% of the actions are reads and 40% writes. An edit first reads the record
+`MIX=search` restores the earlier mix exactly, so earlier runs stay reproducible: no
+browse available and no delete book, and instead search books (a word from seeded
+titles/authors, or one whole seeded title) at 15%. In that mix 60% of the actions are
+reads and 40% writes.
+
+In the default mix 56% of the actions are reads and 44% writes. An edit first reads the record
 (`edit_book_get`, `edit_member_get`), a supporting request. A return only ever returns a
 loan from the user's **own stack** of loans it borrowed itself; it never takes loans from
 other users, so users do not fight over loans and the number of active loans stays
@@ -219,10 +229,19 @@ summary also prints each level's starting `active_loans`, and the real split of 
 requests next to the intended split of the actions. The edits keep the copies, ISBN and email, so they
 cannot clash with other data (the API has no version column; a PUT replaces the record).
 
+A delete only ever deletes a book from the user's **own list** of books it added itself
+(`add_book` remembers the id of every 201). Add (4%) and delete (4%) balance, so the books
+table keeps about the same size during a ramp; in the earlier runs it grew from 50,000 to
+144,000 books and every step had more data than the one before. If the list is empty, the
+delete becomes an add and is counted as `delete_converted_to_add` (the summary prints
+it per level when the mix has deletes). A delete answers 204, or 409 if another user has
+borrowed the book in the meantime (`book_has_active_loans`); the book then stays, and
+the id is dropped from the list. 404 is an error.
+
 ### Browsing and paging
 
 `PAGING=cursor` (the default) makes browsing look like a user paging through a list.
-For `browse_books`, `list_members` and `list_loans` (one cursor per status) each VU keeps
+For `browse_books`, `browse_available`, `list_members` and `list_loans` (one cursor per status) each VU keeps
 the `next_cursor` of its last answer for that list. With probability 0.75, if it has a
 cursor, it asks for the next page (`?after=<cursor>`); otherwise it asks for page 1, which
 resets the cursor (and so does the last page, whose `next_cursor` is null). Every page
@@ -233,8 +252,8 @@ costs about the same as page 1, because the API pages by keyset (see
 `OFFSET` reaches about 50,000 rows deep. Use it to reproduce earlier runs; their numbers
 are not comparable with cursor runs, because a random deep page is far more expensive,
 above all on Postgres. The summary header names the paging (`summary.json` has `paging`;
-older summaries have none and were run with offset). The action mix and the 40/60
-write/read split are the same in both.
+older summaries have none and were run with offset). The action mix and its write/read
+split are the same in both.
 
 Every request is tagged `action:<name>`, `kind:read|write|auth` and
 `phase:ramp|hold|post`. Login, `GET /api/auth/me` and logout are `kind:auth` and count
@@ -253,12 +272,13 @@ the action does not expect. Each action has an explicit list (`EXPECT` in
 |---|---|
 | login, me | 200 |
 | logout | 204 |
-| browse_books, search_books, open_book, list_members, open_member, list_loans | 200 |
+| browse_books, browse_available, search_books, open_book, list_members, open_member, list_loans | 200 |
 | borrow | 201, or 409 (no copies left, or the member is at the 5-loan limit) |
 | return | 200, or 409 (already returned; not expected, since only the user's own loans are returned) |
 | edit_book_get, edit_member_get | 200 |
 | edit_book, edit_member | 200 |
 | add_book | 201, or 409 (duplicate ISBN) |
+| delete_book | 204, or 409 (another user borrowed the book); 404 is an error |
 | add_member | 201 |
 
 A `Rate` metric counts the errors and `responseCallback` makes k6's own `http_req_failed`
@@ -281,7 +301,7 @@ users: a 10 s ramp up by STEP, then a hold for the rest of the step.
 **The workload is the same** (the same mix, think times and data as `users`) with one
 difference: **each user logs in once, when it starts, and keeps the session for the whole
 run.** There is no logout and no re-login between sessions; `me`, `login` and `logout`
-leave the steady loop, and the 40% write / 60% read mix of the actions is unchanged. This is
+leave the steady loop, and the mix of the actions (`MIX`) is unchanged. This is
 how real users behave (one login a day), and it stops the simulated users from re-running
 Argon2 about every 90 s, which spends CPU that real traffic would not. New users still log
 in as they arrive: about STEP per step, inside the 10 s ramp (that is why a step's p95 is
@@ -394,6 +414,7 @@ Environment overrides (defaults in brackets):
 | `SEED_VUS` (16) | k6 VUs that seed |
 | `SESSION_POOL` (50) | sessions logged in at setup in the rps model |
 | `PAGING` (`cursor`) | `cursor`: "next page" browsing with `after`; `offset`: random deep `page=N`. See "Browsing and paging" |
+| `MIX` (`nosearch`) | `nosearch`: no book search, browse available (11%) and delete book (4%) instead; `search`: the earlier mix with `search_books` (15%). See "The action mix". The summary header names it (`summary.json` has `mix`; older summaries have none and were run with `search`) |
 | `NODE_CPUS` (6,7), `CENTRAL_CPUS` (8-13), `K6_CPUS` (0-3) | core sets; they may not overlap or include 14-15 |
 | `PREFIX` (`lt-`) | name prefix of every resource of one box (compose projects, containers, networks, volumes, `loadtest/results/.state-<PREFIX>`); must start with `lt-` and end with `-`, e.g. `lt-pg-`. `down` removes only that prefix. See "Two boxes in parallel" |
 | `LT_MODE` (`web`) | `web` or `node`, see Modes |
