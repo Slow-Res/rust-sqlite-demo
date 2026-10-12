@@ -17,3 +17,5 @@ def cells: [
 def row: "| " + (cells | map(n) | join(" | ")) + " |";
 def head: ["users", "req/s", "p50 ms", "p95 ms", "p99 ms", "err %", "box CPU % of 200 (avg; per container)", "peak MiB per container", "k6 CPU %", "CPU MHz avg / min", "clock", "restarts / OOM", "re-logins", "result"];
 def header: "| " + (head | join(" | ")) + " |\n|" + (head | map("---") | join("|")) + "|";
+# The warm-up object (ramp-warmup.jq) as one line, printed before the table.
+def warmup_line: "warm-up: \(.warmup_s) s (unjudged): \(.req_per_s | n) req/s, p95 \(.p95 | n) ms, err \(.error_pct | n)%, box CPU \(.box_cpu_pct_of_200.avg | n)% of 200, \(.logins | n) logins";

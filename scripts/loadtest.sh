@@ -10,7 +10,7 @@
 #   scripts/loadtest.sh up
 #   scripts/loadtest.sh users N | rps R
 #   scripts/loadtest.sh search users|rps [START] [FACTOR]
-#   scripts/loadtest.sh ramp [START] [STEP] [STEP_S]
+#   scripts/loadtest.sh ramp [START] [STEP] [STEP_S]     (WARMUP_S=120: an unjudged warm-up first)
 #   scripts/loadtest.sh clockcheck
 #   scripts/loadtest.sh down
 set -euo pipefail
@@ -86,6 +86,9 @@ if [ -n "$DB_POOL" ]; then export DATABASE_MAX_CONNECTIONS="$DB_POOL"; else unse
 DRAIN_TIMEOUT_S="${DRAIN_TIMEOUT_S:-900}"
 MAX_LEVEL="${MAX_LEVEL:-100000}"   # the search gives up above this
 MAX_USERS="${MAX_USERS:-5000}"     # ramp stops here if no step has failed
+# ramp: WARMUP_S seconds of unjudged warm-up before step 0 (users sign in gradually, then hold START); 0 = none.
+WARMUP_S="${WARMUP_S:-0}"
+[[ $WARMUP_S == 0 || ( $WARMUP_S =~ ^[1-9][0-9]*$ && $WARMUP_S -ge 30 ) ]] || { echo "LOADTEST: usage: WARMUP_S must be 0 (no warm-up) or an integer of at least 30 seconds (got '$WARMUP_S')" >&2; exit 2; }
 RAMP_UP_S=10                       # ramp: each step ramps up over this long, then holds
 RAMP_EVAL_DELAY_S=10               # ramp: a step is read this long after it ended (requests still in flight)
 
@@ -777,14 +780,22 @@ cmd_search() {
 
 # --------------------------------------------------------------------- ramp
 
-# The k6 REST API's view of step $1, as a document like k6's summary (.metrics),
-# or fail. $2 is k6's address.
+# The k6 REST API's view of step $1 (a number, or warmup), as a document like k6's
+# summary (.metrics), or fail. $2 is k6's address. The warm-up has no re-login metric
+# but a login counter.
 k6_live_doc() {
-  local k=$1 addr=$2 name
-  for name in http_req_duration http_req_failed http_reqs relogins; do
-    curl -fsS --max-time 5 "http://$addr:6565/v1/metrics/$name%7Bstep%3A$k%7D" || return 1
-    echo
-  done | jq -s 'map(.data | {key: .id, value: {values: .attributes.sample, tainted: .attributes.tainted}}) | {metrics: from_entries}'
+  local k=$1 addr=$2 name names=(http_req_duration http_req_failed http_reqs relogins)
+  [ "$k" != warmup ] || names=(http_req_duration http_req_failed http_reqs)
+  {
+    for name in "${names[@]}"; do
+      curl -fsS --max-time 5 "http://$addr:6565/v1/metrics/$name%7Bstep%3A$k%7D" || return 1
+      echo
+    done
+    if [ "$k" = warmup ]; then
+      curl -fsS --max-time 5 "http://$addr:6565/v1/metrics/warmup_logins" || return 1
+      echo
+    fi
+  } | jq -s 'map(.data | {key: .id, value: {values: .attributes.sample, tainted: .attributes.tainted}}) | {metrics: from_entries}'
 }
 
 # ramp_steps <k6 doc file> <from> <to> <live|final>: the step objects, as a JSON array.
@@ -794,11 +805,20 @@ ramp_steps() {
   local doc=$1 from=$2 to=$3 source=$4 dir=$RAMP_DIR
   jq -cR 'fromjson? | select(.)' "$dir/samples.jsonl" >"$WORK/r.samples"
   jq -cR 'fromjson? | select(.)' "$dir/events.jsonl" >"$WORK/r.events"
-  jq -n --slurpfile k6 "$doc" --slurpfile samples "$WORK/r.samples" --slurpfile events "$WORK/r.events" \
+  jq -n -L loadtest --slurpfile k6 "$doc" --slurpfile samples "$WORK/r.samples" --slurpfile events "$WORK/r.events" \
     --arg prefix "$PREFIX" --argjson before "$RAMP_STATE_BEFORE" --argjson t0 "$RAMP_T0" --argjson step_s "$RAMP_STEP_S" \
     --argjson start "$RAMP_START" --argjson step_users "$RAMP_STEP" --argjson from "$from" --argjson to "$to" \
     --argjson ncont "${#NODE_CONTAINERS[@]}" --argjson p95_limit "$P95_MS" --argjson p99_limit "$P99_MS" --argjson err_limit "$ERR_PCT" \
     --argjson clock "$RUN_CLOCK" --arg source "$source" -f loadtest/ramp-steps.jq
+}
+
+# ramp_warmup <k6 doc file> <scenario start>: the warm-up object (loadtest/ramp-warmup.jq).
+ramp_warmup() {
+  local doc=$1 t0=$2 dir=$RAMP_DIR
+  jq -cR 'fromjson? | select(.)' "$dir/samples.jsonl" >"$WORK/r.samples"
+  jq -cn -L loadtest --slurpfile k6 "$doc" --slurpfile samples "$WORK/r.samples" --arg prefix "$PREFIX" \
+    --argjson t0 "$t0" --argjson warmup_s "$WARMUP_S" --argjson start "$RAMP_START" --argjson ncont "${#NODE_CONTAINERS[@]}" \
+    -f loadtest/ramp-warmup.jq
 }
 
 cmd_ramp() {
@@ -830,9 +850,14 @@ cmd_ramp() {
   docker events --filter type=container --filter event=die --filter event=oom "${filters[@]}" --format '{{json .}}' >"$dir/events.jsonl" 2>/dev/null &
   EVENTS_PID=$!
 
-  printf '\n==> ramp: %s users, +%s every %ss up to %s users (%s steps), until a step fails\n' "$start" "$step" "$step_s" "$MAX_USERS" "$nsteps"
+  local warm_args=() warm_note=
+  if ((WARMUP_S > 0)); then
+    warm_args=(-e WARMUP_S="$WARMUP_S")
+    warm_note="warm-up $WARMUP_S s (unjudged), then "
+  fi
+  printf '\n==> ramp: %s%s users, +%s every %ss up to %s users (%s steps), until a step fails\n' "$warm_note" "$start" "$step" "$step_s" "$MAX_USERS" "$nsteps"
   K6_ARGS=(--address 0.0.0.0:6565)
-  k6_run "$dir" user.js -e MODE=ramp -e START="$start" -e STEP="$step" -e STEP_S="$step_s" -e MAX_USERS="$MAX_USERS" \
+  k6_run "$dir" user.js -e MODE=ramp -e START="$start" -e STEP="$step" -e STEP_S="$step_s" -e MAX_USERS="$MAX_USERS" "${warm_args[@]}" \
     -e P99_MS="$P99_MS" -e SEED_BOOKS="$SEED_BOOKS" -e PAGING="$PAGING" -e MIX="$MIX" >"$dir/k6.log" 2>&1 &
   local k6_pid=$!
   K6_ARGS=()
@@ -843,13 +868,29 @@ cmd_ramp() {
     ((SECONDS < deadline)) || die "k6 did not start the ramp within 600 s (log: $dir/k6.log)"
     sleep 1
   done
-  RAMP_T0=$(awk -v ms="$setup_ms" 'BEGIN { printf "%.3f", ms / 1000 }')
+  # The scenario starts with the warm-up; RAMP_T0 is where the stairs (step 0) start.
+  local warm_t0
+  warm_t0=$(awk -v ms="$setup_ms" 'BEGIN { printf "%.3f", ms / 1000 }')
+  RAMP_T0=$(awk -v t="$warm_t0" -v w="$WARMUP_S" 'BEGIN { printf "%.3f", t + w }')
   local k6_ip
   k6_ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$K6_NETWORK\").IPAddress}}" "${PREFIX}k6-$$") || die "cannot find k6's address"
 
   # Evaluate each step RAMP_EVAL_DELAY_S after it ended, from k6's REST API; stop
   # k6 at the first step that fails the pass rule. Requests still in flight at
   # that moment are missed, so the report is made from k6's end-of-test summary.
+  # The warm-up is read once like a step, but never judged: it prints its own line before
+  # the table and never stops the ramp.
+  local warm_doc="$WORK/r.warm.json"
+  if ((WARMUP_S > 0)); then
+    while awk -v n="$(now)" -v d="$RAMP_T0" -v e="$RAMP_EVAL_DELAY_S" 'BEGIN { exit !(n < d + e) }'; do
+      kill -0 "$k6_pid" 2>/dev/null || break
+      sleep 1
+    done
+    if k6_live_doc warmup "$k6_ip" >"$warm_doc" 2>/dev/null; then
+      echo
+      jq -r -L loadtest 'include "ramp-lib"; warmup_line' <<<"$(ramp_warmup "$warm_doc" "$warm_t0")"
+    fi
+  fi
   echo
   jq -rn -L loadtest 'include "ramp-lib"; header'
   local k=0 live_fail="" stop=null live_doc="$WORK/r.live.json" live_steps step_end sigterm_at exit_at
@@ -902,13 +943,18 @@ cmd_ramp() {
   local printed=$k
   [ -z "$live_fail" ] || printed=$((k + 1))
   sed -n "$((printed + 1)),\$p" "$dir/steps.jsonl" | while IFS= read -r line; do jq -r -L loadtest -f loadtest/ramp-line.jq <<<"$line"; done
+  local warmup=null
+  if ((WARMUP_S > 0)); then
+    warmup=$(ramp_warmup "$dir/k6-summary.json" "$warm_t0") || die "could not compute the warm-up (loadtest/ramp-warmup.jq; inputs in $dir)"
+    jq . <<<"$warmup" >"$dir/warmup.json"
+  fi
   local out
   out=$(jq -s -L loadtest --arg db "$LT_DB" --arg paging "$PAGING" --arg mix "$MIX" --arg db_pool "$DB_POOL" --arg pg_work_mem "$PG_WORK_MEM" --arg node_cpus "$NODE_CPUS" --arg k6_cpus "$K6_CPUS" \
     --arg nginx_mem "$NGINX_MEM" --arg web_mem "$WEB_MEM" --arg pg_mem "$PG_MEM" \
     --arg pg_shared "${PG_SHARED_BUFFERS:-}" --arg pg_cache "${PG_EFFECTIVE_CACHE_SIZE:-}" \
     --argjson start "$start" --argjson step_users "$step" --argjson step_s "$step_s" --argjson max_users "$MAX_USERS" \
     --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson stop "$stop" --argjson live_fail "${live_fail:-null}" \
-    --argjson clock "$RUN_CLOCK" --argjson cool "$RUN_COOL" \
+    --argjson clock "$RUN_CLOCK" --argjson cool "$RUN_COOL" --argjson warmup "$warmup" \
     -f loadtest/ramp-summary.jq "$dir/steps.jsonl") || die "could not write the summary (loadtest/ramp-summary.jq)"
   jq -r .md <<<"$out" >"$dir/summary.md"
   echo

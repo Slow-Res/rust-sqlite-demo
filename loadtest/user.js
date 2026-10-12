@@ -8,13 +8,16 @@
 //                        and each VU uses one of them.
 //   MODE=ramp  START, STEP, STEP_S, MAX_USERS  stairs of ramping-vus: START users,
 //                        then STEP more every STEP_S seconds (a 10 s ramp up, then
-//                        a hold). Each user logs in once, when it starts, and keeps
+//                        a hold). WARMUP_S (0 = none) puts an unjudged warm-up before
+//                        the stairs: the users sign in gradually over its first half and
+//                        hold START for the second; its requests are tagged step:warmup.
+//                        Each user logs in once, when it starts, and keeps
 //                        the session for the whole run (no logout, no new login; a
 //                        401 means the session was lost and it logs in again, counted
 //                        as relogins). One action then think time, same mix as
 //                        MODE=users. Every request is
-//                        tagged step:<k> (k = elapsed / STEP_S, taken when the request
-//                        starts) and scripts/loadtest.sh ramp reads the numbers per step.
+//                        tagged step:<k> (k = (elapsed - WARMUP_S) / STEP_S, taken when the
+//                        request starts) and scripts/loadtest.sh ramp reads the numbers per step.
 // Browsing (browse_books, list_members, list_loans) follows PAGING:
 //   PAGING=cursor  (default) "next page" browsing: each VU keeps the last next_cursor
 //                        of each list; with probability 0.75, if it has one, it asks for
@@ -43,6 +46,8 @@ const START = Number(__ENV.START || 100);
 const STEP = Number(__ENV.STEP || 100);
 const STEP_S = Number(__ENV.STEP_S || 60);
 const MAX_USERS = Number(__ENV.MAX_USERS || 5000);
+const WARMUP_S = Number(__ENV.WARMUP_S || 0);
+if (!Number.isInteger(WARMUP_S) || (WARMUP_S !== 0 && WARMUP_S < 30)) throw new Error(`WARMUP_S must be 0 or an integer of at least 30 (got '${__ENV.WARMUP_S}')`);
 const STEP_RAMP_S = 10; // each step ramps up over this long, then holds
 const P99_MS = Number(__ENV.P99_MS || 1000);
 const SESSION_POOL = Number(__ENV.SESSION_POOL || 50);
@@ -106,6 +111,7 @@ const unexpected = new Counter('unexpected_status');
 const converted = new Counter('return_converted_to_borrow'); // a return with no own loan to return
 const deleteConverted = new Counter('delete_converted_to_add'); // a delete with no own book to delete
 const relogins = new Counter('relogins'); // ramp mode: a login after a 401 (the session was lost), tag step
+const warmupLogins = MODE === 'ramp' && WARMUP_S > 0 ? new Counter('warmup_logins') : null; // ramp mode, WARMUP_S > 0: logins that started in the warm-up
 const skipped = new Counter('skipped_actions'); // e.g. a return with no active loan anywhere
 
 // Thresholds that never fail. They exist so k6 keeps hold-only sub-metrics for
@@ -149,8 +155,21 @@ if (MODE === 'ramp') {
     stepThresholds[`http_reqs{step:${k}}`] = ['count>=0'];
     stepThresholds[`relogins{step:${k}}`] = ['count>=0'];
   }
+  // The warm-up is never judged: no p99 limit, only the numbers the runner reports.
+  if (WARMUP_S > 0) {
+    stepThresholds['http_req_duration{step:warmup}'] = ['p(95)>=0'];
+    stepThresholds['http_req_failed{step:warmup}'] = ['rate>=0'];
+    stepThresholds['http_reqs{step:warmup}'] = ['count>=0'];
+    stepThresholds['warmup_logins'] = ['count>=0'];
+  }
 }
+// Warm-up: 0 -> START over the first half (users sign in gradually, not all at
+// once), then hold START until WARMUP_S. The stairs follow, step 0 = START.
 const stairs = [];
+if (WARMUP_S > 0) {
+  const half = Math.floor(WARMUP_S / 2);
+  stairs.push({ target: START, duration: `${half}s` }, { target: START, duration: `${WARMUP_S - half}s` });
+}
 for (let k = 0; k < STEPS; k++) {
   stairs.push({ target: START + k * STEP, duration: `${STEP_RAMP_S}s` }, { target: START + k * STEP, duration: `${STEP_S - STEP_RAMP_S}s` });
 }
@@ -237,9 +256,10 @@ export function setup() {
   return data;
 }
 
-// Ramp mode: the step the request starts in.
+// Ramp mode: the step the request starts in, or 'warmup' before the stairs.
 function stepOf() {
-  return Math.floor((Date.now() - exec.scenario.startTime) / (STEP_S * 1000));
+  const elapsed = Date.now() - exec.scenario.startTime - WARMUP_S * 1000;
+  return WARMUP_S > 0 && elapsed < 0 ? 'warmup' : Math.floor(elapsed / (STEP_S * 1000));
 }
 
 function phase() {
@@ -278,6 +298,7 @@ const json = (res, path) => {
 const vu = { loggedIn: false, everLoggedIn: false, ready: false, loans: [], books: [], cursors: {} };
 
 function startSession() {
+  if (warmupLogins && stepOf() === 'warmup') warmupLogins.add(1);
   const res = request('POST', '/api/auth/login', { username: c.ADMIN_USER, password: c.ADMIN_PASSWORD }, 'login');
   vu.loggedIn = res.status === 200;
   if (vu.loggedIn) get('/api/auth/me', 'me');

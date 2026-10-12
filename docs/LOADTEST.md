@@ -316,6 +316,21 @@ whole run. The pass rule is the same as below with **errors < 2%** in this mode 
 overrides it, 2 by default only here); restarts and OOM kills are recorded per step but are
 not part of the ramp's rule.
 
+**Warm-up (`WARMUP_S`).** A ramp that starts high (START 3000) would log in 3,000 users in
+10 s, which is a burst of Argon2 hashes on a few hashing permits, and step 0 would fail for
+that and not for the steady load. `WARMUP_S=N` (an integer of at least 30; default 0 = none)
+puts an unjudged warm-up before the stairs: the users sign in gradually, 0 to START over the
+first N/2 s, and hold START until N s. Then the stairs run as above, step 0 = START (judged),
+and every step's window is counted from the end of the warm-up. The warm-up's requests are
+tagged `step:warmup`, belong to no step and are never PASS or FAIL; it never stops the ramp.
+Its numbers (req/s, p95, error %, box CPU, logins started) are printed as one line before the
+table, and `summary.md` shows it after `warm-up: N s (unjudged)` in the header and again above
+the table; `warmup.json` in the results directory has the same numbers.
+
+```
+WARMUP_S=120 scripts/loadtest.sh ramp 3000 100 30   # 2 min warm-up, then 3000 users, +100 every 30 s
+```
+
 **Early stop.** Each step is read 10 s after it ended (so requests that took long have
 finished) from k6's REST API (`--address`, reached through the k6 container's address on
 the box network). The steps' sub-metrics are declared as thresholds that never abort. The
@@ -340,7 +355,7 @@ average and minimum per step. When two boxes run side by side, a frequency drop 
 they slowed each other through the laptop's shared power budget. Short steps have few samples.
 
 **Output**, in `loadtest/results/<timestamp>-<db>-ramp[-<prefix>]/`: `steps.jsonl` (one
-object per step), `summary.md` (a header naming the stack, the box, the memory split and the
+object per step; `warmup.json` too with `WARMUP_S`), `summary.md` (a header naming the stack, the box, the memory split and the
 rule, with "each user logs in once and keeps the session", then one row per step: users,
 req/s, p50/p95/p99, error %, box CPU with its per-container split, peak memory per
 container, k6 CPU, average / minimum frequency in MHz, clock (see "Reproducible runs"),
@@ -409,6 +424,7 @@ Environment overrides (defaults in brackets):
 | `RAMP` (60), `HOLD` (300) | seconds of ramp-up and of measured hold |
 | `P95_MS` (500), `P99_MS` (1000), `ERR_PCT` (1; 2 for `ramp`) | pass-rule limits; make them impossible to see the fail path |
 | `MAX_USERS` (5000) | `ramp` stops here if no step failed |
+| `WARMUP_S` (0) | `ramp`: seconds of unjudged warm-up before step 0 (0 to START over the first half, then a hold), 0 or an integer of at least 30. Example: `WARMUP_S=120 scripts/loadtest.sh ramp 3000 100 30`. See "Step ramp" |
 | `NGINX_MEM` (256m), `WEB_MEM` (3840m; 1024m with Postgres), `PG_MEM` (2816m) | memory split of the box; must add up to 4096 MiB. See "`LT_DB`" |
 | `DB_POOL` (empty: the app's 10) | the web app's database pool size, passed as `DATABASE_MAX_CONNECTIONS` (both backends); web mode only. A positive integer. With Postgres, `max_connections` stays 50 up to a pool of 30 and becomes `DB_POOL` + 20 above that. The summary header and `summary.json` (`db_pool`) record it; empty is recorded as the default (10) |
 | `PG_WORK_MEM` (4MB) | Postgres' `work_mem`, an integer with a unit `kB`, `MB` or `GB`; applies with `LT_DB=postgres`. Recorded in the summary header and `summary.json` (`pg_work_mem`). Each query step of each connection may use it, so a larger pool multiplies it; stay inside `PG_MEM` |

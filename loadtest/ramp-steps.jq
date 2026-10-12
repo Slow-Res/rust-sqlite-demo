@@ -2,24 +2,17 @@
 # --argjson, --slurpfile): k6 (a document with .metrics: the end-of-test summary,
 # or the live values read from k6's REST API), samples and events (JSON lines of
 # scripts/loadtest.sh), before (container state before the run), prefix, t0 (epoch
-# seconds when k6's scenario started), step_s, start, step_users, from, to, ncont
-# (box containers), the p95/p99/err limits, clock (the box cores' clock lock, JSON of
-# scripts/loadtest.sh clock_state, or null) and source (live|final).
+# seconds when the stairs start: k6's scenario start plus the warm-up), step_s, start,
+# step_users, from, to, ncont (box containers), the p95/p99/err limits, clock (the box
+# cores' clock lock, JSON of scripts/loadtest.sh clock_state, or null) and source
+# (live|final).
 # Step k covers [t0 + k*step_s, t0 + (k+1)*step_s) and the requests tagged step:k.
 # throttle is the growth of the box cores' (summed) and the package's throttle counters
 # over the step; clock_ok is false when the clock is locked and the step ran below 95% of
 # it, or when anything throttled (null: unlocked and nothing throttled, so not known).
 # The REST API has no p99; there the step's metric has a p99 threshold and its
 # `tainted` flag says whether the p99 is over the limit.
-def r1: if . == null then null else (. * 10 | round) / 10 end;
-def r2: if . == null then null else (. * 100 | round) / 100 end;
-def mib:
-  capture("^(?<n>[0-9.]+)\\s*(?<u>[A-Za-z]+)") as $x
-  | ($x.n | tonumber) * ({"B": 1, "KiB": 1024, "kB": 1000, "MiB": 1048576, "MB": 1000000, "GiB": 1073741824, "GB": 1000000000}[$x.u] // 1) / 1048576;
-def short: ltrimstr("/") | sub("^" + $prefix + "web-"; "") | sub("-1$"; "");
-def is_box: .Name | startswith($prefix + "web-");
-def avg: if length == 0 then null else add / length end;
-def rmap: map({key: (.name | short), value: .restarts}) | from_entries;
+include "ramp-util";
 
 $k6[0].metrics as $m
 | ($before | rmap) as $r0
