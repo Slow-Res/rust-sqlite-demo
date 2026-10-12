@@ -175,10 +175,39 @@ fn push_filter(builder: &mut QueryBuilder<Sqlite>, filter: &BookFilter) {
     }
 }
 
+/// The FTS5 expression when `filter` is a word search and nothing else, so the
+/// count can come from the index alone. Must match what `push_filter` binds.
+fn fts_only_expression(filter: &BookFilter) -> Option<String> {
+    if !matches!(filter.availability, Availability::All) {
+        return None;
+    }
+    let q = filter.q.as_deref()?;
+    let words = search_words(q);
+    if words.is_empty() {
+        return None;
+    }
+    Some(fts_expression(&words, isbn_prefix(q).as_deref()))
+}
+
 /// Number of books matching `filter`.
 async fn count_books(pool: &SqlitePool, filter: &BookFilter) -> Result<u64, RepoError> {
-    let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM books b");
-    push_filter(&mut count, filter);
+    let mut count = match fts_only_expression(filter) {
+        // The join in `push_filter` looks up every matching book row only to
+        // count it. `books_fts` is kept in step with `books` by the triggers,
+        // so its matching rows are exactly the matching books.
+        Some(expr) => {
+            let mut count = QueryBuilder::<Sqlite>::new(
+                "SELECT COUNT(*) FROM books_fts WHERE books_fts MATCH ",
+            );
+            count.push_bind(expr);
+            count
+        }
+        None => {
+            let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM books b");
+            push_filter(&mut count, filter);
+            count
+        }
+    };
     let total: i64 = count.build_query_scalar().fetch_one(pool).await?;
     u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))
 }
