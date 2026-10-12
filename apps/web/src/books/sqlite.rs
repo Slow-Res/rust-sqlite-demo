@@ -9,7 +9,10 @@ use library_shared::Availability;
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use super::domain::BookFields;
-use super::repo::{BookFilter, BookRecord, BookRepository, DeleteBookOutcome, UpdateBookOutcome};
+use super::repo::{
+    AVAILABLE_TOTAL, BookFilter, BookRecord, BookRepository, DeleteBookOutcome, ON_LOAN_TOTAL,
+    UpdateBookOutcome,
+};
 use crate::count_cache::CountCache;
 use crate::db::{RepoError, escape_like, from_timestamp, isbn_prefix, search_words, to_timestamp};
 use crate::pagination::PageParams;
@@ -191,6 +194,16 @@ fn fts_only_expression(filter: &BookFilter) -> Option<String> {
 
 /// Number of books matching `filter`.
 async fn count_books(pool: &SqlitePool, filter: &BookFilter) -> Result<u64, RepoError> {
+    // An availability filter without a search: count the active loans once. The
+    // predicate in `push_filter` runs a subquery per book, over the whole table.
+    if filter.counts_from_loans() {
+        let sql = match filter.availability {
+            Availability::OnLoan => ON_LOAN_TOTAL,
+            _ => AVAILABLE_TOTAL,
+        };
+        let total: i64 = sqlx::query_scalar(sql).fetch_one(pool).await?;
+        return u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()));
+    }
     let mut count = match fts_only_expression(filter) {
         // The join in `push_filter` looks up every matching book row only to
         // count it. `books_fts` is kept in step with `books` by the triggers,

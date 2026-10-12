@@ -40,6 +40,23 @@ impl From<BookRecord> for Book {
     }
 }
 
+// The totals of an availability-only filter, from the active loans. The per-book
+// predicate (`total_copies - active loans > 0`) is a correlated subquery for every
+// book: 1.7 s per request at 500k books. These two group the active loans once
+// (partial index `idx_loans_active_book`) and give the same number: a book with
+// no active loan is available (`books.total_copies` is at least 1, CHECK), and a
+// book is full when its active loans use every copy. SQL both backends accept.
+
+/// Books with at least one active loan.
+pub const ON_LOAN_TOTAL: &str =
+    "SELECT COUNT(DISTINCT book_id) FROM loans WHERE returned_at IS NULL";
+
+/// Books with at least one free copy: all books minus the full ones.
+pub const AVAILABLE_TOTAL: &str = "SELECT (SELECT COUNT(*) FROM books) - \
+    (SELECT COUNT(*) FROM (SELECT book_id, COUNT(*) AS n FROM loans \
+     WHERE returned_at IS NULL GROUP BY book_id) a \
+     JOIN books b ON b.id = a.book_id WHERE b.total_copies - a.n <= 0)";
+
 /// Search criteria for the book list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookFilter {
@@ -49,10 +66,24 @@ pub struct BookFilter {
 }
 
 impl BookFilter {
-    /// The count-cache slot for this filter, if its total is cacheable: only the
-    /// unfiltered list (no search, availability All) is.
+    /// The count-cache slot for this filter, if its total is cacheable: the
+    /// unfiltered list, and a list filtered by availability alone (no search).
     pub fn count_key(&self) -> Option<CountKey> {
-        (self.q.is_none() && self.availability == Availability::All).then_some(CountKey::Books)
+        if self.q.is_some() {
+            return None;
+        }
+        Some(match self.availability {
+            Availability::All => CountKey::Books,
+            Availability::Available => CountKey::BooksAvailable,
+            Availability::OnLoan => CountKey::BooksOnLoan,
+        })
+    }
+
+    /// Whether the total can come from the active loans alone: an availability
+    /// filter with no search. Then the adapters count with [`ON_LOAN_TOTAL`] or
+    /// [`AVAILABLE_TOTAL`] instead of a subquery per book.
+    pub fn counts_from_loans(&self) -> bool {
+        self.q.is_none() && self.availability != Availability::All
     }
 }
 

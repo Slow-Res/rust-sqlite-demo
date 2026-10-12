@@ -1,12 +1,15 @@
-//! A short-lived cache for the `total` of the unfiltered list pages.
+//! A short-lived cache for the `total` of the unfiltered list pages (and of the
+//! book list filtered by availability alone).
 //!
 //! Every list request counts the matching rows, and counting the whole table
 //! (50k books, 10k members, 20k+ loans) walks an entire index on every request.
 //! The total of an *unfiltered* list is the same for every caller, so it is
 //! kept for `LIST_COUNT_TTL_MS` (default 1000) and shared. Only totals are
-//! cached: every page of rows is still read from the database, and filtered
-//! or search counts are never cached (the index bounds them). With a TTL of 0
-//! nothing is kept and every request counts.
+//! cached: every page of rows is still read from the database, and search
+//! counts are never cached (the index bounds them). The availability totals of
+//! the book list are cached because they are a scan of the active loans, as
+//! many on every request as there are loans. With a TTL of 0 nothing is kept
+//! and every request counts.
 //!
 //! The price is that `total` may lag behind a write by up to the TTL.
 
@@ -20,13 +23,15 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountKey {
     Books,
+    BooksAvailable,
+    BooksOnLoan,
     Members,
     LoansActive,
     LoansReturned,
     LoansAll,
 }
 
-const KEYS: usize = 5;
+const KEYS: usize = 7;
 
 impl CountKey {
     fn slot(self) -> usize {
@@ -36,6 +41,8 @@ impl CountKey {
             Self::LoansActive => 2,
             Self::LoansReturned => 3,
             Self::LoansAll => 4,
+            Self::BooksAvailable => 5,
+            Self::BooksOnLoan => 6,
         }
     }
 }

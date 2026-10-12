@@ -9,7 +9,10 @@ use library_shared::Availability;
 use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 
 use super::domain::BookFields;
-use super::repo::{BookFilter, BookRecord, BookRepository, DeleteBookOutcome, UpdateBookOutcome};
+use super::repo::{
+    AVAILABLE_TOTAL, BookFilter, BookRecord, BookRepository, DeleteBookOutcome, ON_LOAN_TOTAL,
+    UpdateBookOutcome,
+};
 use crate::count_cache::CountCache;
 use crate::db::{RepoError, escape_like, from_timestamp, isbn_prefix, search_words, to_timestamp};
 use crate::pagination::PageParams;
@@ -173,6 +176,16 @@ fn push_filter(builder: &mut QueryBuilder<Postgres>, filter: &BookFilter) {
 
 /// Number of books matching `filter`.
 async fn count_books(pool: &PgPool, filter: &BookFilter) -> Result<u64, RepoError> {
+    // An availability filter without a search: count the active loans once. The
+    // predicate in `push_filter` runs a subquery per book, over the whole table.
+    if filter.counts_from_loans() {
+        let sql = match filter.availability {
+            Availability::OnLoan => ON_LOAN_TOTAL,
+            _ => AVAILABLE_TOTAL,
+        };
+        let total: i64 = sqlx::query_scalar(sql).fetch_one(pool).await?;
+        return u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()));
+    }
     let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM books b");
     push_filter(&mut count, filter);
     let total: i64 = count.build_query_scalar().fetch_one(pool).await?;

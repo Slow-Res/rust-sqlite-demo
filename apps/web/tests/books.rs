@@ -228,17 +228,31 @@ async fn availability_filter(db: Database) {
     let free = create(&app, &cookie, book("Free")).await;
     let partial = create(&app, &cookie, book("Partial")).await; // 2 copies
     let full = create(&app, &cookie, json!({ "title": "Full", "author": "A", "isbn": null, "published_year": null, "total_copies": 1 })).await;
+    let full_two = create(&app, &cookie, book("Full Two")).await; // 2 copies, both out
     insert_loan(&app, partial["id"].as_i64().unwrap(), false).await;
     insert_loan(&app, full["id"].as_i64().unwrap(), false).await;
-    // A returned loan does not count.
+    insert_loan(&app, full_two["id"].as_i64().unwrap(), false).await;
+    insert_loan(&app, full_two["id"].as_i64().unwrap(), false).await;
+    // A returned loan does not count, not even next to an active one.
     insert_loan(&app, free["id"].as_i64().unwrap(), true).await;
+    insert_loan(&app, partial["id"].as_i64().unwrap(), true).await;
 
+    // The totals come from the active loans, not from the rows of the page, so
+    // they are checked next to the titles. (`total_copies` is at least 1, CHECK,
+    // so a book with no copies at all cannot exist.)
     let (_, _, page) = app.get("/api/books?availability=available", None).await;
     assert_eq!(titles(&page), ["Free", "Partial"]);
+    assert_eq!(page["total"], 2);
     let (_, _, page) = app.get("/api/books?availability=on_loan", None).await;
-    assert_eq!(titles(&page), ["Full", "Partial"]);
-    let (_, _, page) = app.get("/api/books?availability=all", None).await;
+    assert_eq!(titles(&page), ["Full", "Full Two", "Partial"]);
     assert_eq!(page["total"], 3);
+    let (_, _, page) = app.get("/api/books?availability=all", None).await;
+    assert_eq!(page["total"], 4);
+    let (_, _, page) = app
+        .get("/api/books?availability=available&per_page=1&page=2", None)
+        .await;
+    assert_eq!(titles(&page), ["Partial"]);
+    assert_eq!(page["total"], 2, "the total ignores the page");
 
     let (_, _, one) = app
         .get(&format!("/api/books/{}", partial["id"]), None)

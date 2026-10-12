@@ -1,5 +1,6 @@
-//! The list-total cache seen through HTTP: only the total of an unfiltered list
-//! may lag, never the rows, and filtered totals are always exact.
+//! The list-total cache seen through HTTP: only the total of an unfiltered list (or
+//! of the books by availability alone) may lag, never the rows, and search totals
+//! are always exact.
 // Helpers (unlike `#[test]` fns) are not covered by clippy.toml's unwrap allowance.
 #![allow(clippy::unwrap_used)]
 
@@ -46,9 +47,20 @@ async fn the_unfiltered_book_total_may_lag_but_the_rows_and_searches_do_not(db: 
     assert_eq!(len(&all), 2, "the rows are read every time");
     assert_eq!(all["total"], 1, "the total is the cached one");
 
-    // A search is counted for real, and so is a filter on availability.
+    // A search is counted for real.
     assert_eq!(page(&app, "/api/books?q=Dune", &cookie).await["total"], 2);
-    assert_eq!(page(&app, "/api/books?availability=available", &cookie).await["total"], 2);
+    // A filter on availability alone is cached like the unfiltered total; add a
+    // search to it and it is counted for real again.
+    let available = page(&app, "/api/books?availability=available", &cookie).await;
+    assert_eq!((len(&available), &available["total"]), (2, &json!(2)));
+    add_book(&app, &cookie, "Dune Messiah II").await;
+    let available = page(&app, "/api/books?availability=available", &cookie).await;
+    assert_eq!(len(&available), 3, "the rows are read every time");
+    assert_eq!(available["total"], 2, "the total is the cached one");
+    assert_eq!(
+        page(&app, "/api/books?availability=available&q=Dune", &cookie).await["total"],
+        3
+    );
 }
 
 async fn the_unfiltered_member_total_may_lag_but_a_search_total_does_not(db: Database) {
