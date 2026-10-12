@@ -1,0 +1,11 @@
+source "https://rubygems.org"
+
+ruby "~> 4.0.5"
+
+gem "rails", "~> 8.1"
+gem "pg", "~> 1.5"
+gem "puma", ">= 7.0"
+gem "argon2", "~> 2.3"
+
+# No dev or test gems: Rails already brings Minitest and Rack::Test, which the
+# request tests in test/ use.
