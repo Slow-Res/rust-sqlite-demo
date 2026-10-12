@@ -3,7 +3,7 @@
 # nginx_mem, web_mem, pg_mem, pg_shared, pg_cache, start, step_users, step_s,
 # max_users, p95, p99, err, stop (null, or {step, to_sigterm_s, to_exit_s}) and
 # live_fail (the step the live reading failed, or null), paging (cursor|offset), mix (nosearch|search),
-# db_pool (the app's pool size, or "" for its default), pg_work_mem, and clock and cool
+# app (rust|rails) and app_desc (its header text), db_pool (the app's pool size, or "" for its default), pg_work_mem, and clock and cool
 # (the clock lock and the cool-down gate of the run, JSON of scripts/loadtest.sh, or null)
 # and warmup (the warm-up object of ramp-warmup.jq, or null when WARMUP_S is 0).
 include "ramp-lib";
@@ -35,10 +35,11 @@ def why: "p95 \(unit(.p95; "ms")) / p99 \(if .p99 != null then unit(.p99; "ms") 
     result: $result,
     ok: ($hp != null),
     md: ("# Ramp test summary\n\n"
-      + "Box: nginx + Rust + \(if $db == "postgres" then "Postgres" else "SQLite" end), 2 CPUs (cores \($node_cpus)), 4096 MiB (nginx \($nginx_mem), web \($web_mem)\(if $db == "postgres" then ", postgres \($pg_mem); shared_buffers \($pg_shared), effective_cache_size \($pg_cache)" else "" end)). k6 on cores \($k6_cpus). Browsing: \($paging) paging. Mix: \($mix). Pool: \(if $db_pool == "" then "default (10)" else $db_pool end) connections\(if $db == "postgres" then ", Postgres work_mem \($pg_work_mem)" else "" end).\n"
+      + "Box: nginx + \(if $app == "rails" then "Rails" else "Rust" end) + \(if $db == "postgres" then "Postgres" else "SQLite" end), 2 CPUs (cores \($node_cpus)), 4096 MiB (nginx \($nginx_mem), web \($web_mem)\(if $db == "postgres" then ", postgres \($pg_mem); shared_buffers \($pg_shared), effective_cache_size \($pg_cache)" else "" end)). k6 on cores \($k6_cpus). Browsing: \($paging) paging. Mix: \($mix). Pool: \(if $app == "rails" then "one per thread" else "\(if $db_pool == "" then "default (10)" else $db_pool end) connections" end)\(if $db == "postgres" then ", Postgres work_mem \($pg_work_mem)" else "" end).\n"
       + "Ramp: \($start) users, then +\($step_users) every \($step_s) s (a 10 s ramp up, then a hold) up to \($max_users) users, until a step fails. Each user logs in once and keeps the session (no logout; a 401 means a re-login, counted per step). Same action mix and think times as the users model.\n"
       + (if $warmup != null then "warm-up: \($warmup.warmup_s) s (unjudged): the users sign in over the first \($warmup.warmup_s / 2 | floor) s and hold \($start) users until the stairs start; its requests belong to no step and are never PASS or FAIL. Step 0 starts after it.\n" else "" end)
       + "Each step's numbers cover the requests that started in that step, not the whole run. Pass rule per step: p95 < \($p95) ms, p99 < \($p99) ms, errors < \($err)%. Restarts and OOM kills are recorded but are not part of the rule. CPU is of 200% (2 cores); frequency is the current frequency of the box cores sampled every 5 s. The clock column is not part of the rule either: ok = steady (clock locked and the step's average at least 95% of it, no throttling), THROTTLED = a box core or the package throttled during the step, drift N = locked but ran at N MHz on average, - = unlocked and not throttled, so not known.\n"
+      + "app: \($app_desc)\n"
       + run_header($clock; $cool) + "\n"
       + (if $stop != null then "Stopped early: step \($stop.step) failed; k6 got SIGTERM \($stop.to_sigterm_s) s after that step ended and exited \($stop.to_exit_s) s after it. Numbers are from k6's end-of-test summary.\n\n" else "" end)
       + (if $warmup != null then ($warmup | warmup_line) + "\n\n" else "" end)

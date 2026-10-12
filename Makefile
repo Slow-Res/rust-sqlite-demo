@@ -1,4 +1,4 @@
-.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user restore-drill e2e alerts-test loadtest loadtest-up loadtest-down loadtest-image
+.PHONY: setup db dev dev-frontend seed-dev user-dev test lint fmt types sqlx-prepare check images up down reset ps logs psql seed user restore-drill e2e alerts-test loadtest loadtest-up loadtest-down loadtest-image loadtest-rails-image
 
 # One-time developer setup. Tools are not installed for you: missing ones are reported.
 setup: ## Check tools, install npm deps, create the dev database
@@ -68,6 +68,9 @@ images: ## Build the three images (tag :dev)
 
 loadtest-image: ## Build the web image with the Postgres backend (:lt), for the load-test comparison
 	docker build -f deploy/docker/Dockerfile --target web --build-arg WEB_FEATURES=postgres -t sqlite-production/web:lt .
+
+loadtest-rails-image: ## Build the Rails comparison app image (:lt), for LT_APP=rails
+	docker build -f apps/rails/Dockerfile -t library-rails:lt apps/rails
 
 up: images ## Start Postgres, Garage, Prometheus and nodes 1-3 (ports 4001-4003)
 	scripts/cluster.sh up

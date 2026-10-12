@@ -1,0 +1,21 @@
+# LOAD TEST ONLY (scripts/loadtest.sh, LT_APP=rails): layered on loadtest.web.yml and
+# loadtest.web-pg.yml. Swaps the Rust web app for the Rails comparison app (apps/rails,
+# image library-rails:lt, WEB_IMAGE overrides it). It is a drop-in: port 4000, /api/health,
+# DATABASE_URL, COOKIE_SECURE and SESSION_TTL_HOURS as the Rust app; nginx, Postgres, the
+# memory split and the cores are unchanged. The Rust-only variables of loadtest.web.yml are
+# dropped. WEB_CONCURRENCY (Puma workers) and RAILS_MAX_THREADS (threads per worker, and the
+# Active Record pool per worker) come from RAILS_WORKERS and RAILS_THREADS; the runner exports them.
+# LOCAL ONLY secret.
+services:
+  web:
+    environment:
+      NODE_ID: !reset null
+      RUST_LOG: !reset null
+      SQLITE_CHECKPOINT_INTERVAL_MS: !reset null
+      DATABASE_MAX_CONNECTIONS: !reset null
+      RAILS_ENV: production
+      RUBY_YJIT_ENABLE: "1"
+      RAILS_LOG_LEVEL: info
+      SECRET_KEY_BASE: loadtest-local-only-not-a-secret-0123456789abcdef0123456789abcdef0123456789abcdef # local only
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      RAILS_MAX_THREADS: ${RAILS_MAX_THREADS:-5}

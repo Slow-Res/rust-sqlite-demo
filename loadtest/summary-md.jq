@@ -9,7 +9,8 @@ def table($head; $rows): row($head) + "\n|" + ($head | map("---") | join("|")) +
 
 "# Load test summary\n\n"
 + (if .aborted != null then "**ABORTED: \(.aborted)** (the levels below finished before that)\n\n" else "" end)
-+ (if .node.mode == "web" then "web only: nginx + Rust + \(if .db == "postgres" then "Postgres" else "SQLite" end), 2 CPUs, 4 GB, cores \(.node.cpus)." else "Node: \(.node.cpu_limit), \(.node.memory_limit), cores \(.node.cpus)." end) + " Browsing: \(.paging // "offset") paging. Mix: \(.mix // "search"). Pool: \(.db_pool // "default (10)") connections\(if .pg_work_mem != null then ", Postgres work_mem \(.pg_work_mem)" else "" end). Ramp \(.ramp_s) s, hold \(.hold_s) s; every number is from the hold window only.\n"
++ (if .node.mode == "web" then "web only: nginx + \(if (.app // "rust") == "rails" then "Rails" else "Rust" end) + \(if .db == "postgres" then "Postgres" else "SQLite" end), 2 CPUs, 4 GB, cores \(.node.cpus)." else "Node: \(.node.cpu_limit), \(.node.memory_limit), cores \(.node.cpus)." end) + " Browsing: \(.paging // "offset") paging. Mix: \(.mix // "search"). Pool: \(if (.app // "rust") == "rails" then "one per thread" else "\(.db_pool // "default (10)") connections" end)\(if .pg_work_mem != null then ", Postgres work_mem \(.pg_work_mem)" else "" end). Ramp \(.ramp_s) s, hold \(.hold_s) s; every number is from the hold window only.\n"
++ "app: \(.app_desc // "rust")\n"
 + run_header(.cpu_clock; .cool_down)
 + "Pass rule: p95 < \(.pass_rule.p95_ms_below) ms, p99 < \(.pass_rule.p99_ms_below) ms, errors < \(.pass_rule.error_pct_below)%, no restart or OOM kill"
 + (if any(.levels[]; .kind == "rps") then ", dropped iterations < \(.pass_rule.dropped_pct_below_rps_only)%" else "" end) + ".\n\n"
