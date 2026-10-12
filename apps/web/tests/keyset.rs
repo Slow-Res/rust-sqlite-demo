@@ -105,6 +105,19 @@ async fn books_walk_applies_the_filter(db: Database) {
     assert_eq!(ids(&items), expected);
     let items = walk(&app, &cookie, "/api/books?q=Same&availability=available", 2).await;
     assert_eq!(ids(&items), expected);
+
+    // The total counts every match, also on a page reached by a cursor and on
+    // one past the end (Postgres takes it from a window, or counts when empty).
+    let (_, _, first) = app.get("/api/books?q=Same&per_page=2", Some(&cookie)).await;
+    assert_eq!(first["total"], expected.len());
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let uri = format!("/api/books?q=Same&per_page=2&after={cursor}");
+    let (_, _, second) = app.get(&uri, Some(&cookie)).await;
+    assert_eq!(second["items"].as_array().unwrap().len(), 2);
+    assert_eq!(second["total"], expected.len());
+    let (_, _, past) = app.get("/api/books?q=Same&per_page=2&page=9", Some(&cookie)).await;
+    assert!(past["items"].as_array().unwrap().is_empty());
+    assert_eq!(past["total"], expected.len());
 }
 
 async fn members_walk_visits_every_member_once_in_order(db: Database) {

@@ -80,6 +80,14 @@ struct BookRow {
     updated_at: i64,
 }
 
+/// A [`BookRow`] of a word search, with the number of matches of the whole search.
+#[derive(sqlx::FromRow)]
+struct TotalBookRow {
+    #[sqlx(flatten)]
+    book: BookRow,
+    total: i64,
+}
+
 impl TryFrom<BookRow> for BookRecord {
     type Error = RepoError;
 
@@ -189,15 +197,10 @@ impl BookRepository for PostgresBookRepository {
         page: PageParams,
         after: Option<(String, i64)>,
     ) -> Result<(Vec<BookRecord>, u64), RepoError> {
-        let total = self
-            .counts
-            .get_or_count_opt(filter.count_key(), || count_books(&self.pool, filter))
-            .await?;
-
         // Deferred join: the inner query walks the index and skips OFFSET rows
         // reading only ids; the columns and the correlated subquery are computed
         // for the page's rows only, not for every skipped row.
-        let mut select = QueryBuilder::<Postgres>::new(concat!(book_columns!(), " FROM ("));
+        let mut select = QueryBuilder::<Postgres>::new(book_columns!());
         // A word search finds its matches through the GIN index in a CTE that
         // the planner must not fold back into the title-order walk: the matches
         // of one word cluster in title order (titles start with an adjective),
@@ -206,22 +209,37 @@ impl BookRepository for PostgresBookRepository {
             .q
             .as_deref()
             .is_some_and(|q| !search_words(q).is_empty());
-        select.push(if by_words {
-            "WITH m AS MATERIALIZED (SELECT b.id, b.title FROM books b"
-        } else {
-            "SELECT b.id FROM books b"
-        });
-        push_filter(&mut select, filter);
-        if let Some((title, id)) = after {
-            select.push(" AND (b.title, b.id) > (");
-            select.push_bind(title);
-            select.push(", ");
-            select.push_bind(id);
-            select.push(")");
-        }
         if by_words {
-            select.push(") SELECT id FROM m ORDER BY title ASC, id ASC");
+            // The total comes from the same statement: a window over the whole
+            // match set. A separate count would re-read the same matches, and
+            // the count cache rarely hits for searches (many keys, each short
+            // lived). The cursor therefore comes after the window, or the total
+            // would only count the rows past it.
+            select
+                .push(", p.total FROM (WITH m AS MATERIALIZED (SELECT b.id, b.title FROM books b");
+            push_filter(&mut select, filter);
+            select.push(
+                ") SELECT id, title, total FROM \
+                 (SELECT id, title, COUNT(*) OVER () AS total FROM m) x",
+            );
+            if let Some((title, id)) = after {
+                select.push(" WHERE (x.title, x.id) > (");
+                select.push_bind(title);
+                select.push(", ");
+                select.push_bind(id);
+                select.push(")");
+            }
+            select.push(" ORDER BY title ASC, id ASC");
         } else {
+            select.push(" FROM (SELECT b.id FROM books b");
+            push_filter(&mut select, filter);
+            if let Some((title, id)) = after {
+                select.push(" AND (b.title, b.id) > (");
+                select.push_bind(title);
+                select.push(", ");
+                select.push_bind(id);
+                select.push(")");
+            }
             select.push(" ORDER BY b.title ASC, b.id ASC");
         }
         select.push(" LIMIT ");
@@ -229,11 +247,38 @@ impl BookRepository for PostgresBookRepository {
         select.push(" OFFSET ");
         select.push_bind(page.offset());
         select.push(") p JOIN books b ON b.id = p.id ORDER BY b.title ASC, b.id ASC");
+
+        if by_words {
+            let rows = select
+                .build_query_as::<TotalBookRow>()
+                .fetch_all(&self.pool)
+                .await?;
+            if let Some(first) = rows.first() {
+                let total =
+                    u64::try_from(first.total).map_err(|err| RepoError::Unexpected(err.into()))?;
+                let items = rows
+                    .into_iter()
+                    .map(|row| BookRecord::try_from(row.book))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok((items, total));
+            }
+            // An empty page (past the end, or no match) carries no window value:
+            // count, so the total stays exact.
+            let total = self
+                .counts
+                .get_or_count_opt(filter.count_key(), || count_books(&self.pool, filter))
+                .await?;
+            return Ok((Vec::new(), total));
+        }
+
+        let total = self
+            .counts
+            .get_or_count_opt(filter.count_key(), || count_books(&self.pool, filter))
+            .await?;
         let rows = select
             .build_query_as::<BookRow>()
             .fetch_all(&self.pool)
             .await?;
-
         let items = rows
             .into_iter()
             .map(BookRecord::try_from)
