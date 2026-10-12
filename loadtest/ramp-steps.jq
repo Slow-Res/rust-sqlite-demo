@@ -3,8 +3,12 @@
 # or the live values read from k6's REST API), samples and events (JSON lines of
 # scripts/loadtest.sh), before (container state before the run), prefix, t0 (epoch
 # seconds when k6's scenario started), step_s, start, step_users, from, to, ncont
-# (box containers), the p95/p99/err limits, and source (live|final).
+# (box containers), the p95/p99/err limits, clock (the box cores' clock lock, JSON of
+# scripts/loadtest.sh clock_state, or null) and source (live|final).
 # Step k covers [t0 + k*step_s, t0 + (k+1)*step_s) and the requests tagged step:k.
+# throttle is the growth of the box cores' (summed) and the package's throttle counters
+# over the step; clock_ok is false when the clock is locked and the step ran below 95% of
+# it, or when anything throttled (null: unlocked and nothing throttled, so not known).
 # The REST API has no p99; there the step's metric has a p99 threshold and its
 # `tainted` flag says whether the p99 is over the limit.
 def r1: if . == null then null else (. * 10 | round) / 10 end;
@@ -43,6 +47,18 @@ $k6[0].metrics as $m
   | ([$hs[] | .stats |= map(select(is_box)) | select((.stats | length) == $ncont) | [.stats[].MemUsage | split(" / ")[0] | mib] | add] | max | r1) as $box_mem
   | ([$hs[].stats[] | select(.Name | startswith($prefix + "k6-")) | .CPUPerc | rtrimstr("%") | tonumber]) as $k6cpu
   | ([$hs[].freq | select(. != null) | .[] | select(. != null) | . / 1000]) as $freq
+  # Throttle counters are cumulative: the last sample of the step minus the last one
+  # before it (or the step's first, when none is earlier).
+  | ([$hs[] | select(.throttle != null)]) as $tw
+  | ((([$samples[] | select(.t < $a and .throttle != null)] | last) // ($tw | first)).throttle) as $t_from
+  | ($tw | last | .throttle) as $t_to
+  | (if $t_from == null or $t_to == null then null
+     else {core: (([$t_to.core, $t_from.core] | transpose | map(.[0] - .[1]) | add)), package: ($t_to.package - $t_from.package)} end) as $throttle
+  | ([$hs[].pkg_temp_c | select(. != null)]) as $temp
+  | ($freq | avg) as $freq_avg
+  | ($throttle != null and ($throttle.core > 0 or $throttle.package > 0)) as $throttled
+  | ($clock.locked == true and $freq_avg != null and $freq_avg < 0.95 * $clock.khz / 1000) as $drift
+  | (if $throttled or $drift then false elif $clock.locked == true and $freq_avg != null then true else null end) as $clock_ok
   # Restarts: the restart count at the last sample of the step minus the one
   # before it. OOM kills: Docker's own events in the step.
   | ([$samples[] | select(.t < $a and .state != null)] | last | .state | rmap) as $prev_try
@@ -70,6 +86,10 @@ $k6[0].metrics as $m
       box_peak_memory_mib: $box_mem,
       k6_cpu_pct: {avg: ($k6cpu | avg | r1), max: ($k6cpu | max | r1)},
       freq_mhz: {avg: ($freq | avg | round), min: ($freq | min | round)},
+      throttle: $throttle,
+      pkg_temp_c: {avg: ($temp | avg | r1), max: ($temp | max | r1)},
+      clock_ok: $clock_ok,
+      clock: (if $throttled or $drift then ([if $throttled then "THROTTLED" else empty end, if $drift then "drift \($freq_avg | round)" else empty end] | join(" ")) elif $clock_ok then "ok" else null end),
       restarts: ($r0 | keys | map({key: ., value: (($cur[.] // 0) - ($prev[.] // 0))}) | from_entries),
       oom: ($r0 | keys | map(. as $c | {key: $c, value: ([$ooms[] | select(. == $c)] | length)}) | from_entries),
       relogins: ($m["relogins{step:\($k)}"].values.count // 0),

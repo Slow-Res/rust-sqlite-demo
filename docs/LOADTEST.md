@@ -343,12 +343,12 @@ they slowed each other through the laptop's shared power budget. Short steps hav
 object per step), `summary.md` (a header naming the stack, the box, the memory split and the
 rule, with "each user logs in once and keeps the session", then one row per step: users,
 req/s, p50/p95/p99, error %, box CPU with its per-container split, peak memory per
-container, k6 CPU, average / minimum frequency in MHz, restarts / OOM, re-logins and PASS or
-FAIL, then the result line), `live-steps.jsonl` (what was read live), `k6-summary.json`,
+container, k6 CPU, average / minimum frequency in MHz, clock (see "Reproducible runs"),
+restarts / OOM, re-logins and PASS or FAIL, then the result line), `live-steps.jsonl` (what was read live), `k6-summary.json`,
 `samples.jsonl`, `events.jsonl`, `k6.log`. The result line looks like
 
 ```
-ramp result: highest passing step 1300 users (≈ 495 req/s); first failing step 1400 users (p95 612 ms / p99 1034 ms / err 0.5%)
+ramp result: highest passing step 1300 users (≈ 495 req/s); first failing step 1400 users (p95 612 ms / p99 1034 ms / err 0.5%) (clock: ok)
 ```
 
 It exits 0 when at least one step passed (also when `MAX_USERS` was reached without a fail),
@@ -427,6 +427,7 @@ Environment overrides (defaults in brackets):
 | `PAUSE_S` (30) | pause between levels of a search, after the drain |
 | `MAX_LEVEL` (100000) | the search gives up above this level |
 | `SAMPLE_S` (5) | sampling tick during a level |
+| `COOL_C` (55), `COOL_MAX_S` (900) | cool-down gate: a run (`users`, `rps`, `search`, `ramp`) starts its first load only when the CPU package is below `COOL_C` degrees C (the `x86_pkg_temp` thermal zone, else the hottest zone), checked every 5 s and printed about every 30 s. After `COOL_MAX_S` seconds it warns and starts anyway; the summary records that it timed out. `COOL_C=0` turns the gate off. See "Reproducible runs" |
 | `DRAIN_TIMEOUT_S` (900) | longest wait for the sync worker to drain |
 | `RESULTS_DIR` | results directory (default `loadtest/results/<UTC timestamp>`, with `-sqlite` or `-postgres` appended in web mode, and `-<prefix>` when `PREFIX` is not `lt-`) |
 | `LT_ADMIN_PASSWORD` (`loadtest-local-only`) | password of the local-only `admin` account |
@@ -464,7 +465,51 @@ maximum of these samples, so a spike shorter than the tick can be missed. A warn
 printed when k6 used more than 80% of its cores: the load generator may then be the
 bottleneck. After each level it checks `RestartCount`
 and `OOMKilled`. Each sample also holds the current frequency of every box core (kHz, from
-`scaling_cur_freq`) and the restart counts of the box containers; ramp mode reports them per step.
+`scaling_cur_freq`), the cumulative throttle counters of the box cores and the package
+(`core_throttle_count`, `package_throttle_count`), the package temperature and the restart counts
+of the box containers; ramp mode reports them per step.
+
+### Reproducible runs
+
+The laptop's CPU package has a sustained power limit (28 W, RAPL PL1). Under hours of load
+the box cores slow down by themselves (0.7-1.6 GHz seen on cores 10 and 11 in the middle of a
+ramp), so two runs of the same code can differ by more than the change being measured. Three
+things make runs comparable:
+
+- **Cool-down gate.** Before the first load the runner waits until the package is below
+  `COOL_C` (55 C), for at most `COOL_MAX_S` (900 s). A run that timed out says so in its
+  summary ("TIMED OUT ... the run started warm").
+- **Lock the clocks.** Pin the box cores to one frequency, so the clock cannot follow the
+  power budget. This needs root, once per boot, for each box core (here cores 10 and 11 at
+  2.4 GHz):
+
+  ```
+  for n in 10 11; do echo 2400000 | sudo tee /sys/devices/system/cpu/cpu$n/cpufreq/scaling_{min,max}_freq; done
+  ```
+
+  The runner needs no root: at the start of a run it reads `scaling_min_freq` and
+  `scaling_max_freq` of the cores in `NODE_CPUS` and records `cpu clock: locked 2400 MHz on
+  cores 10,11` when min equals max on all of them, or `unlocked (min-max ...)` otherwise, in
+  the summary header and in `summary.json` (`cpu_clock`, `cool_down`). An unlocked run prints a
+  warning. Cap the other cores too, so they cannot take the power budget.
+- **The `clock` column of a ramp.** Every step records the growth of the box cores'
+  `core_throttle_count` (summed) and of the package's `package_throttle_count` over its window
+  (`throttle {core, package}`), and the package temperature (`pkg_temp_c {avg, max}`), in
+  `steps.jsonl`. `clock` says `ok` when the clock is locked, the step's average frequency is at least 95% of the
+  lock and nothing throttled; `THROTTLED` when any throttle counter grew; `drift 2210` when the
+  average (here 2210 MHz) is below 95% of the lock (both words when both apply); `-` when the run is
+  unlocked and nothing throttled, so the clock is not known (`clock_ok` is `null` in
+  `steps.jsonl`; `false` for the other two). The column is a flag only: it never changes
+  PASS or FAIL. The `ramp result` line ends with `(clock: ok)` when the first failing step and the
+  highest passing step were both `ok`, with `(clock: not verified)` when one is `-`, and with a
+  warning naming the step when one of them was not steady: treat that result as a lower
+  confidence one and repeat it.
+
+`users`, `rps` and `search` record the lock and the cool-down in their summary but have no per-level clock
+column; the raw counters and temperatures are in each level's `samples.jsonl`.
+
+`scripts/loadtest.sh clockcheck` runs the lock check and the cool-down gate alone, and prints
+the package temperature and the throttle counters, without touching any container.
 
 ### Results
 

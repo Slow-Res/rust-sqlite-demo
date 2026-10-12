@@ -10,6 +10,8 @@
     mix: $mix,
     db_pool: (if $db_pool == "" then null else ($db_pool | tonumber) end),
     pg_work_mem: (if $db == "postgres" then $pg_work_mem else null end),
+    cpu_clock: $clock,
+    cool_down: $cool,
     ramp_s: $ramp,
     hold_s: $hold,
     aborted: (if $aborted == "" then null else $aborted end),

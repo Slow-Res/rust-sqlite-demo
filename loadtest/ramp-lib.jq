@@ -9,10 +9,11 @@ def cells: [
   (.peak_memory_mib | split_of),
   "\(.k6_cpu_pct.avg | n)",
   "\(.freq_mhz.avg | n) / \(.freq_mhz.min | n)",
+  .clock,
   "\([.restarts[]] | add) / \([.oom[]] | add)",
   .relogins,
   (if .pass then "PASS" else "FAIL (" + (.reasons | join("; ")) + ")" end)
 ];
 def row: "| " + (cells | map(n) | join(" | ")) + " |";
-def head: ["users", "req/s", "p50 ms", "p95 ms", "p99 ms", "err %", "box CPU % of 200 (avg; per container)", "peak MiB per container", "k6 CPU %", "CPU MHz avg / min", "restarts / OOM", "re-logins", "result"];
+def head: ["users", "req/s", "p50 ms", "p95 ms", "p99 ms", "err %", "box CPU % of 200 (avg; per container)", "peak MiB per container", "k6 CPU %", "CPU MHz avg / min", "clock", "restarts / OOM", "re-logins", "result"];
 def header: "| " + (head | join(" | ")) + " |\n|" + (head | map("---") | join("|")) + "|";

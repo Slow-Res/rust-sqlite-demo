@@ -11,6 +11,7 @@
 #   scripts/loadtest.sh users N | rps R
 #   scripts/loadtest.sh search users|rps [START] [FACTOR]
 #   scripts/loadtest.sh ramp [START] [STEP] [STEP_S]
+#   scripts/loadtest.sh clockcheck
 #   scripts/loadtest.sh down
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -63,6 +64,11 @@ RAMP="${RAMP:-60}" HOLD="${HOLD:-300}"
 # ramp mode allows 2% errors (a step of many users logging in at once), the others 1%.
 P95_MS="${P95_MS:-500}" P99_MS="${P99_MS:-1000}" ERR_PCT="${ERR_PCT:-$([ "${1:-}" = ramp ] && echo 2 || echo 1)}" DROP_PCT="${DROP_PCT:-1}"
 PAUSE_S="${PAUSE_S:-30}"           # between levels, after the sync worker has drained
+# The run starts only when the CPU package is below COOL_C (degrees C; 0 turns the gate
+# off); after COOL_MAX_S seconds it warns and starts anyway.
+COOL_C="${COOL_C:-55}" COOL_MAX_S="${COOL_MAX_S:-900}"
+[[ $COOL_C =~ ^[0-9]+$ ]] || { echo "LOADTEST: usage: COOL_C must be a whole number of degrees C, 0 to turn the gate off (got '$COOL_C')" >&2; exit 2; }
+[[ $COOL_MAX_S =~ ^[1-9][0-9]*$ ]] || { echo "LOADTEST: usage: COOL_MAX_S must be a positive integer (got '$COOL_MAX_S')" >&2; exit 2; }
 SAMPLE_S="${SAMPLE_S:-5}"
 SESSION_POOL="${SESSION_POOL:-50}"   # rps model: sessions logged in at setup
 PAGING="${PAGING:-cursor}"           # browsing: cursor = "next page" (keyset), offset = random deep pages
@@ -115,6 +121,8 @@ EVENTS_PID=
 WORK=$(mktemp -d)
 RUN_DIR=          # results of the running command, for the summary of an aborted run
 RUN_RESULT=null   # the search result so far, as JSON
+RUN_CLOCK=null    # the box cores' clock policy at the start of the run (clock_state), as JSON
+RUN_COOL=null     # what the cool-down gate did (cool_down), as JSON
 SUMMARY_DONE=false
 ABORT_REASON=
 LEVEL_PASS=       # set by run_level: true or false
@@ -401,6 +409,107 @@ cmd_down() {
 }
 
 
+# ---------------------------------------------------- clock and temperature
+
+# The package temperature in degrees C (one decimal): the x86_pkg_temp zone, or the
+# hottest zone when there is none; empty when no zone can be read. World-readable.
+pkg_temp_c() {
+  local z t
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ "$(cat "$z/type" 2>/dev/null || true)" = x86_pkg_temp ] || continue
+    t=$(cat "$z/temp" 2>/dev/null || true)
+    if [[ $t =~ ^[0-9]+$ ]]; then awk -v t="$t" 'BEGIN { printf "%.1f\n", t / 1000 }'; return 0; fi
+  done
+  { cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null || true; } |
+    awk '$1 ~ /^[0-9]+$/ && $1 > m { m = $1; f = 1 } END { if (f) printf "%.1f\n", m / 1000 }'
+}
+
+# The box cores' throttle counters as JSON {core: [per core], package: n}, or null when
+# one cannot be read. The package counter is per package: any box core reports it.
+read_throttle() {
+  local core first= c pkg cores=()
+  for core in $(expand_cpus "$NODE_CPUS"); do
+    [ -n "$first" ] || first=$core
+    c=$(cat "/sys/devices/system/cpu/cpu$core/thermal_throttle/core_throttle_count" 2>/dev/null || true)
+    [[ $c =~ ^[0-9]+$ ]] || { echo null; return 0; }
+    cores+=("$c")
+  done
+  pkg=$(cat "/sys/devices/system/cpu/cpu$first/thermal_throttle/package_throttle_count" 2>/dev/null || true)
+  [[ $pkg =~ ^[0-9]+$ ]] || { echo null; return 0; }
+  jq -cn --argjson pkg "$pkg" '{core: $ARGS.positional, package: $pkg}' --jsonargs "${cores[@]}"
+}
+
+# Whether the box cores' clocks are pinned (scaling_min_freq == scaling_max_freq, the same
+# on every core), as JSON {locked, khz, min_khz, max_khz, cores, text}. locked is null
+# when cpufreq cannot be read. Without a lock the clock follows the laptop's power and
+# thermal limits, so the results of two runs are not comparable.
+clock_state() {
+  local core mn mx rows=
+  for core in $(expand_cpus "$NODE_CPUS"); do
+    mn=$(cat "/sys/devices/system/cpu/cpu$core/cpufreq/scaling_min_freq" 2>/dev/null || true)
+    mx=$(cat "/sys/devices/system/cpu/cpu$core/cpufreq/scaling_max_freq" 2>/dev/null || true)
+    rows+="$core ${mn:-x} ${mx:-x}"$'\n'
+  done
+  printf '%s' "$rows" | jq -Rsc '
+    [split("\n")[] | select(length > 0) | split(" ") | {core: (.[0] | tonumber), min: (try (.[1] | tonumber) catch null), max: (try (.[2] | tonumber) catch null)}] as $c
+    | ($c | map(.core | tostring) | join(",")) as $cores
+    | if any($c[]; .min == null or .max == null) then
+        {locked: null, khz: null, min_khz: null, max_khz: null, cores: $cores, text: "unknown (cpufreq of cores \($cores) not readable)"}
+      else
+        ($c | map(.min) | min) as $lo | ($c | map(.max) | max) as $hi
+        | if all($c[]; .min == .max) and $lo == $hi then
+            {locked: true, khz: $lo, min_khz: $lo, max_khz: $hi, cores: $cores, text: "locked \($lo / 1000 | round) MHz on cores \($cores)"}
+          else
+            {locked: false, khz: null, min_khz: $lo, max_khz: $hi, cores: $cores, text: "unlocked (min–max \($lo / 1000 | round)–\($hi / 1000 | round) MHz on cores \($cores))"}
+          end
+      end'
+}
+
+# Wait until the package is below COOL_C, checking every 5 s and printing the temperature
+# about every 30 s. After COOL_MAX_S it warns and goes on. Sets RUN_COOL.
+cool_down() {
+  local start=$SECONDS t t0 last=-30 timed_out=false
+  if [ "$COOL_C" = 0 ]; then
+    RUN_COOL=$(jq -cn '{enabled: false, text: "cool-down gate: off (COOL_C=0)"}')
+    echo "cool-down gate: off (COOL_C=0)"
+    return 0
+  fi
+  t=$(pkg_temp_c)
+  if [ -z "$t" ]; then
+    RUN_COOL=$(jq -cn --argjson c "$COOL_C" '{enabled: true, threshold_c: $c, start_c: null, end_c: null, waited_s: 0, timed_out: false, text: "cool-down gate: no temperature sensor, skipped"}')
+    echo "warning: no CPU temperature sensor under /sys/class/thermal: cool-down gate skipped" >&2
+    return 0
+  fi
+  t0=$t
+  while awk -v t="$t" -v c="$COOL_C" 'BEGIN { exit !(t >= c) }'; do
+    if ((SECONDS - start >= COOL_MAX_S)); then
+      timed_out=true
+      echo "warning: still $t C after ${COOL_MAX_S}s (limit $COOL_C C): starting anyway, results may be affected by heat" >&2
+      break
+    fi
+    if ((SECONDS - last >= 30)); then
+      echo "cooling: package $t C, waiting for below $COOL_C C ($((SECONDS - start))s of at most ${COOL_MAX_S}s)"
+      last=$SECONDS
+    fi
+    sleep 5
+    t=$(pkg_temp_c)
+    [ -n "$t" ] || break
+  done
+  RUN_COOL=$(jq -cn --argjson c "$COOL_C" --argjson max_s "$COOL_MAX_S" --arg t0 "$t0" --arg t "${t:-$t0}" --argjson w "$((SECONDS - start))" --argjson timed_out "$timed_out" '
+    {enabled: true, threshold_c: $c, max_s: $max_s, start_c: ($t0 | tonumber), end_c: ($t | tonumber), waited_s: $w, timed_out: $timed_out}
+    | .text = (if .timed_out then "cool-down gate: TIMED OUT after \(.waited_s) s at \(.end_c) C (limit \(.threshold_c) C), the run started warm"
+        else "cool-down gate: \(.start_c) C at the start, \(.end_c) C after \(.waited_s) s (limit \(.threshold_c) C)" end)')
+  jq -r .text <<<"$RUN_COOL"
+}
+
+# Before the first load of a run: record the clock lock, then wait for the package to cool.
+preflight() {
+  RUN_CLOCK=$(clock_state)
+  echo "cpu clock: $(jq -r .text <<<"$RUN_CLOCK")"
+  [ "$(jq -r .locked <<<"$RUN_CLOCK")" = true ] || echo "warning: the box cores' clock is not locked, so a step can run at a different speed than the next (docs/LOADTEST.md, Reproducible runs)" >&2
+  cool_down
+}
+
 # ------------------------------------------------------------------- levels
 
 # Samples on a fixed SAMPLE_S tick, as JSON lines: container CPU and memory (the
@@ -408,7 +517,7 @@ cmd_down() {
 # position and upload counter. The queries run at the same time, so a slow
 # `docker stats` (about 2 s) does not stretch the tick.
 sample_loop() {
-  local file=$1 t next=$(now) names pids delay core freq_files=()
+  local file=$1 t next=$(now) names pids delay core thr temp freq_files=()
   # Each box core's current frequency (kHz): whether two boxes side by side slow
   # each other through the laptop's shared power budget.
   for core in $(expand_cpus "$NODE_CPUS"); do freq_files+=("/sys/devices/system/cpu/cpu$core/cpufreq/scaling_cur_freq"); done
@@ -428,11 +537,15 @@ sample_loop() {
     (restart_state >"$WORK/s.state" 2>/dev/null || echo null >"$WORK/s.state") &
     wait
     for core in "${freq_files[@]}"; do cat "$core" 2>/dev/null || echo null; done | jq -cs . >"$WORK/s.freq" || echo null >"$WORK/s.freq"
+    # Throttle counters (cumulative) and the package temperature: ramp mode takes each step's delta.
+    thr=$(read_throttle)
+    temp=$(pkg_temp_c)
     jq -cn --arg t "$t" --argjson stats "$(cat "$WORK/s.stats")" \
       --argjson pending "$(cat "$WORK/s.pending")" --argjson lag "$(cat "$WORK/s.lag")" \
       --argjson puts "$(cat "$WORK/s.puts")" --argjson txid "$(cat "$WORK/s.txid")" \
       --argjson state "$(cat "$WORK/s.state")" --argjson freq "$(cat "$WORK/s.freq")" \
-      '{t: ($t | tonumber), stats: $stats, pending: $pending, lag: $lag, puts: $puts, txid: $txid, state: $state, freq: $freq}' >>"$file" || true
+      --argjson throttle "$thr" --argjson temp "${temp:-null}" \
+      '{t: ($t | tonumber), stats: $stats, pending: $pending, lag: $lag, puts: $puts, txid: $txid, state: $state, freq: $freq, throttle: $throttle, pkg_temp_c: $temp}' >>"$file" || true
     next=$(awk -v n="$next" -v s="$SAMPLE_S" 'BEGIN { printf "%.3f", n + s }')
     delay=$(awk -v n="$next" -v c="$(now)" -v s="$SAMPLE_S" 'BEGIN { d = n - c; if (d < 0) { d = 0; n = c } printf "%.3f", d }')
     # A tick that ran over starts the next one at once; it does not queue up.
@@ -528,8 +641,9 @@ write_summary() {
   local dir=$1 levels=$2 result=${3:-null} aborted=${4:-}
   jq -s --argjson result "$result" --arg aborted "$aborted" --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
     --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg paging "$PAGING" --arg mix "$MIX" --arg db_pool "$DB_POOL" --arg pg_work_mem "$PG_WORK_MEM" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" --arg db "$([ "$LT_MODE" = web ] && echo "$LT_DB" || true)" \
+    --argjson clock "$RUN_CLOCK" --argjson cool "$RUN_COOL" \
     -f loadtest/summary.jq "$levels" >"$dir/summary.json" || return 1
-  jq -r --arg prefix "$PREFIX" -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
+  jq -r -L loadtest --arg prefix "$PREFIX" -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
   SUMMARY_DONE=true
   echo
   echo "results: $dir (summary.md, summary.json, one directory per level)"
@@ -547,6 +661,7 @@ cmd_level() {
   dir=$(new_results_dir)
   RUN_DIR=$dir
   : >"$dir/levels.jsonl"
+  preflight
   run_level "$kind" "$value" "$dir/${kind}-${value}"
   jq -c . "$dir/${kind}-${value}/level.json" >"$dir/levels.jsonl"
   write_summary "$dir" "$dir/levels.jsonl" || die "could not write the summary"
@@ -576,6 +691,7 @@ cmd_search() {
   dir=$(new_results_dir)
   RUN_DIR=$dir
   : >"$dir/levels.jsonl"
+  preflight
   local rows_start
   rows_start=$(db_rows) || die "cannot read the row counts (API or Postgres)"
   RUN_RESULT=$(jq -cn --arg kind "$kind" --argjson rows_start "$rows_start" '{kind: $kind, status: "not finished", best_pass: null, first_fail: null, db_rows_start: $rows_start}')
@@ -682,7 +798,7 @@ ramp_steps() {
     --arg prefix "$PREFIX" --argjson before "$RAMP_STATE_BEFORE" --argjson t0 "$RAMP_T0" --argjson step_s "$RAMP_STEP_S" \
     --argjson start "$RAMP_START" --argjson step_users "$RAMP_STEP" --argjson from "$from" --argjson to "$to" \
     --argjson ncont "${#NODE_CONTAINERS[@]}" --argjson p95_limit "$P95_MS" --argjson p99_limit "$P99_MS" --argjson err_limit "$ERR_PCT" \
-    --arg source "$source" -f loadtest/ramp-steps.jq
+    --argjson clock "$RUN_CLOCK" --arg source "$source" -f loadtest/ramp-steps.jq
 }
 
 cmd_ramp() {
@@ -705,6 +821,7 @@ cmd_ramp() {
   local rows_before
   rows_before=$(db_rows) || die "cannot read the row counts (API)"
   echo "rows: $rows_before"
+  preflight
   : >"$dir/samples.jsonl"
   sample_loop "$dir/samples.jsonl" &
   SAMPLER_PID=$!
@@ -791,6 +908,7 @@ cmd_ramp() {
     --arg pg_shared "${PG_SHARED_BUFFERS:-}" --arg pg_cache "${PG_EFFECTIVE_CACHE_SIZE:-}" \
     --argjson start "$start" --argjson step_users "$step" --argjson step_s "$step_s" --argjson max_users "$MAX_USERS" \
     --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson stop "$stop" --argjson live_fail "${live_fail:-null}" \
+    --argjson clock "$RUN_CLOCK" --argjson cool "$RUN_COOL" \
     -f loadtest/ramp-summary.jq "$dir/steps.jsonl") || die "could not write the summary (loadtest/ramp-summary.jq)"
   jq -r .md <<<"$out" >"$dir/summary.md"
   echo
@@ -804,10 +922,11 @@ case "${1:-}" in
   users | rps) cmd_level "$1" "${2:?usage: loadtest.sh $1 N}" ;;
   search) shift; cmd_search "$@" ;;
   ramp) shift; cmd_ramp "$@" ;;
+  clockcheck) preflight; echo "now: package $(pkg_temp_c) C, throttle $(read_throttle)" ;;
   config) web_compose config ;;
   down) cmd_down ;;
   *)
-    echo "usage: scripts/loadtest.sh up | users N | rps R | search users|rps [START] [FACTOR] | ramp [START] [STEP] [STEP_S] | config | down" >&2
+    echo "usage: scripts/loadtest.sh up | users N | rps R | search users|rps [START] [FACTOR] | ramp [START] [STEP] [STEP_S] | clockcheck | config | down" >&2
     exit 2
     ;;
 esac
