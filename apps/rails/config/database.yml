@@ -1,0 +1,15 @@
+# One pool per Puma worker, as large as the thread count: WEB_CONCURRENCY x
+# RAILS_MAX_THREADS connections in all (10 by default, like the Rust pool).
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS", 5) %>
+  checkout_timeout: 30
+
+production:
+  <<: *default
+  url: <%= ENV["DATABASE_URL"] %>
+
+test:
+  <<: *default
+  url: <%= ENV["DATABASE_URL"] %>
