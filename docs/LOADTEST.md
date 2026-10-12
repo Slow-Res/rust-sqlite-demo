@@ -506,6 +506,44 @@ and `OOMKilled`. Each sample also holds the current frequency of every box core 
 (`core_throttle_count`, `package_throttle_count`), the package temperature and the restart counts
 of the box containers; ramp mode reports them per step.
 
+### Contract test
+
+`scripts/contract-test.sh BASE_URL` checks a running box against `docs/API-CONTRACT.md`:
+every route, the success shapes and values, each validation error, 401, 404, 405 and 413,
+the 409 answers, cursor and offset paging, search, the availability filter, and the totals
+and their cache. Run it against a box before a load round, and against the Rails box
+before its first round: a box that fails it is not measuring the same API.
+
+It is bash and `curl` and `jq` on the host (no k6). It logs in as `LT_ADMIN_USER` /
+`LT_ADMIN_PASSWORD` (the same defaults as `scripts/loadtest.sh`), creates its own books,
+members and loans (each tagged with a random word) and deletes them at the end, so it
+works on a seeded box of any size and can be run again. It takes about 25 s. It prints one
+`FAIL:` line per failed check and a summary on stderr; the exit code is 0 only if every
+check passed. Web mode does not publish a port, so aim at nginx's address on the box
+network:
+
+```bash
+PREFIX=lt-ct- LT_DB=postgres NODE_CPUS=6,7 K6_CPUS=8,9 CENTRAL_CPUS=8,9 BOOKS=2000 MEMBERS=500 LOANS=1000 COOL_C=0 SEED_CACHE=0 scripts/loadtest.sh up
+NGINX=$(docker inspect -f '{{(index .NetworkSettings.Networks "lt-ct-web_default").IPAddress}}' lt-ct-web-nginx-1)
+CT_PSQL="docker exec -i lt-ct-web-postgres-1 psql -U library -d library -tA" scripts/contract-test.sh "http://$NGINX"
+PREFIX=lt-ct- LT_DB=postgres scripts/loadtest.sh down
+```
+
+(Swap the prefix for yours; the network is `<PREFIX>web_default`, the containers
+`<PREFIX>web-nginx-1` and `<PREFIX>web-postgres-1`.) A small seed is enough: the test never depends on the seed's contents.
+
+| Variable | Meaning |
+|---|---|
+| `LT_ADMIN_USER` (`admin`), `LT_ADMIN_PASSWORD` (`loadtest-local-only`) | the account to log in as |
+| `CT_TTL_MS` (1000) | the box's `LIST_COUNT_TTL_MS`: how long an unfiltered total may lag a write. The test waits for each total to catch up for up to three TTLs |
+| `CT_SESSION_TTL_S` (604800), `CT_COOKIE_SECURE` (`false`) | what the box is configured with: the cookie's `Max-Age` and whether it has `Secure` |
+| `CT_PSQL` | a command that reads SQL on stdin and prints bare values, as above. It enables the checks that the API alone cannot do: overdue loans (the test moves a loan's `due_at` into the past), expired sessions and the login sweep, the token stored hashed, and the Argon2id hash. Without it those are skipped (a `skip:` line on stderr; the exit code is not affected) |
+| `CT_VERBOSE` | set it to print a line for every passed check |
+
+The checks are in the order of `docs/API-CONTRACT.md`. A failed check names what was
+expected and what came back; one failure may cause others after it (a book that could not
+be created is not there to be listed).
+
 ### Reproducible runs
 
 The laptop's CPU package has a sustained power limit (28 W, RAPL PL1). Under hours of load
