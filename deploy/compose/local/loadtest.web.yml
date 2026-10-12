@@ -49,6 +49,9 @@ services:
       # No Litestream here, and constant readers keep SQLite's own checkpoints
       # from ever resetting the WAL (2.5 GB for a 43 MB database): truncate it every second.
       SQLITE_CHECKPOINT_INTERVAL_MS: "1000"
+      # The pool size; the runner exports it from DB_POOL only when that is set, so an
+      # unset DB_POOL leaves the app's default (no value here: compose omits the variable).
+      DATABASE_MAX_CONNECTIONS:
     volumes: [data:/data]
     # The same 2 cores (4.4 GHz efficiency cores) as the whole node of the
     # full-node mode; 4096 MiB minus nginx's 256. It holds the app, the SQLite

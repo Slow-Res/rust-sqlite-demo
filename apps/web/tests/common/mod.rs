@@ -337,6 +337,7 @@ pub fn test_config() -> Config {
         list_count_ttl_ms: 0,
         sqlite_checkpoint_interval_ms: 0,
         password_hash_permits: None,
+        database_max_connections: None,
     }
 }
 

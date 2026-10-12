@@ -15,7 +15,8 @@ services:
     # Memory, planner and WAL settings differ from the defaults; synchronous_commit=on
     # and fsync=on stay, so a commit is durable on power loss. shared_buffers is
     # 25% and effective_cache_size 75% of PG_MEM; the runner derives them (the
-    # defaults here are those of the default 2816m). The planner and WAL flags
+    # defaults here are those of the default 2816m). work_mem is PG_WORK_MEM; the runner
+    # raises max_connections to the pool (DB_POOL) plus 20 when that would pass 50. The planner and WAL flags
     # are the standard SSD values, as PGTune gives for a 2-CPU web workload
     # (random_page_cost=4 is a hard-disk default: it made the planner Seq Scan
     # 52k rows for a whole-title ILIKE search instead of using the trigram GIN
@@ -28,9 +29,9 @@ services:
       - -c
       - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-2112MB}
       - -c
-      - max_connections=50
+      - max_connections=${PG_MAX_CONNECTIONS:-50}
       - -c
-      - work_mem=4MB
+      - work_mem=${PG_WORK_MEM:-4MB}
       - -c
       - maintenance_work_mem=176MB
       - -c

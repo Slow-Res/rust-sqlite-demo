@@ -93,7 +93,8 @@ same machine. It is a comparison mode, not a production topology.
 - **`DATABASE_URL`.** `postgres://user:password@host:5432/db` (or `postgresql://`) selects
   Postgres; `sqlite:` stays the default. `web` migrates the database on start with
   `migrations/web-postgres`. A binary built without the feature refuses a Postgres URL at
-  startup. Both backends use a pool of 10 connections. `create-user` works on both backends.
+  startup. Both backends use a pool of 10 connections (`DATABASE_MAX_CONNECTIONS`
+  overrides it). `create-user` works on both backends.
 - **Not supported.** Litestream, the sync worker (there is no `change_log`), `seed` and
   `check-db`: the last two exit with an error on Postgres.
 - **Same behaviour.** The Postgres adapters return the same results and errors as the

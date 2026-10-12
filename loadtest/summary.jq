@@ -8,6 +8,8 @@
     pass_rule: {p95_ms_below: $p95, p99_ms_below: $p99, error_pct_below: $err, dropped_pct_below_rps_only: $drop, no_restart_or_oom: true, window: "hold only (ramp excluded)"},
     paging: $paging,
     mix: $mix,
+    db_pool: (if $db_pool == "" then null else ($db_pool | tonumber) end),
+    pg_work_mem: (if $db == "postgres" then $pg_work_mem else null end),
     ramp_s: $ramp,
     hold_s: $hold,
     aborted: (if $aborted == "" then null else $aborted end),

@@ -63,8 +63,9 @@ otherwise. `scripts/loadtest.sh config` prints the rendered compose file of the 
 Postgres runs with defaults except for memory, planner and WAL settings. Memory:
 `shared_buffers` = 25% of `PG_MEM` and `effective_cache_size` = 75% of it, rounded to MB
 (704MB and 2112MB at 2816m; the runner derives them from `PG_MEM` and passes them as
-flags), `max_connections=50`, `work_mem=4MB`, `maintenance_work_mem=176MB` (and `shm_size`
-256m). Planner and WAL, the standard SSD values as PGTune gives for a 2-CPU web workload:
+flags), `max_connections=50` (raised to `DB_POOL` + 20 when the pool is above 30), `work_mem=4MB`
+(`PG_WORK_MEM`), `maintenance_work_mem=176MB` (and `shm_size` 256m). Planner and WAL, the
+standard SSD values as PGTune gives for a 2-CPU web workload:
 `random_page_cost=1.1`, `effective_io_concurrency=200`, `min_wal_size=1GB`,
 `max_wal_size=4GB`, `max_parallel_workers_per_gather=1`. With the hard-disk default
 `random_page_cost=4` the planner chose a Seq Scan of 52k rows (23 ms) for a whole-title
@@ -409,6 +410,8 @@ Environment overrides (defaults in brackets):
 | `P95_MS` (500), `P99_MS` (1000), `ERR_PCT` (1; 2 for `ramp`) | pass-rule limits; make them impossible to see the fail path |
 | `MAX_USERS` (5000) | `ramp` stops here if no step failed |
 | `NGINX_MEM` (256m), `WEB_MEM` (3840m; 1024m with Postgres), `PG_MEM` (2816m) | memory split of the box; must add up to 4096 MiB. See "`LT_DB`" |
+| `DB_POOL` (empty: the app's 10) | the web app's database pool size, passed as `DATABASE_MAX_CONNECTIONS` (both backends); web mode only. A positive integer. With Postgres, `max_connections` stays 50 up to a pool of 30 and becomes `DB_POOL` + 20 above that. The summary header and `summary.json` (`db_pool`) record it; empty is recorded as the default (10) |
+| `PG_WORK_MEM` (4MB) | Postgres' `work_mem`, an integer with a unit `kB`, `MB` or `GB`; applies with `LT_DB=postgres`. Recorded in the summary header and `summary.json` (`pg_work_mem`). Each query step of each connection may use it, so a larger pool multiplies it; stay inside `PG_MEM` |
 | `DROP_PCT` (1) | dropped iterations limit, rps only |
 | `BOOKS` (50000), `MEMBERS` (10000), `LOANS` (20000) | size of the seed, for `up` |
 | `SEED_VUS` (16) | k6 VUs that seed |
@@ -496,8 +499,9 @@ the default data takes a few minutes (it is about 100,000 API calls).
   sessions, and nothing is reset, so later levels run on a larger database than earlier
   ones. The summary states the row counts at the start and the end.
 - **A burst of logins can OOM-kill the web container.** Every login hashes a password with
-  Argon2 (about 19 MiB each), and the web app does not limit how many hashes run at once.
-  An earlier version of the rps model logged in per VU and, once the node fell behind,
+  Argon2 (about 19 MiB each), and the web app caps concurrent hashes at max(1, cores/2) permits
+  (`PASSWORD_HASH_PERMITS` overrides it). Before that cap, an earlier version of the rps
+  model logged in per VU and, once the node fell behind,
   started hundreds of VUs that all logged in; web reached its 3 GB and was killed. The rps
   model now logs in a fixed pool sequentially at setup. The users model still logs in
   during the run, as real users do, and a restart or OOM kill in any level is a failed

@@ -69,6 +69,14 @@ PAGING="${PAGING:-cursor}"           # browsing: cursor = "next page" (keyset), 
 [[ $PAGING == cursor || $PAGING == offset ]] || { echo "LOADTEST: PAGING must be cursor or offset" >&2; exit 2; }
 MIX="${MIX:-nosearch}"               # action mix: nosearch = no book search (browse available + delete book instead), search = the earlier mix
 [[ $MIX == nosearch || $MIX == search ]] || { echo "LOADTEST: MIX must be nosearch or search" >&2; exit 2; }
+# DB_POOL: the app's database pool size (DATABASE_MAX_CONNECTIONS); empty leaves the app's
+# default, so the variable is not passed at all. PG_WORK_MEM: Postgres' work_mem (kB, MB or GB).
+DB_POOL="${DB_POOL:-}"
+[[ -z $DB_POOL || $DB_POOL =~ ^[1-9][0-9]{0,4}$ ]] || { echo "LOADTEST: usage: DB_POOL must be a positive integer, e.g. 20 (got '$DB_POOL')" >&2; exit 2; }
+[[ -z $DB_POOL || $LT_MODE == web ]] || { echo "LOADTEST: usage: DB_POOL works only with LT_MODE=web" >&2; exit 2; }
+PG_WORK_MEM="${PG_WORK_MEM:-4MB}"
+[[ $PG_WORK_MEM =~ ^[1-9][0-9]*(kB|MB|GB)$ ]] || { echo "LOADTEST: usage: PG_WORK_MEM must be an integer with a unit kB, MB or GB, e.g. 16MB (got '$PG_WORK_MEM')" >&2; exit 2; }
+if [ -n "$DB_POOL" ]; then export DATABASE_MAX_CONNECTIONS="$DB_POOL"; else unset DATABASE_MAX_CONNECTIONS; fi
 DRAIN_TIMEOUT_S="${DRAIN_TIMEOUT_S:-900}"
 MAX_LEVEL="${MAX_LEVEL:-100000}"   # the search gives up above this
 MAX_USERS="${MAX_USERS:-5000}"     # ramp stops here if no step has failed
@@ -90,6 +98,11 @@ for _v in NGINX_MEM WEB_MEM PG_MEM; do
   [ -n "$(to_mib "${!_v}")" ] || { echo "LOADTEST: usage: $_v must be an integer with a unit m or g, e.g. 256m (got '${!_v}')" >&2; exit 2; }
 done
 if [ "$LT_DB" = postgres ]; then
+  export PG_WORK_MEM
+  # Every pool connection is a backend, and the runner's own psql calls need a few more.
+  # 50 is enough for a pool up to 30; a bigger one raises the limit with it.
+  _pool=${DB_POOL:-10}
+  export PG_MAX_CONNECTIONS=$((_pool + 20 > 50 ? _pool + 20 : 50))
   export PG_SHARED_BUFFERS="$(awk -v m="$(to_mib "$PG_MEM")" 'BEGIN { printf "%d", m * 0.25 + 0.5 }')MB"
   export PG_EFFECTIVE_CACHE_SIZE="$(awk -v m="$(to_mib "$PG_MEM")" 'BEGIN { printf "%d", m * 0.75 + 0.5 }')MB"
 fi
@@ -514,7 +527,7 @@ pause_between_levels() {
 write_summary() {
   local dir=$1 levels=$2 result=${3:-null} aborted=${4:-}
   jq -s --argjson result "$result" --arg aborted "$aborted" --argjson p95 "$P95_MS" --argjson p99 "$P99_MS" --argjson err "$ERR_PCT" --argjson drop "$DROP_PCT" \
-    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg paging "$PAGING" --arg mix "$MIX" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" --arg db "$([ "$LT_MODE" = web ] && echo "$LT_DB" || true)" \
+    --argjson ramp "$RAMP" --argjson hold "$HOLD" --arg paging "$PAGING" --arg mix "$MIX" --arg db_pool "$DB_POOL" --arg pg_work_mem "$PG_WORK_MEM" --arg node_cpus "$NODE_CPUS" --arg mode "$LT_MODE" --arg db "$([ "$LT_MODE" = web ] && echo "$LT_DB" || true)" \
     -f loadtest/summary.jq "$levels" >"$dir/summary.json" || return 1
   jq -r --arg prefix "$PREFIX" -f loadtest/summary-md.jq "$dir/summary.json" >"$dir/summary.md" || return 1
   SUMMARY_DONE=true
@@ -773,7 +786,7 @@ cmd_ramp() {
   [ -z "$live_fail" ] || printed=$((k + 1))
   sed -n "$((printed + 1)),\$p" "$dir/steps.jsonl" | while IFS= read -r line; do jq -r -L loadtest -f loadtest/ramp-line.jq <<<"$line"; done
   local out
-  out=$(jq -s -L loadtest --arg db "$LT_DB" --arg paging "$PAGING" --arg mix "$MIX" --arg node_cpus "$NODE_CPUS" --arg k6_cpus "$K6_CPUS" \
+  out=$(jq -s -L loadtest --arg db "$LT_DB" --arg paging "$PAGING" --arg mix "$MIX" --arg db_pool "$DB_POOL" --arg pg_work_mem "$PG_WORK_MEM" --arg node_cpus "$NODE_CPUS" --arg k6_cpus "$K6_CPUS" \
     --arg nginx_mem "$NGINX_MEM" --arg web_mem "$WEB_MEM" --arg pg_mem "$PG_MEM" \
     --arg pg_shared "${PG_SHARED_BUFFERS:-}" --arg pg_cache "${PG_EFFECTIVE_CACHE_SIZE:-}" \
     --argjson start "$start" --argjson step_users "$step" --argjson step_s "$step_s" --argjson max_users "$MAX_USERS" \

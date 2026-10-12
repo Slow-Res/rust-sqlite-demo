@@ -35,6 +35,9 @@ pub struct Config {
     /// How many password hashes may run at once; `None` takes half the cores (see
     /// `auth::password`).
     pub password_hash_permits: Option<usize>,
+    /// Size of the database pool, on either backend; `None` takes the default of
+    /// `db` (10).
+    pub database_max_connections: Option<u32>,
 }
 
 impl Config {
@@ -76,6 +79,14 @@ impl Config {
             },
         };
 
+        let database_max_connections = match get("DATABASE_MAX_CONNECTIONS") {
+            None => None,
+            Some(raw) => match raw.parse::<u32>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => bail!("DATABASE_MAX_CONNECTIONS must be a positive integer, got `{raw}`"),
+            },
+        };
+
         Ok(Self {
             database_url: get("DATABASE_URL")
                 .unwrap_or_else(|| "sqlite://data/library.db".to_owned()),
@@ -90,6 +101,7 @@ impl Config {
             list_count_ttl_ms: parse_or(&get, "LIST_COUNT_TTL_MS", 1000)?,
             sqlite_checkpoint_interval_ms: parse_or(&get, "SQLITE_CHECKPOINT_INTERVAL_MS", 0)?,
             password_hash_permits,
+            database_max_connections,
         })
     }
 }
@@ -133,6 +145,20 @@ mod tests {
         assert_eq!(config.list_count_ttl_ms, 1000);
         assert_eq!(config.sqlite_checkpoint_interval_ms, 0);
         assert_eq!(config.password_hash_permits, None);
+        assert_eq!(config.database_max_connections, None);
+    }
+
+    #[test]
+    fn database_max_connections_must_be_a_positive_integer() {
+        let pool = |v: &str| Config::from_lookup(lookup(&[("DATABASE_MAX_CONNECTIONS", v)]));
+        assert_eq!(pool("20").unwrap().database_max_connections, Some(20));
+        for bad in ["0", "-1", "", "ten", "1.5", "4294967296"] {
+            let err = pool(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("DATABASE_MAX_CONNECTIONS"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::config::Config;
 // the load test follows, so the comparison measures the databases, not the pools.
 // The box has 2 cores: past a handful of connections more of them only queue
 // inside the database (and in Postgres each one is a process with its own memory).
+// `DATABASE_MAX_CONNECTIONS` overrides it, for both backends.
 const SQLITE_MAX_CONNECTIONS: u32 = 10;
 #[cfg(feature = "postgres")]
 const POSTGRES_MAX_CONNECTIONS: u32 = 10;
@@ -76,7 +77,11 @@ pub async fn connect(config: &Config) -> anyhow::Result<Database> {
         #[cfg(feature = "postgres")]
         {
             let pool = PgPoolOptions::new()
-                .max_connections(POSTGRES_MAX_CONNECTIONS)
+                .max_connections(
+                    config
+                        .database_max_connections
+                        .unwrap_or(POSTGRES_MAX_CONNECTIONS),
+                )
                 .connect(&config.database_url)
                 .await?;
             return Ok(Database::Postgres(pool));
@@ -86,7 +91,10 @@ pub async fn connect(config: &Config) -> anyhow::Result<Database> {
             "DATABASE_URL names Postgres, but this binary was built without the `postgres` feature"
         );
     }
-    let pool = sqlite_setup::open_pool(&config.database_url, SQLITE_MAX_CONNECTIONS, true).await?;
+    let max_connections = config
+        .database_max_connections
+        .unwrap_or(SQLITE_MAX_CONNECTIONS);
+    let pool = sqlite_setup::open_pool(&config.database_url, max_connections, true).await?;
     Ok(Database::Sqlite(pool))
 }
 
