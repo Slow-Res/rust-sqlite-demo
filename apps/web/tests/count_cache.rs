@@ -49,14 +49,15 @@ async fn the_unfiltered_book_total_may_lag_but_the_rows_and_searches_do_not(db: 
 
     // A search is counted for real.
     assert_eq!(page(&app, "/api/books?q=Dune", &cookie).await["total"], 2);
-    // A filter on availability alone is cached like the unfiltered total; add a
+    // A filter on availability alone is cached like the unfiltered total, and is
+    // computed from it (all books minus the full ones), so it lags with it; add a
     // search to it and it is counted for real again.
     let available = page(&app, "/api/books?availability=available", &cookie).await;
-    assert_eq!((len(&available), &available["total"]), (2, &json!(2)));
+    assert_eq!((len(&available), &available["total"]), (2, &json!(1)));
     add_book(&app, &cookie, "Dune Messiah II").await;
     let available = page(&app, "/api/books?availability=available", &cookie).await;
     assert_eq!(len(&available), 3, "the rows are read every time");
-    assert_eq!(available["total"], 2, "the total is the cached one");
+    assert_eq!(available["total"], 1, "the total is the cached one");
     assert_eq!(
         page(&app, "/api/books?availability=available&q=Dune", &cookie).await["total"],
         3

@@ -10,10 +10,10 @@ use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 
 use super::domain::BookFields;
 use super::repo::{
-    AVAILABLE_TOTAL, BookFilter, BookRecord, BookRepository, DeleteBookOutcome, ON_LOAN_TOTAL,
+    BookFilter, BookRecord, BookRepository, DeleteBookOutcome, FULL_BOOKS_TOTAL, ON_LOAN_TOTAL,
     UpdateBookOutcome,
 };
-use crate::count_cache::CountCache;
+use crate::count_cache::{CountCache, CountKey};
 use crate::db::{RepoError, escape_like, from_timestamp, isbn_prefix, search_words, to_timestamp};
 use crate::pagination::PageParams;
 
@@ -174,17 +174,37 @@ fn push_filter(builder: &mut QueryBuilder<Postgres>, filter: &BookFilter) {
     }
 }
 
+/// Number of books, unfiltered.
+async fn count_all_books(pool: &PgPool) -> Result<u64, RepoError> {
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM books")
+        .fetch_one(pool)
+        .await?;
+    u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()))
+}
+
 /// Number of books matching `filter`.
-async fn count_books(pool: &PgPool, filter: &BookFilter) -> Result<u64, RepoError> {
+async fn count_books(
+    pool: &PgPool,
+    counts: &CountCache,
+    filter: &BookFilter,
+) -> Result<u64, RepoError> {
     // An availability filter without a search: count the active loans once. The
     // predicate in `push_filter` runs a subquery per book, over the whole table.
     if filter.counts_from_loans() {
-        let sql = match filter.availability {
-            Availability::OnLoan => ON_LOAN_TOTAL,
-            _ => AVAILABLE_TOTAL,
-        };
-        let total: i64 = sqlx::query_scalar(sql).fetch_one(pool).await?;
-        return u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()));
+        if filter.availability == Availability::OnLoan {
+            let total: i64 = sqlx::query_scalar(ON_LOAN_TOTAL).fetch_one(pool).await?;
+            return u64::try_from(total).map_err(|err| RepoError::Unexpected(err.into()));
+        }
+        // Available = all books - full books. Counting `books` is the expensive
+        // part, and the unfiltered total is already cached for the list: reuse it
+        // (both parts are at most one TTL old, the cache's contract). A book
+        // deleted in between could make the difference negative: clamp it.
+        let all = counts
+            .get_or_count(CountKey::Books, || count_all_books(pool))
+            .await?;
+        let full: i64 = sqlx::query_scalar(FULL_BOOKS_TOTAL).fetch_one(pool).await?;
+        let full = u64::try_from(full).map_err(|err| RepoError::Unexpected(err.into()))?;
+        return Ok(all.saturating_sub(full));
     }
     let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM books b");
     push_filter(&mut count, filter);
@@ -279,14 +299,18 @@ impl BookRepository for PostgresBookRepository {
             // count, so the total stays exact.
             let total = self
                 .counts
-                .get_or_count_opt(filter.count_key(), || count_books(&self.pool, filter))
+                .get_or_count_opt(filter.count_key(), || {
+                    count_books(&self.pool, &self.counts, filter)
+                })
                 .await?;
             return Ok((Vec::new(), total));
         }
 
         let total = self
             .counts
-            .get_or_count_opt(filter.count_key(), || count_books(&self.pool, filter))
+            .get_or_count_opt(filter.count_key(), || {
+                count_books(&self.pool, &self.counts, filter)
+            })
             .await?;
         let rows = select
             .build_query_as::<BookRow>()
