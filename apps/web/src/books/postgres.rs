@@ -198,7 +198,19 @@ impl BookRepository for PostgresBookRepository {
         // reading only ids; the columns and the correlated subquery are computed
         // for the page's rows only, not for every skipped row.
         let mut select = QueryBuilder::<Postgres>::new(concat!(book_columns!(), " FROM ("));
-        select.push("SELECT b.id FROM books b");
+        // A word search finds its matches through the GIN index in a CTE that
+        // the planner must not fold back into the title-order walk: the matches
+        // of one word cluster in title order (titles start with an adjective),
+        // so the walk-and-filter plan can read most of the table to find 21 rows.
+        let by_words = filter
+            .q
+            .as_deref()
+            .is_some_and(|q| !search_words(q).is_empty());
+        select.push(if by_words {
+            "WITH m AS MATERIALIZED (SELECT b.id, b.title FROM books b"
+        } else {
+            "SELECT b.id FROM books b"
+        });
         push_filter(&mut select, filter);
         if let Some((title, id)) = after {
             select.push(" AND (b.title, b.id) > (");
@@ -207,7 +219,11 @@ impl BookRepository for PostgresBookRepository {
             select.push_bind(id);
             select.push(")");
         }
-        select.push(" ORDER BY b.title ASC, b.id ASC");
+        if by_words {
+            select.push(") SELECT id FROM m ORDER BY title ASC, id ASC");
+        } else {
+            select.push(" ORDER BY b.title ASC, b.id ASC");
+        }
         select.push(" LIMIT ");
         select.push_bind(page.limit());
         select.push(" OFFSET ");
