@@ -336,6 +336,7 @@ pub fn test_config() -> Config {
         // No count cache: list totals stay exact in the HTTP tests.
         list_count_ttl_ms: 0,
         sqlite_checkpoint_interval_ms: 0,
+        password_hash_permits: None,
     }
 }
 

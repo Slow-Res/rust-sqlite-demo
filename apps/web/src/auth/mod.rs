@@ -14,6 +14,7 @@ mod service;
 mod sqlite;
 
 pub use extractor::AuthUser;
+pub use password::configure as configure_password_hashing;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresAuthRepository;
 pub use repo::{AuthRepository, SessionUser, UserRecord};

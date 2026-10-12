@@ -8,24 +8,53 @@
 //! Argon2id is memory-hard by design: every hash needs 19 MiB (the default
 //! parameters). `spawn_blocking` alone would run as many hashes at once as there
 //! are logins in flight (its pool grows to 512 threads), so a login burst could
-//! take gigabytes and get the process OOM-killed. More parallel hashes than
-//! cores add memory, not throughput, so a process-wide semaphore lets at most
-//! one hash per core run; further logins wait for a permit instead.
+//! take gigabytes and get the process OOM-killed. A process-wide semaphore lets
+//! only a few hashes run at once; further logins wait for a permit instead.
+//!
+//! The limit is half the cores, not all of them, for CPU as well as memory. Each
+//! hash is about 50-100 ms of CPU, and in the load test a step starts with 100
+//! new users logging in over 10 s: with one permit per core the web app went
+//! from 22% to 60-98% CPU, the 2-core box hit 200%, and every request queued
+//! (p99 1,026 ms at 2,500 users, while the average CPU was only 120%). Capped at
+//! half the cores, logins queue longer in a burst and other requests keep a core.
+//! `PASSWORD_HASH_PERMITS` overrides the limit.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use argon2::Argon2;
 use argon2::password_hash::{Error as HashError, PasswordHasher, PasswordVerifier};
 use tokio::sync::Semaphore;
 
-/// One permit per core (at least 1): the number of Argon2 hashes that may run at once.
-fn max_parallel_hashes() -> usize {
-    std::thread::available_parallelism().map_or(1, usize::from)
+/// How many hashes may run at once: `configured` (`PASSWORD_HASH_PERMITS`, already
+/// checked to be positive) if set, otherwise half of `cores`, and at least 1.
+fn permits_for(cores: usize, configured: Option<usize>) -> usize {
+    configured.unwrap_or_else(|| (cores / 2).max(1))
 }
 
-static HASH_PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(max_parallel_hashes())));
+fn default_permits(configured: Option<usize>) -> Arc<Semaphore> {
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    Arc::new(Semaphore::new(permits_for(cores, configured)))
+}
+
+static HASH_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Set the permit count from the config (`PASSWORD_HASH_PERMITS`). Call once at
+/// startup, before the first hash; a later call changes nothing. Without it (unit
+/// tests, other binaries) the first hash takes the default.
+pub fn configure(configured: Option<usize>) {
+    let permits = default_permits(configured);
+    tracing::info!(
+        permits = permits.available_permits(),
+        "password hashing limit"
+    );
+    // Already set means a hash ran first; keep the semaphore it is using.
+    let _ = HASH_PERMITS.set(permits);
+}
+
+fn hash_permits() -> Arc<Semaphore> {
+    HASH_PERMITS.get_or_init(|| default_permits(None)).clone()
+}
 
 /// Run `work` on the blocking pool once `permits` has a free permit. The permit is
 /// taken *before* `spawn_blocking`, so a waiting login costs only a queued future,
@@ -57,7 +86,7 @@ pub const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$kULZ+KhiNP3f8wTuk3H
 
 /// Hash `password` into a PHC string (`$argon2id$v=19$...`) with a random salt.
 pub async fn hash_password(password: String) -> anyhow::Result<String> {
-    run_limited(HASH_PERMITS.clone(), move || {
+    run_limited(hash_permits(), move || {
         Argon2::default()
             .hash_password(password.as_bytes())
             .map(|hash| hash.to_string())
@@ -69,7 +98,7 @@ pub async fn hash_password(password: String) -> anyhow::Result<String> {
 /// `Ok(true)` if `password` matches `hash`, `Ok(false)` if it does not, and
 /// `Err` only for a malformed hash or an internal failure.
 pub async fn verify_password(password: String, hash: String) -> anyhow::Result<bool> {
-    run_limited(HASH_PERMITS.clone(), move || {
+    run_limited(hash_permits(), move || {
         match Argon2::default().verify_password(password.as_bytes(), hash.as_str()) {
             Ok(()) => Ok(true),
             Err(HashError::PasswordInvalid) => Ok(false),
@@ -86,6 +115,19 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn default_permits_are_half_the_cores_and_at_least_one() {
+        for (cores, expected) in [(1, 1), (2, 1), (3, 1), (4, 2), (16, 8)] {
+            assert_eq!(permits_for(cores, None), expected, "{cores} cores");
+        }
+    }
+
+    #[test]
+    fn a_configured_count_overrides_the_default() {
+        assert_eq!(permits_for(2, Some(4)), 4);
+        assert_eq!(permits_for(16, Some(1)), 1);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn never_more_than_the_permit_count_run_at_once() {

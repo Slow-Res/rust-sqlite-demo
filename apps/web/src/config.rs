@@ -32,6 +32,9 @@ pub struct Config {
     /// SQLite only: how often, in ms, to checkpoint and truncate the WAL in the
     /// background (see `checkpoint`); 0 leaves it to SQLite (and Litestream).
     pub sqlite_checkpoint_interval_ms: u64,
+    /// How many password hashes may run at once; `None` takes half the cores (see
+    /// `auth::password`).
+    pub password_hash_permits: Option<usize>,
 }
 
 impl Config {
@@ -65,6 +68,14 @@ impl Config {
             );
         }
 
+        let password_hash_permits = match get("PASSWORD_HASH_PERMITS") {
+            None => None,
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => bail!("PASSWORD_HASH_PERMITS must be a positive integer, got `{raw}`"),
+            },
+        };
+
         Ok(Self {
             database_url: get("DATABASE_URL")
                 .unwrap_or_else(|| "sqlite://data/library.db".to_owned()),
@@ -78,6 +89,7 @@ impl Config {
             node_id,
             list_count_ttl_ms: parse_or(&get, "LIST_COUNT_TTL_MS", 1000)?,
             sqlite_checkpoint_interval_ms: parse_or(&get, "SQLITE_CHECKPOINT_INTERVAL_MS", 0)?,
+            password_hash_permits,
         })
     }
 }
@@ -120,6 +132,17 @@ mod tests {
         assert_eq!(config.log_format, LogFormat::Pretty);
         assert_eq!(config.list_count_ttl_ms, 1000);
         assert_eq!(config.sqlite_checkpoint_interval_ms, 0);
+        assert_eq!(config.password_hash_permits, None);
+    }
+
+    #[test]
+    fn password_hash_permits_must_be_a_positive_integer() {
+        let permits = |v: &str| Config::from_lookup(lookup(&[("PASSWORD_HASH_PERMITS", v)]));
+        assert_eq!(permits("3").unwrap().password_hash_permits, Some(3));
+        for bad in ["0", "-1", "", "two", "1.5"] {
+            let err = permits(bad).unwrap_err();
+            assert!(err.to_string().contains("PASSWORD_HASH_PERMITS"), "{bad}");
+        }
     }
 
     #[test]
