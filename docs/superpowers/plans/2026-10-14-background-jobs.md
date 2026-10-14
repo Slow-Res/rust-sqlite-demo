@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, tokio, sqlx 0.9 (Postgres), axum 0.8, prometheus-client 0.25, tokio-util 0.7, lettre 0.11 (SMTP), reqwest 0.13 (HTTP), hmac 0.13 + sha2 0.11, Postgres 18.6, Mailpit v1.31.2 (test SMTP).
 
-**Spec:** `docs/superpowers/specs/2026-10-14-background-jobs-design.md` (read it first; this plan argues from it). Task 19 records the small deviations listed under Global Constraints in the spec.
+**Spec:** `docs/superpowers/specs/2026-10-14-background-jobs-design.md` (read it first; this plan argues from it). Its §22 lists the deviations decided while planning; §23 the framework integration (axum, tokio, others).
 
 ## Global Constraints
 
@@ -20,7 +20,7 @@
 - Tests needing Postgres use `TEST_POSTGRES_URL` from `scripts/test-postgres.sh` (container `sqlite-production-test-pg`, port 55432). Never stop or remove that container. Each test creates and drops its own database.
 - Email tests use `TEST_SMTP_URL` / `TEST_MAILPIT_URL` from the new `scripts/test-mailpit.sh` (container `sqlite-production-test-mailpit`, image `axllent/mailpit:v1.31.2`).
 - Comments follow the repo: explain *why*, doc comments on public items, spec section references like `(spec §8.2)`. Committed dev credentials get a `# local only` / `// local only` comment.
-- Spec deviations decided while planning (Task 19 writes them into the spec): recurring tasks use a fixed interval (`every`), not cron; no `enqueue_many` (callers loop); no `trace` column; env names carry units (`JOBS_POLL_MS`, `JOBS_SHUTDOWN_TIMEOUT_S`, `JOBS_KEEP_SUCCEEDED_H`, `JOBS_KEEP_FAILED_H`, `JOBS_SMTP_TIMEOUT_S`); the lease is per kind in code (`JobOptions::lease`), not an env var; the migration table is set with `Migrator::dangerous_set_table_name`, not `sqlx.toml`.
+- Spec deviations decided while planning (already in spec §22; Task 20 adds any made while implementing): recurring tasks use a fixed interval (`every`), not cron; no `enqueue_many` (callers loop); no `trace` column; env names carry units (`JOBS_POLL_MS`, `JOBS_SHUTDOWN_TIMEOUT_S`, `JOBS_KEEP_SUCCEEDED_H`, `JOBS_KEEP_FAILED_H`, `JOBS_SMTP_TIMEOUT_S`); the lease is per kind in code (`JobOptions::lease`), not an env var; the migration table is set with `Migrator::dangerous_set_table_name`, not `sqlx.toml`.
 - Job kinds and queue names: `loan_email.v1` on queue `email`; `webhook.v1` on queue `webhooks`. Channel for NOTIFY: `jobs`. Migration table: `_jobs_migrations`. Leader advisory lock key: `0x6A6F_6273_6C65_6164_i64`.
 
 ## Review Focus
@@ -28,7 +28,7 @@
 1. **Arguments that no longer decode** (a payload changed without bumping the kind's version): the job must end `failed` with cause `bad_args` and a readable message, and the worker must keep serving other jobs. → Task 7 test `undecodable_args_fail_permanently`.
 2. **Enqueueing a unique key while the existing job is running**: returns `Duplicate(existing id)`, creates nothing, never aborts the caller's transaction; once that job finishes, the same key enqueues a new job. → Task 3 test `duplicate_while_running_then_new_after_finish`.
 3. **A handler that hangs and ignores cancellation**: after its deadline the attempt ends as `deadline_exceeded` and is retried, and the same worker keeps running other jobs. → Task 9 test `hung_handler_hits_deadline_and_worker_keeps_going`.
-4. **A remote that accepts the connection and never answers** (SMTP or webhook endpoint): the attempt fails with a retryable error within the configured timeout and frees its slot. → Task 16 test `hanging_smtp_server_times_out_as_retry`, Task 17 test `hanging_endpoint_times_out_as_retry`.
+4. **A remote that accepts the connection and never answers** (SMTP or webhook endpoint): the attempt fails with a retryable error within the configured timeout and frees its slot. → Task 17 test `hanging_smtp_server_times_out_as_retry`, Task 18 test `hanging_endpoint_times_out_as_retry`.
 5. **Huge error messages** (a handler returns a 1 MB error string): stored truncated to 2,000 characters, the errors list capped at 10 entries. → Task 6 test `errors_are_capped_and_truncated`, Task 7 test `huge_error_message_is_truncated`.
 
 ---
@@ -59,11 +59,14 @@ crates/jobs/src/heartbeat.rs                heartbeat + progress flush task     
 crates/jobs/src/worker.rs                   Worker: queue loops, listener, shutdown        spec §11, §13
 crates/jobs/src/maintenance.rs              leader election + periodic tasks             spec §8.5
 crates/jobs/src/metrics.rs                  prometheus families                           spec §17.2
-crates/jobs/src/http.rs                     /metrics /healthz /readyz                      spec §17.3
+crates/jobs/src/ready.rs                    readiness, framework-free                      spec §17.3, §23
+crates/jobs/src/http.rs                     axum router for /metrics /healthz /readyz (feature http)  spec §17.3, §23
 crates/jobs/src/ops.rs                      queries behind the ops CLI                    spec §17.4
 crates/jobs/tests/common/mod.rs             TestDb, fast configs, test job kinds
-crates/jobs/tests/{migrate,enqueue,process,claim,finish,execute,worker,maintenance,recurring,http,ops,child_process,outage}.rs
+crates/jobs/tests/{migrate,enqueue,process,claim,finish,execute,worker,maintenance,recurring,ready,http,axum_integration,ops,child_process,outage}.rs
 crates/jobs/examples/throughput.rs          ≥ 1,000 no-op jobs/s smoke                    spec §21
+crates/jobs/examples/axum_app.rs            the crate inside an axum app (compiled guide)  spec §23
+crates/jobs/README.md                       integration guide: tokio, axum, other frameworks (drafted)
 apps/web/Cargo.toml                         optional deps under feature postgres
 apps/web/src/jobs_config.rs                 JobsConfig (plain data, always compiled)
 apps/web/src/config.rs                      Config.jobs
@@ -79,7 +82,8 @@ apps/web/tests/{jobs_worker,jobs_events,jobs_email,jobs_email_chaos,jobs_webhook
 scripts/test-mailpit.sh                     throwaway Mailpit for tests
 Makefile, .github/workflows/ci.yml          Mailpit + web postgres tests
 deploy/compose/local/loadtest.web-pg.yml    `worker` service (profile jobs)
-docs/JOBS.md, docs/RUNBOOK.md, docs/ARCHITECTURE.md, docs/decisions/0007-own-job-queue.md
+docs/JOBS.md, docs/RUNBOOK.md, docs/ARCHITECTURE.md, docs/decisions/0007-own-job-queue.md   drafted; finalized in Task 20
+deploy/monitoring/alerts.yml, alerts.test.yml   JobsQueueStalled, JobsFailing, JobsNoLeader
 ```
 
 ---
@@ -134,7 +138,12 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 prometheus-client = "0.25"
-axum = "0.8"
+# Only for the optional /metrics /healthz /readyz router (spec §23).
+axum = { version = "0.8", optional = true }
+
+[features]
+default = ["http"]
+http = ["dep:axum"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -5173,21 +5182,68 @@ git commit -m "jobs: recurring ticks de-duplicated by (task, run_at) and batched
 
 ---
 
-### Task 12: HTTP endpoints (`/metrics`, `/healthz`, `/readyz`)
+### Task 12: Readiness and the optional axum router (`/metrics`, `/healthz`, `/readyz`)
 
 **Files:**
-- Create: `crates/jobs/src/http.rs`
-- Modify: `crates/jobs/src/lib.rs`
-- Test: `crates/jobs/tests/http.rs`
+- Create: `crates/jobs/src/ready.rs`, `crates/jobs/src/http.rs`
+- Modify: `crates/jobs/src/lib.rs`, `crates/jobs/src/worker.rs` (add `Worker::router`)
+- Test: `crates/jobs/tests/ready.rs`, `crates/jobs/tests/http.rs`
 
 **Interfaces:**
-- Produces: `http::router(metrics: Arc<Metrics>, health: Arc<Health>, pool: PgPool, heartbeat: Duration) -> axum::Router`; `http::serve(listener: tokio::net::TcpListener, router: Router, stop: CancellationToken) -> std::io::Result<()>`.
+- Consumes: `Health` (Task 8), `Metrics`, `Worker` (Task 9).
+- Produces:
+  - Always compiled: `ready::ready(health: &Health, pool: &PgPool, stale_after: Duration) -> Result<(), NotReady>`; `enum NotReady { Fenced, NoHeartbeatYet, StaleHeartbeat(Duration), DatabaseUnreachable }` with `Display` and `std::error::Error`. Re-exported as `library_jobs::{ready, NotReady, Health, Metrics}`.
+  - Feature `http` (default): `http::router(metrics: Arc<Metrics>, health: Arc<Health>, pool: PgPool, heartbeat: Duration) -> axum::Router`; `http::serve(listener: tokio::net::TcpListener, router: Router, stop: CancellationToken) -> std::io::Result<()>`; `Worker::router(&self) -> axum::Router`.
 
-- [ ] **Step 1: Write the failing test**
+Readiness lives outside the axum module so an app on another framework (actix-web, Rocket, …) can
+answer `/readyz` with two lines of its own (spec §23); `http.rs` is a thin adapter over it.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `crates/jobs/tests/ready.rs` (no axum: it must pass with `--no-default-features`):
+
+```rust
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+mod common;
+
+use std::time::Duration;
+
+use common::*;
+use library_jobs::{Health, NotReady, ready};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn readiness_follows_heartbeats_fencing_and_the_database() {
+    with_db(|pool| async move {
+        let stale_after = Duration::from_millis(500);
+        let health = Health::default();
+        assert_eq!(ready(&health, &pool, stale_after).await, Err(NotReady::NoHeartbeatYet));
+        health.beat_ok();
+        assert_eq!(ready(&health, &pool, stale_after).await, Ok(()));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(matches!(ready(&health, &pool, stale_after).await, Err(NotReady::StaleHeartbeat(_))));
+        health.beat_ok();
+        health.set_fenced();
+        let fenced = ready(&health, &pool, stale_after).await.unwrap_err();
+        assert_eq!(fenced, NotReady::Fenced);
+        assert!(fenced.to_string().contains("self-fenced"));
+
+        // A pool that can never connect: port 1 refuses at once.
+        let dead = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused") // local only
+            .unwrap();
+        let fresh = Health::default();
+        fresh.beat_ok();
+        assert_eq!(ready(&fresh, &dead, Duration::from_secs(5)).await, Err(NotReady::DatabaseUnreachable));
+    })
+    .await;
+}
+```
 
 Create `crates/jobs/tests/http.rs`:
 
 ```rust
+#![cfg(feature = "http")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 mod common;
 
@@ -5226,18 +5282,83 @@ async fn readiness_follows_heartbeats_and_metrics_count_jobs() {
         let _ = w.handle.await;
     }).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_router_serves_the_same_endpoints() {
+    with_db(|pool| async move {
+        let worker = library_jobs::Worker::new(pool.clone(), registry(), fast_config("default:1")).unwrap();
+        let router = worker.router();
+        assert_eq!(get(&router, "/healthz").await.0, StatusCode::OK);
+        assert_eq!(get(&router, "/readyz").await.0, StatusCode::SERVICE_UNAVAILABLE, "not running: no heartbeat yet");
+        assert!(get(&router, "/metrics").await.1.contains("jobs_leader"));
+    }).await;
+}
 ```
 
-- [ ] **Step 2: Run to see it fail**
+- [ ] **Step 2: Run to see them fail**
 
-Run: `cargo test -p library-jobs --test http`
-Expected: compile error (`http` module not found).
+Run: `cargo test -p library-jobs --test ready --test http`
+Expected: compile errors (`ready`, `NotReady`, `http` not found).
 
-- [ ] **Step 3: Implement `http.rs`**
+- [ ] **Step 3: Implement `ready.rs`**
 
 ```rust
-//! `/metrics`, `/healthz`, `/readyz` for a worker process (spec §17.2-17.3).
-//! Bind it to an internal address only.
+//! Readiness without any web framework (spec §17.3, §23). `http` serves it as
+//! `/readyz`; an app on another framework calls it from its own handler.
+
+use std::fmt;
+use std::time::Duration;
+
+use sqlx::PgPool;
+
+use crate::heartbeat::Health;
+
+/// Longest wait for the database's answer.
+const DB_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotReady {
+    /// The registry row was deleted: the process stopped working and must exit.
+    Fenced,
+    NoHeartbeatYet,
+    StaleHeartbeat(Duration),
+    DatabaseUnreachable,
+}
+
+impl fmt::Display for NotReady {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fenced => f.write_str("self-fenced: the registry row was deleted"),
+            Self::NoHeartbeatYet => f.write_str("no heartbeat yet"),
+            Self::StaleHeartbeat(age) => write!(f, "last heartbeat {age:?} ago"),
+            Self::DatabaseUnreachable => f.write_str("database unreachable"),
+        }
+    }
+}
+
+impl std::error::Error for NotReady {}
+
+/// Ready: not fenced, a heartbeat within `stale_after` (three heartbeat
+/// periods is the usual choice), and the database answers within 2 s.
+pub async fn ready(health: &Health, pool: &PgPool, stale_after: Duration) -> Result<(), NotReady> {
+    if health.is_fenced() {
+        return Err(NotReady::Fenced);
+    }
+    match health.last_beat_age() {
+        None => return Err(NotReady::NoHeartbeatYet),
+        Some(age) if age > stale_after => return Err(NotReady::StaleHeartbeat(age)),
+        Some(_) => {}
+    }
+    let ping = tokio::time::timeout(DB_TIMEOUT, sqlx::query("SELECT 1").execute(pool)).await;
+    if matches!(ping, Ok(Ok(_))) { Ok(()) } else { Err(NotReady::DatabaseUnreachable) }
+}
+```
+
+- [ ] **Step 4: Implement `http.rs`**
+
+```rust
+//! `/metrics`, `/healthz`, `/readyz` as an axum router (feature `http`, spec
+//! §17.3). Serve it on an internal address, or behind admin auth.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -5253,6 +5374,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::heartbeat::Health;
 use crate::metrics::Metrics;
+use crate::ready::ready;
 
 #[derive(Clone)]
 struct HttpState {
@@ -5270,22 +5392,11 @@ pub fn router(metrics: Arc<Metrics>, health: Arc<Health>, pool: PgPool, heartbea
         .with_state(HttpState { metrics, health, pool, stale_after: heartbeat * 3 })
 }
 
-/// Ready: not fenced, a heartbeat within three periods, and the database answers.
 async fn readyz(State(s): State<HttpState>) -> (StatusCode, String) {
-    let unavailable = |msg: String| (StatusCode::SERVICE_UNAVAILABLE, msg);
-    if s.health.is_fenced() {
-        return unavailable("self-fenced: the registry row was deleted\n".into());
+    match ready(&s.health, &s.pool, s.stale_after).await {
+        Ok(()) => (StatusCode::OK, "ready\n".into()),
+        Err(not_ready) => (StatusCode::SERVICE_UNAVAILABLE, format!("{not_ready}\n")),
     }
-    match s.health.last_beat_age() {
-        None => return unavailable("no heartbeat yet\n".into()),
-        Some(age) if age > s.stale_after => return unavailable(format!("last heartbeat {age:?} ago\n")),
-        Some(_) => {}
-    }
-    let ping = tokio::time::timeout(Duration::from_secs(2), sqlx::query("SELECT 1").execute(&s.pool)).await;
-    if !matches!(ping, Ok(Ok(_))) {
-        return unavailable("database unreachable\n".into());
-    }
-    (StatusCode::OK, "ready\n".into())
 }
 
 async fn metrics_text(State(s): State<HttpState>) -> impl IntoResponse {
@@ -5302,19 +5413,45 @@ pub async fn serve(listener: TcpListener, router: Router, stop: CancellationToke
 }
 ```
 
-Add `pub mod http;` to `lib.rs`.
+In `worker.rs`, inside `impl Worker` (after `health()`):
 
-- [ ] **Step 4: Run the test**
+```rust
+    /// `/metrics`, `/healthz` and `/readyz` for this worker, ready to serve or
+    /// nest (feature `http`).
+    #[cfg(feature = "http")]
+    pub fn router(&self) -> axum::Router {
+        crate::http::router(self.metrics(), self.health(), self.pool.clone(), self.config.heartbeat)
+    }
+```
 
-Run: `cargo test -p library-jobs --test http`
-Expected: PASS.
+In `lib.rs`:
 
-- [ ] **Step 5: Commit**
+```rust
+pub mod ready;
+#[cfg(feature = "http")]
+pub mod http;
+
+pub use heartbeat::Health;
+pub use metrics::Metrics;
+pub use ready::{NotReady, ready};
+```
+
+- [ ] **Step 5: Run the tests, with and without the feature**
 
 ```bash
-cargo clippy -p library-jobs --all-targets -- -D warnings && cargo fmt
+cargo test -p library-jobs --test ready --test http
+cargo test -p library-jobs --no-default-features --test ready
+cargo build -p library-jobs --no-default-features
+test -z "$(cargo tree -q -p library-jobs --no-default-features -i axum 2>/dev/null)"
+```
+Expected: 3 PASS, then 1 PASS without the feature; the axum-free build compiles and has no axum in its tree.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cargo clippy -p library-jobs --all-targets -- -D warnings && cargo clippy -p library-jobs --no-default-features --all-targets -- -D warnings && cargo fmt
 git add crates/jobs
-git commit -m "jobs: /metrics, /healthz and /readyz for worker processes"
+git commit -m "jobs: framework-free readiness, and /metrics /healthz /readyz as an optional axum router"
 ```
 
 ---
@@ -5927,7 +6064,7 @@ Run (scratch database on the test Postgres):
 docker exec sqlite-production-test-pg psql -U postgres -c 'DROP DATABASE IF EXISTS jobs_bench' -c 'CREATE DATABASE jobs_bench'
 taskset -c 6-9 cargo run --release -p library-jobs --example throughput -- "${TEST_POSTGRES_URL%/*}/jobs_bench"
 ```
-Expected: a line like `20000 jobs in N s = X jobs/s`; X ≥ 1,000. Record the number for `docs/JOBS.md` (Task 19). If it is below 1,000, profile before changing anything (likely suspects: claim batch size = free slots, per-job `notify_one` wake-ups).
+Expected: a line like `20000 jobs in N s = X jobs/s`; X ≥ 1,000. Record the number for `docs/JOBS.md` (Task 20). If it is below 1,000, profile before changing anything (likely suspects: claim batch size = free slots, per-job `notify_one` wake-ups).
 
 - [ ] **Step 7: Commit**
 
@@ -5938,7 +6075,347 @@ git commit -m "jobs: real SIGKILL recovery test, ignored database-outage test, t
 ```
 
 ---
-### Task 15: Web app: jobs config, dependencies, `worker` and `jobs` subcommands, embedded mode
+### Task 15: axum integration: tests, a compiled example, and the crate README
+
+**Files:**
+- Create: `crates/jobs/tests/axum_integration.rs`, `crates/jobs/examples/axum_app.rs`
+- Modify: `crates/jobs/Cargo.toml` (`[[example]]`, dev-dependency `tracing-subscriber`), `crates/jobs/README.md` (drafted 2026-10-15)
+
+**Interfaces:**
+- Consumes: `Enqueuer`, `Job`, `Registry`, `Worker`, `Worker::router`, `http::serve`, `ExitReason` (Tasks 3, 7, 9, 12); `common::{with_db, start, fast_config, eventually, count, Noop}`.
+- Produces: nothing new in the API. This task proves the integration the README promises (spec §23).
+
+The README was drafted before the code. This task makes it true: every snippet and name in it
+must match the API as built.
+
+- [ ] **Step 1: Write the integration tests**
+
+Create `crates/jobs/tests/axum_integration.rs`:
+
+```rust
+//! The crate used the way the README's axum section shows: a handler enqueues
+//! in its transaction, and a worker in the same process runs the job.
+#![cfg(feature = "http")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+mod common;
+
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::extract::{FromRef, State};
+use axum::http::{Request, StatusCode};
+use axum::routing::post;
+use axum::{Json, Router};
+use common::*;
+use library_jobs::{Enqueuer, ExitReason};
+use sqlx::PgPool;
+use tower::ServiceExt;
+
+#[derive(Clone, FromRef)]
+struct AppState {
+    pool: PgPool,
+    jobs: Enqueuer,
+}
+
+#[derive(serde::Deserialize)]
+struct SignUp {
+    email: String,
+}
+
+/// The README's handler. An address ending in `@rollback.test` stands in for a
+/// failure after the enqueue: the transaction is dropped, user and job vanish together.
+async fn sign_up(State(pool): State<PgPool>, State(jobs): State<Enqueuer>, Json(body): Json<SignUp>) -> StatusCode {
+    let mut tx = pool.begin().await.unwrap();
+    let id: Option<i64> = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) ON CONFLICT (email) DO NOTHING RETURNING id")
+        .bind(&body.email)
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap();
+    let Some(id) = id else { return StatusCode::CONFLICT };
+    jobs.enqueue(&mut *tx, &Noop { n: id }).await.unwrap();
+    if body.email.ends_with("@rollback.test") {
+        return StatusCode::UNPROCESSABLE_ENTITY;
+    }
+    tx.commit().await.unwrap();
+    StatusCode::CREATED
+}
+
+fn app(pool: PgPool) -> Router {
+    Router::new().route("/signup", post(sign_up)).with_state(AppState { pool, jobs: Enqueuer::new(true) })
+}
+
+async fn post_signup(app: &Router, email: &str) -> StatusCode {
+    let req = Request::post("/signup")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+async fn users_table(pool: &PgPool) {
+    sqlx::query("CREATE TABLE users (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email TEXT NOT NULL UNIQUE)")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_enqueues_inside_its_transaction() {
+    with_db(|pool| async move {
+        users_table(&pool).await;
+        let app = app(pool.clone());
+        assert_eq!(post_signup(&app, "a@example.test").await, StatusCode::CREATED);
+        assert_eq!(post_signup(&app, "a@example.test").await, StatusCode::CONFLICT);
+        assert_eq!(post_signup(&app, "b@rollback.test").await, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(count(&pool, "SELECT count(*) FROM users").await, 1);
+        assert_eq!(count(&pool, "SELECT count(*) FROM jobs").await, 1, "one job, for the one committed user");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_in_the_same_process_runs_the_job_and_stops_cleanly() {
+    with_db(|pool| async move {
+        users_table(&pool).await;
+        let w = start(&pool, fast_config("default:2"));
+        let app = app(pool.clone());
+        assert_eq!(post_signup(&app, "c@example.test").await, StatusCode::CREATED);
+        eventually(Duration::from_secs(5), "the job ran", || async {
+            count(&pool, "SELECT count(*) FROM test_runs").await == 1
+        })
+        .await;
+        assert_eq!(w.shutdown().await, ExitReason::Shutdown);
+    })
+    .await;
+}
+```
+
+- [ ] **Step 2: Run them**
+
+Run: `cargo test -p library-jobs --test axum_integration`
+Expected: 2 PASS. This task adds no library code; the tests pin what the README promises. A
+failure here is a bug in Tasks 3, 9 or 12 (or a wrong promise in the README): fix it there.
+
+- [ ] **Step 3: Write the example**
+
+In `crates/jobs/Cargo.toml` add:
+
+```toml
+[[example]]
+name = "axum_app"
+required-features = ["http"]
+```
+
+and under `[dev-dependencies]`: `tracing-subscriber = "0.3"`.
+
+Create `crates/jobs/examples/axum_app.rs`:
+
+```rust
+//! The crate inside an axum app (README, "axum"): a sign-up handler enqueues a
+//! job in its transaction, a worker runs in the same process, /metrics /healthz
+//! /readyz are served on an internal address, and Ctrl-C drains HTTP, then the
+//! worker. Use a scratch database:
+//!
+//!   cargo run -p library-jobs --example axum_app -- <DATABASE_URL>
+//!   curl -i -H 'content-type: application/json' -d '{"email":"a@example.com"}' 127.0.0.1:3000/signup
+//!   curl -s 127.0.0.1:9300/metrics | grep jobs_completed
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use axum::extract::{FromRef, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
+use library_jobs::{
+    EnqueueError, Enqueuer, ExitReason, Job, JobContext, JobError, JobOptions, QueueConfig, Registry, Worker, WorkerConfig,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
+use tokio_util::sync::CancellationToken;
+
+/// Stands in for an SMTP client: shared services reach handlers through `ctx.require`.
+struct Greeter {
+    greeting: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WelcomeEmail {
+    user_id: i64,
+}
+
+impl Job for WelcomeEmail {
+    const KIND: &'static str = "example_welcome_email.v1";
+    const QUEUE: &'static str = "email";
+
+    fn options() -> JobOptions {
+        JobOptions { deadline: Duration::from_secs(30), ..JobOptions::default() }
+    }
+
+    fn unique_key(&self) -> Option<String> {
+        Some(self.user_id.to_string())
+    }
+
+    async fn perform(self, ctx: JobContext) -> Result<(), JobError> {
+        let greeter = ctx.require::<Greeter>()?;
+        let email: Option<String> = sqlx::query_scalar("SELECT email FROM example_users WHERE id = $1")
+            .bind(self.user_id)
+            .fetch_optional(ctx.pool())
+            .await?;
+        match email {
+            Some(email) => tracing::info!(job_id = ctx.id(), attempt = ctx.attempt(), "{} {email}", greeter.greeting),
+            None => tracing::info!(job_id = ctx.id(), "user {} is gone; nothing to send", self.user_id),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, FromRef)]
+struct AppState {
+    pool: PgPool,
+    jobs: Enqueuer,
+}
+
+#[derive(Deserialize)]
+struct SignUp {
+    email: String,
+}
+
+async fn sign_up(
+    State(pool): State<PgPool>,
+    State(jobs): State<Enqueuer>,
+    Json(body): Json<SignUp>,
+) -> Result<StatusCode, AppError> {
+    let mut tx = pool.begin().await?;
+    let id: Option<i64> =
+        sqlx::query_scalar("INSERT INTO example_users (email) VALUES ($1) ON CONFLICT (email) DO NOTHING RETURNING id")
+            .bind(&body.email)
+            .fetch_optional(&mut *tx)
+            .await?;
+    // Returning drops `tx`: a rollback, and no job.
+    let Some(id) = id else { return Ok(StatusCode::CONFLICT) };
+    jobs.enqueue(&mut *tx, &WelcomeEmail { user_id: id }).await?;
+    tx.commit().await?; // the user and the job commit together; NOTIFY goes out now
+    Ok(StatusCode::CREATED)
+}
+
+/// Both errors mean "could not save": a 500, logged, never the database's text to the client.
+struct AppError(anyhow::Error);
+
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        Self(err.into())
+    }
+}
+
+impl From<EnqueueError> for AppError {
+    fn from(err: EnqueueError) -> Self {
+        Self(err.into())
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        tracing::error!(error = ?self.0, "request failed");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    }
+}
+
+fn registry() -> Registry {
+    Registry::new()
+        .register::<WelcomeEmail>()
+        .provide(Arc::new(Greeter { greeting: "welcome,".to_owned() }))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+    let url = std::env::args().nth(1).context("usage: axum_app <DATABASE_URL>")?;
+
+    let pool = PgPoolOptions::new().max_connections(10).connect(&url).await?;
+    // Stands in for your own migrations.
+    sqlx::query("CREATE TABLE IF NOT EXISTS example_users (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email TEXT NOT NULL UNIQUE)")
+        .execute(&pool)
+        .await?;
+    library_jobs::migrate(&pool).await?;
+
+    // The worker gets a pool of its own, so jobs never wait for the API's connections.
+    let worker_pool = PgPoolOptions::new().max_connections(8).connect(&url).await?;
+    let worker = Worker::new(worker_pool, registry(), WorkerConfig::new(QueueConfig::parse_list("email:4")?))?;
+    let internal = worker.router();
+
+    let stop = CancellationToken::new();
+    tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            let _ = tokio::signal::ctrl_c().await;
+            stop.cancel();
+        }
+    });
+    let worker_task = tokio::spawn(worker.run(stop.clone()));
+
+    // Internal endpoints on their own address, never on the public listener.
+    let private = tokio::net::TcpListener::bind("127.0.0.1:9300").await?;
+    tokio::spawn(library_jobs::http::serve(private, internal, stop.clone()));
+
+    let app = Router::new()
+        .route("/signup", post(sign_up))
+        .with_state(AppState { pool, jobs: Enqueuer::new(true) });
+    let public = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    tracing::info!("API on 127.0.0.1:3000, jobs endpoints on 127.0.0.1:9300; Ctrl-C to stop");
+    axum::serve(public, app).with_graceful_shutdown(stop.clone().cancelled_owned()).await?;
+
+    // HTTP has drained; now running jobs finish or go back to the queue.
+    match worker_task.await?? {
+        ExitReason::Shutdown => Ok(()),
+        ExitReason::SelfFenced => anyhow::bail!("the jobs worker fenced itself off; restart the process"),
+    }
+}
+```
+
+If `CancellationToken::cancelled_owned` is missing in the resolved tokio-util, use
+`async move { stop.cancelled().await }` on a clone instead (the form `http::serve` uses).
+
+- [ ] **Step 4: Build and smoke-run the example**
+
+```bash
+cargo clippy -p library-jobs --all-targets -- -D warnings
+docker exec sqlite-production-test-pg psql -U postgres -c 'DROP DATABASE IF EXISTS jobs_example' -c 'CREATE DATABASE jobs_example'
+cargo run -p library-jobs --example axum_app -- "${TEST_POSTGRES_URL%/*}/jobs_example" &
+sleep 5
+curl -fsS -o /dev/null -w '%{http_code}\n' -H 'content-type: application/json' -d '{"email":"a@example.com"}' 127.0.0.1:3000/signup
+curl -fsS -o /dev/null -w '%{http_code}\n' -H 'content-type: application/json' -d '{"email":"a@example.com"}' 127.0.0.1:3000/signup || true
+sleep 2
+curl -fsS 127.0.0.1:9300/metrics | grep 'jobs_completed_total'
+kill -INT %1; wait %1; echo "exit $?"
+```
+Expected: `201`, then `409`; the log line `welcome, a@example.com`; a
+`jobs_completed_total{kind="example_welcome_email.v1",outcome="succeeded"} 1` line; exit 0 after
+Ctrl-C.
+
+- [ ] **Step 5: Make the README true**
+
+Read `crates/jobs/README.md` top to bottom against the code. For each snippet and table row:
+names, signatures, defaults (`max_attempts` 10, deadline 15 min, heartbeat 20 s, lease 60 s,
+`shutdown_timeout` 25 s, `cancel_grace` 5 s, the 64 KB argument limit), feature names, metric
+names. The axum section's `main` must match `examples/axum_app.rs` (copy it from the example if
+they differ). Fix the README, not the code, unless the README describes what the spec requires;
+then fix the code and add a test. Remove the "Draft" note at the top.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cargo fmt
+git add crates/jobs
+git commit -m "jobs: axum integration tests, a compiled axum example, and the crate README checked against the API"
+```
+
+---
+
+### Task 16: Web app: jobs config, dependencies, `worker` and `jobs` subcommands, embedded mode
 
 **Files:**
 - Create: `apps/web/src/jobs_config.rs`, `apps/web/src/jobs/mod.rs`, `apps/web/src/jobs/worker.rs`, `apps/web/src/jobs/ops_cli.rs`, `apps/web/tests/jobs_worker.rs`
@@ -6398,7 +6875,7 @@ use crate::jobs_config::JobsConfig;
 /// settings are missing (no SMTP URL, no webhook endpoint) is left out, so its
 /// jobs wait, and `jobs status` names them, instead of failing.
 pub fn registry(jobs: &JobsConfig) -> anyhow::Result<Registry> {
-    let _ = jobs; // the email and webhook kinds read it (Tasks 16-17)
+    let _ = jobs; // the email and webhook kinds read it (Tasks 17-18)
     Ok(Registry::new())
 }
 
@@ -6452,12 +6929,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let pool = super::connect(&config.database_url, config.jobs.db_pool).await?;
     db::migrate(&Database::Postgres(pool.clone())).await?;
     super::migrate(&pool).await?;
-    let worker_config = super::worker_config(&config.jobs, "worker")?;
-    let heartbeat = worker_config.heartbeat;
-    let worker = Worker::new(pool.clone(), super::registry(&config.jobs)?, worker_config)?;
+    let worker = Worker::new(pool.clone(), super::registry(&config.jobs)?, super::worker_config(&config.jobs, "worker")?)?;
 
     let stop = CancellationToken::new();
-    let router = library_jobs::http::router(worker.metrics(), worker.health(), pool.clone(), heartbeat);
+    let router = worker.router();
     let addr = config.jobs.metrics_addr;
     let listener = TcpListener::bind(addr).await.with_context(|| format!("binding JOBS_METRICS_ADDR {addr}"))?;
     tracing::info!(%addr, "worker metrics and health listening");
@@ -6868,14 +7343,14 @@ git commit -m "web: JOBS_* config, worker and jobs subcommands, embedded mode, j
 
 ---
 
-### Task 16: `loan_email.v1` and the Mailer
+### Task 17: `loan_email.v1` and the Mailer
 
 **Files:**
 - Create: `apps/web/src/jobs/events.rs`, `apps/web/src/jobs/loan_email.rs`, `scripts/test-mailpit.sh`, `apps/web/tests/jobs_email.rs`, `apps/web/tests/jobs_email_chaos.rs`
 - Modify: `apps/web/src/jobs/mod.rs`
 
 **Interfaces:**
-- Consumes: `Job`, `JobContext::detached`, `JobError`, `Deps` (Task 3); `JobsConfig`, `Secret` (Task 15).
+- Consumes: `Job`, `JobContext::detached`, `JobError`, `Deps` (Task 3); `JobsConfig`, `Secret` (Task 16).
 - Produces:
   - `jobs::events::LoanEventKind { Borrowed, Returned }` (serde `snake_case`) with `as_str()`; `jobs::events::event_id(loan_id: i64, LoanEventKind) -> String` = `loan.<id>.<borrowed|returned>`.
   - `jobs::loan_email::LoanEmail { loan_id: i64, event: LoanEventKind }` (kind `loan_email.v1`, queue `email`, unique key = the event id).
@@ -7149,7 +7624,7 @@ If `chaos(0, 0)` is refused (Mailpit may reject `ErrorCode` 0), reset with `Erro
 Run: `eval "$(./scripts/test-mailpit.sh)" && cargo test -p library-web --features postgres --test jobs_email`
 Expected: compile errors (`jobs::events`, `jobs::loan_email` not found).
 
-- [ ] **Step 4: Implement `events.rs` (event kinds only; Task 18 adds the enqueueing)**
+- [ ] **Step 4: Implement `events.rs` (event kinds only; Task 19 adds the enqueueing)**
 
 ```rust
 //! Loan events: what borrowing or returning a book tells the outside world
@@ -7353,14 +7828,14 @@ git commit -m "web: loan_email.v1 over SMTP with a stable Message-ID; 5xx perman
 
 ---
 
-### Task 17: `webhook.v1`, `WebhookSender` and Standard Webhooks signatures
+### Task 18: `webhook.v1`, `WebhookSender` and Standard Webhooks signatures
 
 **Files:**
 - Create: `apps/web/src/jobs/webhook.rs`, `apps/web/tests/jobs_webhook.rs`
 - Modify: `apps/web/src/jobs/mod.rs`
 
 **Interfaces:**
-- Consumes: `LoanEventKind`, `event_id` (Task 16); `WebhookEndpoint`, `Secret`, `decode_secret` (Task 15); `LoanDetails` (`crate::loans`).
+- Consumes: `LoanEventKind`, `event_id` (Task 17); `WebhookEndpoint`, `Secret`, `decode_secret` (Task 16); `LoanDetails` (`crate::loans`).
 - Produces: `jobs::webhook::{WebhookEvent { id, kind (serde "type"), occurred_at: DateTime<Utc>, data: Value }, WebhookEvent::loan(LoanEventKind, &LoanDetails), Webhook { endpoint: String, event: WebhookEvent }, WebhookSender::new(&[WebhookEndpoint], connect_timeout, timeout) -> anyhow::Result<Self>, WebhookSender::from_config(&JobsConfig) -> anyhow::Result<Option<Self>>, deliver(&self, endpoint: &str, &WebhookEvent) -> Result<(), JobError>, sign(key: &[u8], id: &str, timestamp: i64, body: &[u8]) -> Result<String, JobError>}`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -7780,14 +8255,14 @@ git commit -m "web: webhook.v1 with Standard Webhooks signatures, no redirects, 
 
 ---
 
-### Task 18: Enqueue on borrow and return (the outbox in the loan transactions)
+### Task 19: Enqueue on borrow and return (the outbox in the loan transactions)
 
 **Files:**
 - Modify: `apps/web/src/jobs/events.rs`, `apps/web/src/loans/postgres.rs`, `apps/web/src/state.rs`, `apps/web/tests/common/mod.rs`
 - Create: `apps/web/tests/jobs_events.rs`
 
 **Interfaces:**
-- Consumes: `Enqueuer`, `EnqueueError` (Task 3); `LoanEmail` (Task 16); `Webhook`, `WebhookEvent` (Task 17); `JobsConfig` (Task 15); `jobs::registry`, `jobs::worker_config` (Tasks 15–17).
+- Consumes: `Enqueuer`, `EnqueueError` (Task 3); `LoanEmail` (Task 17); `Webhook`, `WebhookEvent` (Task 18); `JobsConfig` (Task 16); `jobs::registry`, `jobs::worker_config` (Tasks 16–18).
 - Produces: `jobs::events::LoanEvents::from_config(&JobsConfig) -> Option<LoanEvents>`, `LoanEvents::record(&self, &mut PgConnection, LoanEventKind, &LoanDetails) -> Result<(), EnqueueError>`; `PostgresLoanRepository::with_events(self, Option<LoanEvents>) -> Self`; test helper `TestApp::with_jobs(db, JobsConfig)`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -8116,11 +8591,11 @@ git commit -m "web: borrow and return enqueue loan_email and webhook jobs inside
 
 ---
 
-### Task 19: Deployment, CI, docs, spec deviations, soak and acceptance
+### Task 20: Deployment, CI, docs, spec deviations, soak and acceptance
 
 **Files:**
-- Modify: `deploy/compose/local/loadtest.web.yml`, `deploy/compose/local/loadtest.web-pg.yml`, `.github/workflows/ci.yml`, `Makefile`, `docs/RUNBOOK.md`, `docs/ARCHITECTURE.md`, `docs/superpowers/specs/2026-10-14-background-jobs-design.md`, `.env.example`
-- Create: `docs/JOBS.md`, `docs/decisions/0007-own-job-queue.md`
+- Modify: `deploy/compose/local/loadtest.web.yml`, `deploy/compose/local/loadtest.web-pg.yml`, `.github/workflows/ci.yml`, `Makefile`, `.env.example`, `deploy/monitoring/alerts.yml`, `deploy/monitoring/alerts.test.yml`
+- Finalize (drafted on 2026-10-15, before implementation): `docs/JOBS.md`, `docs/RUNBOOK.md` (Background jobs sections), `docs/ARCHITECTURE.md` (Background jobs module map), `docs/decisions/0007-own-job-queue.md`, spec §22
 
 - [ ] **Step 1: Compose**
 
@@ -8200,6 +8675,8 @@ after `- run: cargo test --workspace`:
 ```yaml
       - run: cargo clippy -p library-web --all-targets --features postgres -- -D warnings
       - run: cargo test -p library-web --features postgres
+      - name: library-jobs builds without axum
+        run: cargo build -p library-jobs --no-default-features && test -z "$(cargo tree -q -p library-jobs --no-default-features -i axum 2>/dev/null)"
 ```
 
 In the `Makefile`, `test` becomes:
@@ -8224,178 +8701,124 @@ In `.env.example`, add:
 Run: `make test`
 Expected: PASS.
 
-- [ ] **Step 3: `docs/JOBS.md`**
+- [ ] **Step 3: Alerts**
 
-```markdown
-# Background jobs
+Append to the rules of `deploy/monitoring/alerts.yml` (same group, after `WalTooLarge`):
 
-Postgres only. The queue is the `library-jobs` crate (`crates/jobs`); the app's
-jobs live in `apps/web/src/jobs/`. Design: `docs/superpowers/specs/2026-10-14-background-jobs-design.md`.
-Why our own crate: [decision 0007](decisions/0007-own-job-queue.md).
-
-## Concepts
-
-- **Job**: a row in `jobs` with a `kind` (`loan_email.v1`), a `queue` (`email`) and JSON `args`.
-  The kind's version suffix changes whenever its arguments change shape.
-- **Outbox**: a job is inserted with the caller's connection, inside the caller's transaction.
-  It exists exactly when the data change commits. Borrow and return do this (`loans/postgres.rs`).
-- **Worker process**: `library-web worker`. One claim loop per queue (`JOBS_QUEUES`, `name:slots[:max_running]`),
-  one heartbeat task, one LISTEN connection, and a candidate for maintenance leader.
-- **Lease**: a running job belongs to one process until `locked_until` (60 s by default per kind). The heartbeat
-  (every 20 s) renews the leases of all running jobs in one statement. A process that stops beating loses its jobs;
-  the leader re-queues them as a crash (`crashes + 1`, cause `lease_expired` or `process_lost`).
-- **Fencing**: every outcome write checks `locked_by` and `attempt`. A process that lost a job can no longer change it.
-- **Leader**: one process holds an advisory lock and runs the reaper (5 s), pruner (30 s), recurring ticks,
-  retention (succeeded 24 h, failed 14 d) and the queue gauges.
-
-## Guarantees
-
-- At least once. A handler can run again after a crash between its side effect and the completion write, so
-  handlers must be idempotent or de-duplicate downstream (the email's `Message-ID` and the webhook's `webhook-id`
-  are stable across attempts).
-- A job is never lost: it ends `succeeded`, `failed` (attempts or crashes used up, or a permanent error) or `cancelled`.
-- Unique keys: while a job with the same kind and key is waiting or running, enqueue returns `Duplicate(id)` and
-  creates nothing, without failing the caller's transaction.
-- All times are database time.
-
-## Writing a job
-
-1. A struct with `Serialize + Deserialize`, and `impl Job` with `KIND` (`name.v1`), `QUEUE`, optional `options()`,
-   `unique_key()`, `concurrency_key()`, and `async fn perform(self, ctx: JobContext) -> Result<(), JobError>`.
-2. Errors: `JobError::Retry` (backoff 5 s doubling to 1 h, full jitter), `RetryAfter(delay)`, `Permanent` (no retry),
-   `Cancelled`. A panic counts as a retryable error.
-3. Long jobs check `ctx.cancelled()` and report `ctx.set_progress(json)`.
-4. Register it in `jobs::registry()` and give it what it needs with `.provide(Arc::new(..))`; the handler takes it
-   with `ctx.require::<T>()`.
-5. Enqueue with `Enqueuer::enqueue(&mut tx, &job)` inside your transaction.
-
-## Configuration
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `JOBS_ENABLED` | `false` | Enqueue, migrate the jobs schema, allow `worker` |
-| `JOBS_EMBEDDED` | `false` | Also run a worker inside `serve` |
-| `JOBS_QUEUES` | `email:4,webhooks:8` | Queues and handler slots of a worker |
-| `JOBS_POLL_MS` | `1000` | Fallback poll; NOTIFY wakes workers sooner |
-| `JOBS_NOTIFY` | `true` | NOTIFY on enqueue, LISTEN in workers |
-| `JOBS_DB_POOL` | `16` | The worker's own pool |
-| `JOBS_SHUTDOWN_TIMEOUT_S` | `25` | Wait for running jobs on SIGTERM, then cancel and release them |
-| `JOBS_KEEP_SUCCEEDED_H` / `JOBS_KEEP_FAILED_H` | `24` / `336` | Retention |
-| `JOBS_METRICS_ADDR` | `0.0.0.0:9300` | `/metrics`, `/healthz`, `/readyz` of `worker` |
-| `JOBS_SMTP_URL` | unset | `smtp://…` or `smtps://…`; unset: no emails are enqueued or sent |
-| `JOBS_SMTP_TIMEOUT_S` | `30` | Per SMTP connection and reply |
-| `JOBS_EMAIL_FROM` / `JOBS_EMAIL_DOMAIN` | `library@localhost` / `library.local` | Sender and `Message-ID` domain |
-| `JOBS_WEBHOOK_ENDPOINTS` | unset | Comma-separated URLs (max 10) |
-| `JOBS_WEBHOOK_SECRET_<n>` | – | `whsec_<base64 key>` for the n-th endpoint (1-based) |
-
-Secrets are never logged and never stored in job arguments.
-
-## Operating
-
-- `library-web jobs status`: per queue available, scheduled, running, failed in 24 h, oldest wait; processes;
-  kinds no live process can run.
-- `jobs list --state failed`, `jobs show <id>`, `jobs retry <id>`, `jobs retry --failed --kind webhook.v1 --since 2h`,
-  `jobs discard <id>`, `jobs cancel <id>`, `jobs pause <queue> --reason …`, `jobs resume <queue>`,
-  `jobs processes`, `jobs prune --dry-run`.
-- Metrics (Prometheus): `jobs_completed_total{kind,outcome}`, `jobs_duration_seconds`, `jobs_wait_seconds`,
-  `jobs_running`, `jobs_slots`, and from the leader `jobs_available`, `jobs_scheduled`,
-  `jobs_oldest_available_seconds`, `jobs_failed_recent`, `jobs_processes_live`, `jobs_leader`.
-- Health: `/readyz` is 503 when the process fenced itself, its heartbeat is older than three periods, or the
-  database does not answer.
-- Throughput on the 2-core box: <fill in the number measured in Task 14 Step 6> no-op jobs/s with one worker.
+```yaml
+      # Background jobs (Postgres deployments; docs/JOBS.md). The queue gauges come
+      # from the leader only, so `max by (queue)` merges the workers' scrapes.
+      - alert: JobsQueueStalled
+        expr: max by (queue) (jobs_oldest_available_seconds) > 300
+        for: 10m
+        annotations:
+          summary: "jobs queue {{ $labels.queue }}: the oldest ready job has waited {{ $value | humanizeDuration }}"
+          runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
+      - alert: JobsFailing
+        expr: sum by (kind) (increase(jobs_completed_total{outcome="failed"}[15m])) > 0
+        annotations:
+          summary: "jobs of kind {{ $labels.kind }} failed in the last 15 minutes"
+          runbook: "docs/RUNBOOK.md#jobs-failed-jobs"
+      # Workers are scraped but none holds the leader lock: nothing reaps
+      # crashed jobs or deletes old ones.
+      - alert: JobsNoLeader
+        expr: count(jobs_leader) > 0 and max(jobs_leader) == 0
+        for: 5m
+        annotations:
+          summary: "no jobs worker is the maintenance leader"
+          runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
 ```
 
-Replace the `<fill in …>` line with the number Task 14 measured before committing.
+Append to `deploy/monitoring/alerts.test.yml` under `tests:`:
 
-- [ ] **Step 4: Runbook, architecture, decision record**
+```yaml
+  - name: jobs, a stalled queue fires and a busy but moving one does not
+    interval: 1m
+    input_series:
+      - series: 'jobs_oldest_available_seconds{instance="w1:9300", queue="email"}'
+        values: "0+60x20"
+      - series: 'jobs_oldest_available_seconds{instance="w1:9300", queue="webhooks"}'
+        values: "30x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: JobsQueueStalled
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: JobsQueueStalled
+        exp_alerts:
+          - exp_labels:
+              queue: email
+            exp_annotations:
+              summary: "jobs queue email: the oldest ready job has waited 16m 0s"
+              runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
 
-Append to `docs/RUNBOOK.md`:
+  - name: jobs, a failure fires once and clears
+    interval: 1m
+    input_series:
+      - series: 'jobs_completed_total{instance="w1:9300", kind="webhook.v1", outcome="failed"}'
+        values: "0x5 1x30"
+      - series: 'jobs_completed_total{instance="w1:9300", kind="loan_email.v1", outcome="succeeded"}'
+        values: "0+5x35"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: JobsFailing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: JobsFailing
+        exp_alerts:
+          - exp_labels:
+              kind: webhook.v1
+            exp_annotations:
+              summary: "jobs of kind webhook.v1 failed in the last 15 minutes"
+              runbook: "docs/RUNBOOK.md#jobs-failed-jobs"
+      - eval_time: 30m
+        alertname: JobsFailing
+        exp_alerts: []
 
-```markdown
-## Background jobs
-
-See `docs/JOBS.md` for concepts. All commands are `library-web jobs …` with the worker's environment.
-
-- **A queue is not moving**: `jobs status`. Oldest wait growing with `running` at the slot count: the handlers are
-  slow or stuck; `jobs list --state running --queue q` and `jobs show <id>` (progress, attempt). A queue marked
-  paused: `jobs resume q`. Kinds listed under "no live process can run": a worker with that kind (and its settings,
-  e.g. `JOBS_SMTP_URL`) is not running.
-- **Failed jobs**: `jobs list --state failed`, read `jobs show <id>` errors. After fixing the cause:
-  `jobs retry --failed --kind <kind> --since 6h`.
-- **Poison job** (fails with `lease_expired`/`process_lost` until `max_crashes`): it killed or hung its worker.
-  Leave it failed, fix the handler, then `jobs retry <id>`.
-- **SMTP outage**: emails retry with backoff for about 10 attempts. If the outage was longer, they end failed;
-  replay with `jobs retry --failed --kind loan_email.v1 --since <outage length>`. The stable Message-ID lets
-  mail systems drop duplicates.
-- **Pause a queue** (a receiver asks us to stop): `jobs pause webhooks --reason "…"`; running jobs finish.
-- **Adding a webhook endpoint**: append its URL to `JOBS_WEBHOOK_ENDPOINTS` and set
-  `JOBS_WEBHOOK_SECRET_<its position>` on both `serve` and `worker`, then restart both. Never reorder existing
-  entries: the secret is matched by position. Removing an endpoint makes its waiting jobs fail as permanent.
-- **A worker exits with "fenced itself off"**: its registry row was pruned (it missed heartbeats for 3 minutes,
-  e.g. the VM was suspended). The supervisor restarts it; its jobs were re-queued.
+  - name: jobs, no leader among scraped workers
+    interval: 1m
+    input_series:
+      - series: 'jobs_leader{instance="w1:9300"}'
+        values: "1x5 0x10"
+      - series: 'jobs_leader{instance="w2:9300"}'
+        values: "0x15"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: JobsNoLeader
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: JobsNoLeader
+        exp_alerts:
+          - exp_annotations:
+              summary: "no jobs worker is the maintenance leader"
+              runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
 ```
 
-In `docs/ARCHITECTURE.md` module map, add rows for `crates/jobs` (the generic queue: schema, enqueue, worker runtime, leader, metrics, ops queries) and `apps/web/src/jobs` (the app's job kinds, enqueue points, `worker` and `jobs` subcommands), in the style of the existing rows.
+Run: `make alerts-test`
+Expected: `SUCCESS` for the rules check and all tests, old and new. If promtool formats the
+duration differently from `16m 0s`, copy its value into the expected summary.
 
-Create `docs/decisions/0007-own-job-queue.md`:
+- [ ] **Step 4: Finalize the drafted docs**
 
-```markdown
-# 0007: Our own Postgres job queue
+`docs/JOBS.md`, the `Background jobs` and `Jobs: …` sections of `docs/RUNBOOK.md`, the
+`Background jobs (Postgres only)` part of `docs/ARCHITECTURE.md`'s module map and
+`docs/decisions/0007-own-job-queue.md` were written on 2026-10-15, before the code. For each:
 
-Date: 2026-10-14. Status: accepted.
+1. Check every command, flag, environment variable, default, metric name, outcome name, error
+   cause and file path against the code. List them with
+   `grep -oE '(JOBS_[A-Z0-9_]+|jobs_[a-z_]+|library-web jobs [a-z-]+)' docs/JOBS.md docs/RUNBOOK.md | sort -u`
+   and find each in `apps/web/src` or `crates/jobs/src`. Fix the doc where it is wrong.
+2. Remove the "Draft" notes.
+3. In `ARCHITECTURE.md`, turn module names into links (`[worker.rs](../crates/jobs/src/worker.rs)`),
+   as the rest of the module map does.
+4. In `JOBS.md`, replace the last sentence of "Testing" with the measured throughput from
+   Task 14 Step 6 ("Throughput on the 2-core box: N no-op jobs/s with one worker").
+5. In decision 0007, set `Status: accepted (<merge date>)`.
 
-## Context
+- [ ] **Step 5: Spec §22**
 
-Borrowing and returning a book must notify the member (email) and outside systems (webhooks) reliably,
-without making the request slower or failing it when SMTP or a receiver is down. More background work
-(reports, imports) follows. The notification must exist if and only if the loan change commits.
-
-## Decision
-
-A transactional outbox and job queue in the same Postgres database, as our own crate `library-jobs`,
-with per-job leases renewed by one heartbeat per process, fenced outcome writes, a process registry and an
-elected maintenance leader, run by a separate `library-web worker` process.
-
-## Alternatives
-
-- **apalis-postgres 1.0**: accepts the caller's transaction, but heartbeats are per worker rather than per job,
-  there is no database-side backoff, no progress, no cross-process cancel, a duplicate key fails the whole insert,
-  and it was days old.
-- **fang**: no outbox (its own pool), a non-atomic claim, no crash recovery.
-- **BullMQ (Rust client)**: Redis only, so no outbox with our data; a lost lock does not stop the job.
-- **graphile_worker**: Postgres and transactional enqueue, but not examined deeply enough to depend on.
-- **Solid Queue's model**, copied in part: process registry with heartbeats, the supervisor failing claimed jobs of
-  dead processes, recurring de-duplication on (task, run_at), capped counts. We add per-job leases, deadlines,
-  cancellation and fencing, which it lacks.
-
-## Consequences
-
-About 3,000 lines we own and test (crash, fencing, leader failover, outage and SIGKILL tests). Postgres only; the
-SQLite deployment has no jobs. Rails gets the same schema later.
-```
-
-- [ ] **Step 5: Record the spec deviations**
-
-Append to the spec a section:
-
-```markdown
-## 22. Changes made while planning
-
-- Recurring tasks run on a fixed interval (`every`, at least 1 s), not cron; ticks are multiples of the interval
-  since the epoch in database time, still de-duplicated on (task, run_at).
-- No `enqueue_many`: callers loop inside their transaction (the loan events do).
-- No `trace` column.
-- Environment names carry units: `JOBS_POLL_MS`, `JOBS_SHUTDOWN_TIMEOUT_S`, `JOBS_KEEP_SUCCEEDED_H`,
-  `JOBS_KEEP_FAILED_H`, `JOBS_SMTP_TIMEOUT_S`. The lease is per kind in code (`JobOptions::lease`, default 60 s),
-  not an environment variable; the heartbeat is 20 s.
-- The jobs migration table is `_jobs_migrations`, set with sqlx's `Migrator::dangerous_set_table_name`, not
-  `sqlx.toml`.
-- Emails are enqueued only when `JOBS_SMTP_URL` is set, webhooks only for configured endpoints; a worker registers
-  only the kinds it has settings for, so jobs wait (and `jobs status` names them) rather than fail.
-- The real-SIGKILL test re-runs the crate's test binary as the child worker (`crates/jobs/tests/child_process.rs`);
-  the binary itself is tested for start, readiness and SIGTERM in `apps/web/tests/jobs_worker.rs`.
-- The outage test pauses a dedicated Postgres container (`docker pause`) and is `#[ignore]`d in CI.
-```
+The spec's §22 lists the changes decided while planning. Add any further change made while
+implementing (a renamed variable, a different default, a test done another way), one line each.
 
 - [ ] **Step 6: Soak: every suite 20 times**
 

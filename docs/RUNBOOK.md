@@ -557,6 +557,105 @@ What decides the exit code:
 
 - The output has `integrity: ok` and `foreign keys: ok`.
 
+## Background jobs
+
+> **Draft:** for the Postgres deployment once `feat/jobs` merges ([docs/JOBS.md](JOBS.md)).
+> The SQLite nodes have no jobs.
+
+Every `jobs` command below runs in the worker's container, with its environment:
+`docker compose exec worker library-web jobs <command>`. Nothing here needs the API to stop:
+borrowing and returning keep working while jobs wait.
+
+| Alert | Section |
+|---|---|
+| `JobsQueueStalled`, `JobsNoLeader` | [Jobs: a queue is not moving](#jobs-a-queue-is-not-moving) |
+| `JobsFailing` | [Jobs: failed jobs](#jobs-failed-jobs) |
+
+## Jobs: a queue is not moving
+
+**When:** `JobsQueueStalled` (the oldest ready job in a queue is over 5 minutes old, for 10
+minutes), `JobsNoLeader`, or members report missing emails.
+
+**Steps**
+
+1. `jobs status`. Read the row of the queue and the warning lines under it.
+2. If the queue says `paused: yes`, someone paused it; the reason is in
+   `SELECT * FROM job_queue_pauses`. If the reason no longer holds: `jobs resume <queue>`.
+3. If a warning lists kinds that no live worker can run, the worker that runs them is missing
+   or lacks its settings: `JOBS_SMTP_URL` for `loan_email.v1`, `JOBS_WEBHOOK_ENDPOINTS` for
+   `webhook.v1`. Fix the worker's environment and recreate it with `up -d`.
+4. If `jobs processes` shows no worker, or only `STALE` ones, start the worker:
+   `docker compose up -d worker`, then read `docker compose logs worker` for the reason it
+   stopped (a worker that logs "fenced itself off" was suspended or cut off for over 3 minutes;
+   restarting it is the fix).
+5. If `running` equals the queue's slots and stays there, handlers are slow or stuck:
+   `jobs list --state running --queue <queue>`, then `jobs show <id>` for their progress and
+   attempt. A stuck handler is stopped by its deadline (15 minutes by default, 2 for emails). To
+   stop one sooner: `jobs cancel <id>`. If the queue is simply too busy, raise its slots in
+   `JOBS_QUEUES` or run a second worker.
+6. `JobsNoLeader` alone: a leader election needs a worker and the database. Check that a worker
+   runs and that its `/readyz` answers 200. Without a leader nothing reaps crashed jobs or deletes
+   old ones, but running jobs still finish.
+
+**Check it worked**
+
+- `jobs status` shows the oldest wait falling, and `jobs_oldest_available_seconds` drops below
+  60 s.
+- Exactly one worker exports `jobs_leader 1`.
+
+## Jobs: failed jobs
+
+**When:** `JobsFailing`, or `jobs status` shows failures in the last 24 h.
+
+A job fails when its attempts run out (10, over about 3 to 4 hours), when its handler reports a
+permanent error, or when its worker died twice while running it.
+
+**Steps**
+
+1. `jobs list --state failed` and `jobs show <id>` for a few of them. The last entry of `errors`
+   says why: `cause` is `error`, `permanent`, `bad_args`, `deadline_exceeded`, `panic`,
+   `lease_expired` or `process_lost`.
+2. By cause:
+   - **SMTP or a receiver was down** (`error`, connection or timeout messages): fix or wait for
+     the remote side, then replay what failed during the outage:
+     `jobs retry --failed --kind loan_email.v1 --since 6h`. A resent email has the same
+     `Message-ID`, and a resent webhook the same `webhook-id`, so receivers can drop duplicates.
+   - **`permanent`** (an invalid address, a 404 from a receiver): retrying gives the same answer.
+     Fix the data or the endpoint first, or leave it.
+   - **`bad_args`**: the job's arguments no longer match its kind. A deploy changed the job's
+     shape without a new version. Fix the code; these jobs cannot be repaired by retrying.
+   - **`lease_expired` / `process_lost` twice** (a poison job): it killed or hung its worker.
+     Leave it failed, read the worker's logs around its `finished_at`, fix the handler, then
+     `jobs retry <id>`.
+3. For one endpoint that keeps failing while you talk to its owner: `jobs pause webhooks
+   --reason "receiver X down, ticket 123"`. This pauses all webhooks; resume as soon as you can.
+
+**Check it worked**
+
+- The retried jobs reach `succeeded` (`jobs list --kind <kind> --limit 20`).
+- `jobs_failed_recent` stops growing.
+
+## Jobs: add a webhook endpoint
+
+**When:** a new receiver must get loan events.
+
+**Steps**
+
+1. Generate a secret: `echo "whsec_$(openssl rand -base64 32)"`. Give it to the receiver's owner
+   over a secure channel.
+2. Append the URL to `JOBS_WEBHOOK_ENDPOINTS` (comma-separated) and set
+   `JOBS_WEBHOOK_SECRET_<n>`, where `<n>` is its position counting from 1. Never reorder the
+   existing entries: secrets are matched by position. Do it in the environment of **both** `web`
+   and `worker`.
+3. `docker compose up -d web worker`.
+
+Removing an endpoint makes its waiting jobs fail as `permanent` ("no longer configured").
+
+**Check it worked**
+
+- Borrow a book. `jobs list --kind webhook.v1 --limit 5` shows one job per endpoint, and the new
+  one reaches `succeeded`.
+
 ## Production to-dos
 
 The example leaves these out. Do them before real use.

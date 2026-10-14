@@ -204,6 +204,40 @@ Shared crates: [crates/sqlite](../crates/sqlite/src/lib.rs) (package `sqlite-set
 is the one place SQLite is opened and configured. [crates/shared](../crates/shared/src/lib.rs)
 holds the API types and `is_valid_node_id`.
 
+### Background jobs (Postgres only)
+
+> **Draft:** being built on `feat/jobs`; see [JOBS.md](JOBS.md). Links are added when the files exist.
+
+`crates/jobs` (package `library-jobs`) is a generic Postgres job queue with no web framework in
+its core; its [README](../crates/jobs/README.md) covers using it from axum, tokio and other
+frameworks.
+
+| Module | Job |
+|---|---|
+| `lib.rs` | Module list, re-exports, `migrate()` (its own `_jobs_migrations` table). |
+| `job.rs`, `context.rs` | The `Job` trait, `JobOptions`, `JobError`; the `JobContext` a handler gets, with `require::<T>()`. |
+| `enqueue.rs` | `Enqueuer`: insert a job on the caller's connection, de-duplicate on its unique key, `NOTIFY` on commit. |
+| `config.rs`, `backoff.rs`, `rate_limit.rs` | Queue and worker settings, retry delays, per-process rate limits. |
+| `store/` | The SQL: claim, heartbeat and registry, fenced outcome writes, reaping and retention, counts. |
+| `registry.rs`, `executor.rs` | Kind to handler; running one job to a recorded outcome (deadline, panic, cancel). |
+| `running.rs`, `heartbeat.rs` | The jobs this process runs, and the one task that renews their leases. |
+| `worker.rs` | `Worker`: a claim loop per queue, LISTEN wake-ups, graceful shutdown, self-fencing. |
+| `maintenance.rs` | The advisory-lock leader: reaper, pruner, recurring jobs, retention, gauges. |
+| `metrics.rs`, `ready.rs`, `http.rs` | Prometheus metrics, readiness, and the optional axum router for `/metrics`, `/healthz`, `/readyz`. |
+| `ops.rs` | Queries behind `library-web jobs …`. |
+
+`apps/web/src/jobs/` holds the app's side:
+
+| Module | Job |
+|---|---|
+| `mod.rs` | The registry of the app's kinds and the worker settings from `JOBS_*`. |
+| `events.rs` | `LoanEvents`: the jobs borrow and return enqueue, inside their transaction. |
+| `loan_email.rs`, `webhook.rs` | `loan_email.v1` (SMTP) and `webhook.v1` (signed HTTP). |
+| `worker.rs`, `ops_cli.rs` | `library-web worker`, embedded mode, and `library-web jobs …`. |
+
+Settings are in `apps/web/src/jobs_config.rs`, compiled into every build; everything else is
+behind the `postgres` feature.
+
 ## Book search
 
 Book search matches word prefixes: `q` is split into words (runs of letters and

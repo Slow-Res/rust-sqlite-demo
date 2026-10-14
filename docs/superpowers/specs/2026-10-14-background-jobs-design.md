@@ -619,3 +619,51 @@ clippy/fmt with and without the `postgres` feature.
 - Throughput smoke test on the 2-core box: ≥ 1,000 no-op jobs/s with one worker process.
 - Docs: `docs/JOBS.md` (concepts, guarantees, writing a job, operating), runbook entries,
   `docs/ARCHITECTURE.md` module map, a decision record `docs/decisions/0007-own-job-queue.md`.
+
+## 22. Changes made while planning
+
+- Recurring tasks run on a fixed interval (`every`, at least 1 s), not cron. A tick is a multiple
+  of the interval since the epoch, in database time, still de-duplicated on `(task, run_at)`.
+- No `enqueue_many`: callers loop inside their transaction (the loan events do).
+- No `trace` column.
+- Environment names carry units: `JOBS_POLL_MS`, `JOBS_SHUTDOWN_TIMEOUT_S`,
+  `JOBS_KEEP_SUCCEEDED_H`, `JOBS_KEEP_FAILED_H`, `JOBS_SMTP_TIMEOUT_S`. The lease is per kind in
+  code (`JobOptions::lease`, default 60 s), not an environment variable; the heartbeat is 20 s.
+- The jobs migration table is `_jobs_migrations`, set with sqlx's
+  `Migrator::dangerous_set_table_name`, not `sqlx.toml` (§3.3).
+- Emails are enqueued only when `JOBS_SMTP_URL` is set, webhooks only for configured endpoints.
+  A worker registers only the kinds it has settings for, so their jobs wait, and `jobs status`
+  names them, rather than fail.
+- The real-SIGKILL test re-runs the crate's test binary as the child worker
+  (`crates/jobs/tests/child_process.rs`). The `library-web` binary itself is tested for start,
+  readiness and SIGTERM (`apps/web/tests/jobs_worker.rs`).
+- The outage test pauses a dedicated Postgres container (`docker pause`) and is `#[ignore]`d in
+  CI.
+- Alerts `JobsQueueStalled`, `JobsFailing`, `JobsNoLeader` join `deploy/monitoring/alerts.yml`,
+  with promtool tests, and the runbook gets matching sections.
+
+## 23. Using the crate from axum, tokio and other frameworks
+
+The crate must be usable from any tokio-based Rust web stack, not only this app. Guide:
+`crates/jobs/README.md`.
+
+- **No framework in the core.** `Enqueuer` takes a `&mut PgConnection`, `Worker::run` is a plain
+  future, `Metrics::encode()` returns text, and `ready(&Health, &PgPool, stale_after)` answers
+  readiness. axum appears only behind the default feature `http` (`http::router`, `http::serve`,
+  `Worker::router()`); `default-features = false` drops the dependency.
+- **tokio is required** (sqlx's Postgres driver and the worker's tasks use it). A multi-threaded
+  runtime is recommended: on `current_thread`, a blocking handler stalls the heartbeat and the
+  process loses its leases. Handlers are `Send + 'static`.
+- **Three ways to run a worker,** all documented with code: a separate process (the default
+  here), `tokio::spawn` inside the server sharing one `CancellationToken` with axum's graceful
+  shutdown, or a runtime of its own on an OS thread (for actix-web, whose runtimes are
+  single-threaded, and for CPU-heavy jobs beside an API). The worker's pool is created inside the
+  runtime that uses it.
+- **axum:** `Enqueuer` in the state via `FromRef`; enqueue on `&mut *tx` in the handler or in the
+  repository just before `commit`; `EnqueueError` maps to a 500 like any database error; the
+  internal router is served on a separate address, or nested behind admin auth.
+- **Other frameworks** (actix-web, Rocket, Poem, Salvo, warp, hyper, Loco): the same three pieces
+  through their own state and handler mechanisms. async-std and smol are not supported.
+- **`examples/axum_app.rs`** is a complete, compiled example (sign-up handler that enqueues in its
+  transaction, embedded worker, internal router, shared shutdown), so the README's main snippet
+  cannot drift from the API. Other frameworks get uncompiled sketches.
