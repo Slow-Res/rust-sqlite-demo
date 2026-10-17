@@ -2,9 +2,12 @@
 //! they are enqueued, and the `worker` and `jobs` subcommands. The queue itself is
 //! the generic `library-jobs` crate.
 
+pub mod events;
+pub mod loan_email;
 pub mod ops_cli;
 pub mod worker;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -18,8 +21,14 @@ use crate::jobs_config::JobsConfig;
 /// settings are missing (no SMTP URL, no webhook endpoint) is left out, so its
 /// jobs wait, and `jobs status` names them, instead of failing.
 pub fn registry(jobs: &JobsConfig) -> anyhow::Result<Registry> {
-    let _ = jobs; // the email and webhook kinds read it (Tasks 17-18)
-    Ok(Registry::new())
+    let mut registry = Registry::new();
+    if let Some(mailer) = loan_email::Mailer::from_config(jobs)? {
+        registry = registry
+            .register::<loan_email::LoanEmail>()
+            .provide(Arc::new(mailer));
+    }
+    // The webhook kind joins in Task 18.
+    Ok(registry)
 }
 
 pub fn worker_config(jobs: &JobsConfig, process_kind: &str) -> anyhow::Result<WorkerConfig> {
