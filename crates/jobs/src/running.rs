@@ -60,6 +60,17 @@ impl Running {
         }
     }
 
+    /// Put back a value whose write failed, unless the handler reported a newer
+    /// one meanwhile or the entry is gone or belongs to another attempt.
+    pub fn restore_progress(&self, job_id: i64, attempt: i32, value: Value) {
+        if let Some(e) = self.map().get(&job_id).filter(|e| e.attempt == attempt) {
+            let mut slot = e.progress.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = Some(value);
+            }
+        }
+    }
+
     /// Pending progress values, removed from their slots, with the fence to write them under.
     pub fn take_progress(&self, process_id: i64) -> Vec<(Fence, Value)> {
         self.map()
@@ -84,6 +95,7 @@ impl Running {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -107,6 +119,23 @@ mod tests {
         assert!(token.is_cancelled());
         assert_eq!(cell.get(), Some(CancelReason::Requested));
         r.cancel(99, CancelReason::Requested); // unknown id: no-op
+    }
+
+    #[test]
+    fn restore_progress_never_overwrites_a_newer_value() {
+        let r = Running::default();
+        let e = entry(2);
+        let slot = e.progress.clone();
+        r.insert(1, e);
+        r.restore_progress(1, 2, serde_json::json!("old"));
+        assert_eq!(*slot.lock().unwrap(), Some(serde_json::json!("old")));
+        *slot.lock().unwrap() = Some(serde_json::json!("new"));
+        r.restore_progress(1, 2, serde_json::json!("older"));
+        assert_eq!(*slot.lock().unwrap(), Some(serde_json::json!("new")));
+        slot.lock().unwrap().take();
+        r.restore_progress(1, 1, serde_json::json!("other attempt"));
+        r.restore_progress(9, 2, serde_json::json!("unknown job"));
+        assert_eq!(*slot.lock().unwrap(), None);
     }
 
     #[test]
