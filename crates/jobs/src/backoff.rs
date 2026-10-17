@@ -30,11 +30,13 @@ impl Backoff {
 
     /// A random delay in `[0, ceiling(attempt)]` (full jitter).
     pub fn delay(&self, attempt: i32) -> Duration {
-        let max = self.ceiling(attempt).as_secs_f64();
+        let ceiling = self.ceiling(attempt);
+        let max = ceiling.as_secs_f64();
         if max <= 0.0 {
             return Duration::ZERO;
         }
-        Duration::from_secs_f64(rand::random_range(0.0..=max))
+        // `try_` because a huge cap can make `max` too large for a `Duration`.
+        Duration::try_from_secs_f64(rand::random_range(0.0..=max)).unwrap_or(ceiling)
     }
 }
 
@@ -68,5 +70,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn extreme_durations_do_not_panic() {
+        let b = Backoff {
+            base: Duration::from_secs(5),
+            cap: Duration::MAX,
+        };
+        assert!(b.delay(i32::MAX) <= b.cap);
+        let b = Backoff {
+            base: Duration::MAX,
+            cap: Duration::MAX,
+        };
+        assert!(b.delay(i32::MAX) <= b.cap);
     }
 }
