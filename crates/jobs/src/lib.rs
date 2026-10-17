@@ -19,6 +19,7 @@ pub mod http;
 pub mod job;
 pub mod maintenance;
 pub mod metrics;
+pub mod ops;
 pub mod rate_limit;
 pub mod ready;
 pub mod registry;
