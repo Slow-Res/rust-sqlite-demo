@@ -256,7 +256,7 @@ async fn work(l: &Leader) {
                 Err(err) => { l.metrics.db_error("reap"); tracing::warn!(error = %err, "jobs: reap failed"); false }
             },
             _ = prune.tick() => if healthy_since.elapsed() < c.prune_after {
-                if last_prune.elapsed() >= c.prune_after * 3 && !starving_logged {
+                if last_prune.elapsed() >= c.prune_after.saturating_mul(3) && !starving_logged {
                     starving_logged = true;
                     tracing::warn!("jobs: no prune for 3x prune_after, the database keeps failing");
                 } else {

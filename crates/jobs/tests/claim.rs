@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use common::{count, register_process, with_db};
+use common::{count, new_job, register_process, with_db};
 use library_jobs::store::claim::{ClaimRequest, claim};
 use sqlx::PgPool;
 
@@ -38,7 +38,7 @@ async fn claims_by_priority_then_age_up_to_the_limit_and_sets_the_lease() {
         let old = add(&pool, "q", "k", 0, -20.0, None).await;
         let new = add(&pool, "q", "k", 0, -1.0, None).await;
         let kinds = kinds();
-        let req = ClaimRequest { queue: "q", kinds: &kinds, process_id: me, limit: 2, max_running: None };
+        let req = ClaimRequest { queue: "q", kinds: &kinds, process_id: me, limit: 2, max_running: None, min_lease_s: 1 };
         let mut got: Vec<i64> = claim(&pool, &req).await.unwrap().into_iter().map(|j| j.id).collect();
         got.sort();
         let mut want = vec![old, new];
@@ -74,6 +74,7 @@ async fn skips_unknown_kinds_future_jobs_and_paused_queues() {
                 process_id: me,
                 limit: 10,
                 max_running: None,
+                min_lease_s: 1,
             };
             assert!(
                 claim(&pool, &req).await.unwrap().is_empty(),
@@ -108,6 +109,7 @@ async fn concurrent_claimers_never_take_the_same_job() {
                         process_id: me,
                         limit: 25,
                         max_running: None,
+                        min_lease_s: 1,
                     };
                     let got = claim(&pool, &req).await.unwrap();
                     if got.is_empty() {
@@ -157,7 +159,7 @@ async fn stress(
             let kinds = kinds();
             let mut idle = 0;
             while idle < 20 {
-                let req = ClaimRequest { queue, kinds: &kinds, process_id: me, limit: 5, max_running };
+                let req = ClaimRequest { queue, kinds: &kinds, process_id: me, limit: 5, max_running, min_lease_s: 1 };
                 let got = claim(&pool, &req).await.unwrap();
                 if got.is_empty() { idle += 1; tokio::time::sleep(Duration::from_millis(10)).await; continue; }
                 idle = 0;
@@ -217,6 +219,36 @@ async fn at_most_one_running_job_per_concurrency_key() {
                                    GROUP BY concurrency_key HAVING count(*) > 1) x",
         )
         .await;
+    })
+    .await;
+}
+
+/// A row enqueued with a lease shorter than the worker's give-up assumption must not be
+/// reaped while its handler may still run: claim and renewal both use the longer one.
+#[tokio::test]
+async fn the_lease_is_never_shorter_than_the_workers_shortest() {
+    with_db(|pool| async move {
+        let me = register_process(&pool, "me").await;
+        let id = new_job(&pool, "k").await;
+        sqlx::query("UPDATE jobs SET lease_s = 5 WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+        let kinds = vec!["k".to_string()];
+        let req = ClaimRequest { queue: "default", kinds: &kinds, process_id: me, limit: 1, max_running: None, min_lease_s: 60 };
+        assert_eq!(claim(&pool, &req).await.unwrap().len(), 1);
+        let lease = "SELECT locked_until BETWEEN now() + interval '58 s' AND now() + interval '61 s' FROM jobs WHERE id = $1";
+        assert!(sqlx::query_scalar::<_, bool>(lease).bind(id).fetch_one(&pool).await.unwrap());
+
+        // Renewal keeps it: shrink the lease, then beat.
+        sqlx::query("UPDATE jobs SET locked_until = now() + interval '1 s' WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+        library_jobs::store::process::heartbeat(&pool, me, &[id], 60).await.unwrap();
+        assert!(sqlx::query_scalar::<_, bool>(lease).bind(id).fetch_one(&pool).await.unwrap());
+
+        // A longer row lease still wins.
+        let long = new_job(&pool, "k").await;
+        sqlx::query("UPDATE jobs SET lease_s = 600 WHERE id = $1").bind(long).execute(&pool).await.unwrap();
+        assert_eq!(claim(&pool, &req).await.unwrap().len(), 1);
+        let ten_min: bool = sqlx::query_scalar("SELECT locked_until > now() + interval '599 s' FROM jobs WHERE id = $1")
+            .bind(long).fetch_one(&pool).await.unwrap();
+        assert!(ten_min);
     })
     .await;
 }

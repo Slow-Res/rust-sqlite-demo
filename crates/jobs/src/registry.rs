@@ -136,11 +136,23 @@ impl Registry {
             if let Err(e) = entry.options.validate() {
                 errors.push(format!("{kind}: {e}"));
             }
-            if entry.options.lease < config.heartbeat * 3 {
+            let three_beats = config.heartbeat.saturating_mul(3);
+            if entry.options.lease < three_beats {
                 errors.push(format!(
-                    "{kind}: lease {:?} is shorter than 3 heartbeats ({:?})",
-                    entry.options.lease,
-                    config.heartbeat * 3
+                    "{kind}: lease {:?} is shorter than 3 heartbeats ({three_beats:?})",
+                    entry.options.lease
+                ));
+            }
+        }
+        // A silent process is pruned, and its jobs freed at once, after `prune_after`. A
+        // worker that lost the database still runs a handler until one beat before the
+        // shortest lease ends (spec §8.2), so pruning earlier could run a job twice.
+        if let (true, Some(lease)) = (config.maintenance.enabled, self.min_lease()) {
+            let give_up_after = lease.saturating_sub(config.heartbeat);
+            if config.maintenance.prune_after < give_up_after {
+                errors.push(format!(
+                    "prune_after {:?} is shorter than the shortest lease minus a heartbeat ({give_up_after:?})",
+                    config.maintenance.prune_after
                 ));
             }
         }
@@ -195,5 +207,33 @@ mod tests {
         let mut slow = config.clone();
         slow.heartbeat = Duration::from_secs(30);
         assert!(Registry::new().register::<A>().validate(&slow).is_err());
+    }
+
+    #[test]
+    fn prune_after_must_outlast_the_shortest_lease_minus_a_heartbeat() {
+        // A: lease 60 s, heartbeat 20 s: handlers may run 40 s after a lost database.
+        let mut config = WorkerConfig::new(QueueConfig::parse_list("q:1").unwrap_or_default());
+        config.maintenance.prune_after = Duration::from_secs(60); // at least 40 s
+        assert!(Registry::new().register::<A>().validate(&config).is_ok());
+        config.heartbeat = Duration::from_secs(5);
+        config.maintenance.prune_after = Duration::from_secs(54); // under 60 - 5
+        let err = Registry::new()
+            .register::<A>()
+            .validate(&config)
+            .unwrap_err();
+        assert!(err.0[0].contains("prune_after"), "{err}");
+        config.maintenance.prune_after = Duration::from_secs(55);
+        assert!(Registry::new().register::<A>().validate(&config).is_ok());
+        // Not checked while this process takes no part in maintenance.
+        config.maintenance.prune_after = Duration::from_secs(15);
+        config.maintenance.enabled = false;
+        assert!(Registry::new().register::<A>().validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_huge_heartbeat_is_reported_not_a_panic() {
+        let mut config = WorkerConfig::new(QueueConfig::parse_list("q:1").unwrap_or_default());
+        config.heartbeat = Duration::MAX;
+        assert!(Registry::new().register::<A>().validate(&config).is_err());
     }
 }

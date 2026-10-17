@@ -47,10 +47,12 @@ pub enum Beat {
 
 /// One transaction: touch the registry row, then renew the leases of
 /// `running_ids` that this process still holds and that are within their deadline.
+/// A lease is never renewed to less than `min_lease_s` (see `ClaimRequest::min_lease_s`).
 pub async fn heartbeat(
     pool: &PgPool,
     process_id: i64,
     running_ids: &[i64],
+    min_lease_s: i32,
 ) -> Result<Beat, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let alive: Option<i64> = sqlx::query_scalar(
@@ -67,13 +69,14 @@ pub async fn heartbeat(
         Vec::new()
     } else {
         sqlx::query_as(
-            "UPDATE jobs SET locked_until = now() + make_interval(secs => lease_s)
+            "UPDATE jobs SET locked_until = now() + make_interval(secs => GREATEST(lease_s, $3))
              WHERE state = 'running' AND locked_by = $1 AND id = ANY($2)
                AND attempt_started_at + make_interval(secs => deadline_s) > now()
              RETURNING id, cancel_requested",
         )
         .bind(process_id)
         .bind(running_ids)
+        .bind(min_lease_s)
         .fetch_all(&mut *tx)
         .await?
     };

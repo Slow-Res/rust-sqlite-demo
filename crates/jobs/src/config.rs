@@ -164,8 +164,28 @@ impl WorkerConfig {
                 return Err(invalid(format!("{what} must be greater than zero")));
             }
         }
-        if self.maintenance.enabled && self.maintenance.prune_after < self.heartbeat * 3 {
-            return Err(invalid("prune_after must be at least 3 heartbeats".into()));
+        let three_beats = self
+            .heartbeat
+            .checked_mul(3)
+            .ok_or_else(|| invalid("heartbeat is too large".into()))?;
+        if self.maintenance.enabled {
+            let m = &self.maintenance;
+            // `tokio::time::interval` panics on a zero period.
+            for (what, d) in [
+                ("leader_retry", m.leader_retry),
+                ("reap_every", m.reap_every),
+                ("prune_every", m.prune_every),
+                ("recurring_every", m.recurring_every),
+                ("retention_every", m.retention_every),
+                ("gauges_every", m.gauges_every),
+            ] {
+                if d.is_zero() {
+                    return Err(invalid(format!("{what} must be greater than zero")));
+                }
+            }
+            if m.prune_after < three_beats {
+                return Err(invalid("prune_after must be at least 3 heartbeats".into()));
+            }
         }
         Ok(())
     }
@@ -223,11 +243,45 @@ mod tests {
         assert!(c.validate().is_ok());
         c.heartbeat = Duration::ZERO;
         assert!(c.validate().is_err());
+        let mut c = WorkerConfig::new(QueueConfig::parse_list("default:4").unwrap());
+        c.maintenance.prune_after = Duration::from_secs(59);
+        assert!(c.validate().is_err(), "prune_after under 3 heartbeats");
         let mut c = WorkerConfig::new(vec![]);
         c.maintenance.enabled = false;
         assert!(
             c.validate().is_err(),
             "a worker must serve at least one queue"
         );
+    }
+
+    #[test]
+    fn zero_maintenance_intervals_are_rejected() {
+        type Set = fn(&mut MaintenanceConfig);
+        let setters: [(&str, Set); 6] = [
+            ("leader_retry", |m| m.leader_retry = Duration::ZERO),
+            ("reap_every", |m| m.reap_every = Duration::ZERO),
+            ("prune_every", |m| m.prune_every = Duration::ZERO),
+            ("recurring_every", |m| m.recurring_every = Duration::ZERO),
+            ("retention_every", |m| m.retention_every = Duration::ZERO),
+            ("gauges_every", |m| m.gauges_every = Duration::ZERO),
+        ];
+        for (name, set) in setters {
+            let mut c = WorkerConfig::new(QueueConfig::parse_list("default:4").unwrap());
+            set(&mut c.maintenance);
+            let err = c.validate().unwrap_err();
+            assert!(err.to_string().contains(name), "{name}: {err}");
+            // A passive worker never runs the loops, so the value is harmless.
+            c.maintenance.enabled = false;
+            assert!(c.validate().is_ok(), "{name} with maintenance off");
+        }
+    }
+
+    #[test]
+    fn a_huge_heartbeat_is_rejected_without_overflow() {
+        let mut c = WorkerConfig::new(QueueConfig::parse_list("default:4").unwrap());
+        c.heartbeat = Duration::MAX;
+        assert!(c.validate().is_err());
+        c.maintenance.enabled = false;
+        assert!(c.validate().is_err());
     }
 }

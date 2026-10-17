@@ -29,11 +29,16 @@ pub struct ClaimRequest<'a> {
     pub limit: i64,
     /// Global cap on running jobs of the queue (spec §7.2).
     pub max_running: Option<i64>,
+    /// The shortest lease, in seconds, of any kind this worker runs: the span its
+    /// heartbeat logic assumes a handler may keep running after a beat. A row enqueued
+    /// with a shorter `lease_s` (an older deploy) gets this lease instead, so the reaper
+    /// cannot take it from under a live handler.
+    pub min_lease_s: i32,
 }
 
 const CLAIM_UNKEYED: &str = "
 UPDATE jobs SET state = 'running', attempt = attempt + 1, locked_by = $3,
-       locked_until = now() + make_interval(secs => lease_s), attempt_started_at = now()
+       locked_until = now() + make_interval(secs => GREATEST(lease_s, $5)), attempt_started_at = now()
 WHERE id IN (
     SELECT id FROM jobs
     WHERE state = 'available' AND queue = $1 AND run_at <= now()
@@ -61,7 +66,7 @@ const TRY_KEY_LOCK: &str =
 
 const CLAIM_ONE: &str = "
 UPDATE jobs SET state = 'running', attempt = attempt + 1, locked_by = $2,
-       locked_until = now() + make_interval(secs => lease_s), attempt_started_at = now()
+       locked_until = now() + make_interval(secs => GREATEST(lease_s, $3)), attempt_started_at = now()
 WHERE id = $1
 RETURNING id, kind, queue, args, attempt, max_attempts, deadline_s, lease_s,
           extract(epoch FROM now() - run_at)::float8 AS waited_s, concurrency_key";
@@ -103,6 +108,7 @@ pub async fn claim(pool: &PgPool, req: &ClaimRequest<'_>) -> Result<Vec<ClaimedJ
         .bind(req.kinds)
         .bind(req.process_id)
         .bind(limit)
+        .bind(req.min_lease_s)
         .fetch_all(&mut *tx)
         .await?;
     claim_keyed(&mut tx, req, limit, &mut claimed).await?;
@@ -147,6 +153,7 @@ async fn claim_keyed(
             sqlx::query_as::<_, KeyedRow>(CLAIM_ONE)
                 .bind(id)
                 .bind(req.process_id)
+                .bind(req.min_lease_s)
                 .fetch_one(&mut *savepoint)
                 .await
                 .map(KeyedRow::split);

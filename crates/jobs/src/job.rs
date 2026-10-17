@@ -38,6 +38,10 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     fn perform(self, ctx: JobContext) -> impl Future<Output = Result<(), JobError>> + Send;
 }
 
+/// Most attempts a kind may allow: far beyond any useful retry schedule, and small
+/// enough that retry-delay arithmetic cannot overflow.
+pub const MAX_ATTEMPTS: i32 = 1000;
+
 /// Per-kind defaults, stored on each job row at enqueue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobOptions {
@@ -70,6 +74,9 @@ impl JobOptions {
         if self.max_attempts < 1 {
             return Err("max_attempts must be at least 1".into());
         }
+        if self.max_attempts > MAX_ATTEMPTS {
+            return Err(format!("max_attempts must be at most {MAX_ATTEMPTS}"));
+        }
         if self.max_crashes < 1 {
             return Err("max_crashes must be at least 1".into());
         }
@@ -92,7 +99,7 @@ impl JobOptions {
     }
 }
 
-fn secs_ceil(d: Duration) -> i32 {
+pub(crate) fn secs_ceil(d: Duration) -> i32 {
     let s = d.as_secs() + u64::from(d.subsec_nanos() > 0);
     i32::try_from(s.max(1)).unwrap_or(i32::MAX)
 }
@@ -141,5 +148,23 @@ impl From<anyhow::Error> for JobError {
 impl From<sqlx::Error> for JobError {
     fn from(err: sqlx::Error) -> Self {
         Self::Retry(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_attempts_is_capped() {
+        let with = |max_attempts| JobOptions {
+            max_attempts,
+            ..JobOptions::default()
+        };
+        assert!(with(1).validate().is_ok());
+        assert!(with(MAX_ATTEMPTS).validate().is_ok());
+        assert!(with(MAX_ATTEMPTS + 1).validate().is_err());
+        assert!(with(i32::MAX).validate().is_err());
+        assert!(with(0).validate().is_err());
     }
 }

@@ -18,7 +18,7 @@ async fn heartbeat_renews_only_this_process_jobs_within_their_deadline() {
             .await
             .unwrap();
         // `mine` is past 2 min of a 900 s deadline: fine. `overdue` is past its 60 s deadline.
-        let beat = heartbeat(&pool, me, &[mine, theirs, overdue]).await.unwrap();
+        let beat = heartbeat(&pool, me, &[mine, theirs, overdue], 1).await.unwrap();
         let Beat::Alive(rows) = beat else { panic!("pruned") };
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![mine]);
@@ -39,7 +39,7 @@ async fn heartbeat_reports_cancel_requests_and_updates_the_registry() {
         let job = insert_running(&pool, me, "k", 60, 900).await;
         sqlx::query("UPDATE job_processes SET last_heartbeat_at = now() - interval '1 minute'").execute(&pool).await.unwrap();
         sqlx::query("UPDATE jobs SET cancel_requested = true WHERE id = $1").bind(job).execute(&pool).await.unwrap();
-        let Beat::Alive(rows) = heartbeat(&pool, me, &[job]).await.unwrap() else { panic!("pruned") };
+        let Beat::Alive(rows) = heartbeat(&pool, me, &[job], 1).await.unwrap() else { panic!("pruned") };
         assert!(rows[0].cancel_requested);
         let fresh: bool = sqlx::query_scalar("SELECT last_heartbeat_at > now() - interval '1 second' FROM job_processes WHERE id = $1")
             .bind(me).fetch_one(&pool).await.unwrap();
@@ -55,7 +55,7 @@ async fn a_deleted_registry_row_reads_as_pruned() {
         set_stopping(&pool, me).await.unwrap();
         deregister(&pool, me).await.unwrap();
         assert!(matches!(
-            heartbeat(&pool, me, &[]).await.unwrap(),
+            heartbeat(&pool, me, &[], 1).await.unwrap(),
             Beat::Pruned
         ));
     })

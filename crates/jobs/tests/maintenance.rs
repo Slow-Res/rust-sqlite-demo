@@ -80,6 +80,29 @@ async fn a_reaped_job_with_a_cancel_request_is_cancelled_not_requeued() {
     .await;
 }
 
+/// `power(2, attempt - 1)` would overflow float8 for a huge attempt count and fail the whole reap.
+#[tokio::test]
+async fn reaping_a_job_with_a_huge_attempt_count_does_not_overflow() {
+    with_db(|pool| async move {
+        let me = register_process(&pool, "me").await;
+        let id = insert_running(&pool, me, "k", 60, 900).await;
+        sqlx::query("UPDATE jobs SET attempt = 2000000000, max_attempts = 2147483647, max_crashes = 5 WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        expire(&pool, id).await;
+        assert_eq!(reap(&pool).await.unwrap().len(), 1);
+        let later: bool = sqlx::query_scalar("SELECT state = 'available' AND run_at > now() FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(later, "requeued with a delay capped by the backoff ceiling");
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn poison_jobs_fail_after_max_crashes_and_attempts_are_respected() {
     with_db(|pool| async move {

@@ -36,7 +36,7 @@ pub async fn reap(pool: &PgPool) -> Result<Vec<Reaped>, sqlx::Error> {
              state = CASE WHEN e.give_up THEN 'failed' WHEN j.cancel_requested THEN 'cancelled' ELSE 'available' END,
              finished_at = CASE WHEN e.give_up OR j.cancel_requested THEN now() ELSE NULL END,
              run_at = CASE WHEN e.give_up OR j.cancel_requested THEN j.run_at
-                      ELSE now() + make_interval(secs => random() * least(3600, 5 * power(2, greatest(j.attempt - 1, 0))))
+                      ELSE now() + make_interval(secs => random() * least(3600, 5 * power(2, least(greatest(j.attempt - 1, 0), 30))))
                       END,
              locked_by = NULL, locked_until = NULL,
              errors = jobs_push_error(j.errors, jsonb_build_object(

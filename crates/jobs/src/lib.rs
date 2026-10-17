@@ -34,7 +34,7 @@ pub use enqueue::{
     EnqueueError, EnqueueOptions, Enqueued, Enqueuer, MAX_ARGS_BYTES, NOTIFY_CHANNEL,
 };
 pub use heartbeat::Health;
-pub use job::{Job, JobError, JobOptions};
+pub use job::{Job, JobError, JobOptions, MAX_ATTEMPTS};
 pub use metrics::Metrics;
 pub use rate_limit::RateLimiter;
 pub use ready::{NotReady, ready};

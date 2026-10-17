@@ -103,6 +103,7 @@ pub async fn run(
         },
         flush_stop,
     ));
+    let min_lease_s = crate::job::secs_ceil(shortest_lease);
     beat_loop(
         running,
         process_id,
@@ -113,7 +114,7 @@ pub async fn run(
         stop,
         move |ids: Vec<i64>| {
             let pool = pool.clone();
-            async move { heartbeat(&pool, process_id, &ids).await }
+            async move { heartbeat(&pool, process_id, &ids, min_lease_s).await }
         },
     )
     .await

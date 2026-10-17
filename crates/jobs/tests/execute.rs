@@ -42,6 +42,7 @@ async fn run_claimed(
         process_id: me,
         limit: 1,
         max_running: None,
+        min_lease_s: 1,
     };
     let job = claim(pool, &req).await.unwrap().pop().expect("claimed");
     assert_eq!(job.id, id);

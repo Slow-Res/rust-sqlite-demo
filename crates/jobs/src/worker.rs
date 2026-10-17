@@ -71,6 +71,8 @@ struct Shared {
     process_id: i64,
     poll: Duration,
     health: Arc<Health>,
+    /// `shortest_lease` in whole seconds, for [`ClaimRequest::min_lease_s`].
+    min_lease_s: i32,
     /// How long after the last good beat claiming stops: the shortest lease
     /// minus one beat, the point where the heartbeat cancels handlers.
     grace: Duration,
@@ -158,6 +160,7 @@ impl Worker {
             process_id,
             poll: config.poll,
             health: health.clone(),
+            min_lease_s: crate::job::secs_ceil(shortest_lease),
             grace: shortest_lease.saturating_sub(config.heartbeat),
         };
         let wakes: HashMap<String, Arc<Notify>> = config
@@ -362,6 +365,7 @@ async fn queue_loop(s: Shared, q: QueueConfig, wake: Arc<Notify>, stop: Cancella
                 process_id: s.process_id,
                 limit: i64::try_from(free).unwrap_or(i64::MAX),
                 max_running: q.max_running,
+                min_lease_s: s.min_lease_s,
             };
             match claim(&s.pool, &req).await {
                 Ok(jobs) => {
