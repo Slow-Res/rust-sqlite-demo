@@ -13,9 +13,11 @@ pub mod config;
 pub mod context;
 pub mod enqueue;
 pub mod executor;
+pub mod heartbeat;
 pub mod job;
 pub mod rate_limit;
 pub mod registry;
+pub mod running;
 pub mod store;
 
 pub use backoff::Backoff;
