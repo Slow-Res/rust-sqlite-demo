@@ -60,6 +60,20 @@ impl Running {
         }
     }
 
+    /// Cancel every entry that has no cancel reason yet; returns their ids.
+    /// Already-cancelled entries keep their reason and are not reported.
+    pub fn cancel_pending(&self, reason: CancelReason) -> Vec<i64> {
+        let mut cancelled = Vec::new();
+        for (id, e) in self.map().iter() {
+            if e.cancel.get().is_none() {
+                e.cancel.set(reason);
+                e.token.cancel();
+                cancelled.push(*id);
+            }
+        }
+        cancelled
+    }
+
     /// Put back a value whose write failed, unless the handler reported a newer
     /// one meanwhile or the entry is gone or belongs to another attempt.
     pub fn restore_progress(&self, job_id: i64, attempt: i32, value: Value) {
@@ -119,6 +133,20 @@ mod tests {
         assert!(token.is_cancelled());
         assert_eq!(cell.get(), Some(CancelReason::Requested));
         r.cancel(99, CancelReason::Requested); // unknown id: no-op
+    }
+
+    #[test]
+    fn cancel_pending_skips_entries_that_already_have_a_reason() {
+        let r = Running::default();
+        let (a, b) = (entry(1), entry(1));
+        let (ca, cb) = (a.cancel.clone(), b.cancel.clone());
+        r.insert(1, a);
+        r.insert(2, b);
+        r.cancel(1, CancelReason::Requested);
+        assert_eq!(r.cancel_pending(CancelReason::LeaseLost), vec![2]);
+        assert!(r.cancel_pending(CancelReason::LeaseLost).is_empty());
+        assert_eq!(ca.get(), Some(CancelReason::Requested));
+        assert_eq!(cb.get(), Some(CancelReason::LeaseLost));
     }
 
     #[test]
