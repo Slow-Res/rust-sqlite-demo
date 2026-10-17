@@ -54,3 +54,49 @@ async fn push_error_keeps_the_last_ten() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn lease_check_requires_holder_and_lease_together_and_only_when_running() {
+    with_db(|pool| async move {
+        // (state, locked_by, locked_until set?, finished_at set?)
+        let insert = |state: &'static str, holder: bool, lease: bool, finished: bool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO jobs (kind, queue, args, state, max_attempts, max_crashes, deadline_s, lease_s,
+                                       locked_by, locked_until, finished_at)
+                     VALUES ('k', 'q', '{}', $1, 1, 1, 1, 1,
+                             CASE WHEN $2 THEN 5 END, CASE WHEN $3 THEN now() END, CASE WHEN $4 THEN now() END)",
+                )
+                .bind(state)
+                .bind(holder)
+                .bind(lease)
+                .bind(finished)
+                .execute(&pool)
+                .await
+            }
+        };
+        let violation = |res: Result<_, sqlx::Error>| match res {
+            Err(sqlx::Error::Database(err)) => err.constraint().map(str::to_owned),
+            _ => None,
+        };
+
+        // Only the holder set, on a job that is not running.
+        let res = insert("available", true, false, false).await;
+        assert_eq!(violation(res).as_deref(), Some("jobs_lease_iff_running"));
+        // Only the lease set, on a running job.
+        let res = insert("running", false, true, false).await;
+        assert_eq!(violation(res).as_deref(), Some("jobs_lease_iff_running"));
+        // Only the lease set, on a job that is not running.
+        let res = insert("available", false, true, false).await;
+        assert_eq!(violation(res).as_deref(), Some("jobs_lease_iff_running"));
+        // Only the holder set, on a running job.
+        let res = insert("running", true, false, false).await;
+        assert_eq!(violation(res).as_deref(), Some("jobs_lease_iff_running"));
+
+        insert("running", true, true, false).await.unwrap();
+        insert("available", false, false, false).await.unwrap();
+        assert_eq!(count(&pool, "SELECT count(*) FROM jobs").await, 2);
+    })
+    .await;
+}

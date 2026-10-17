@@ -29,7 +29,7 @@ CREATE TABLE jobs (
     finished_at        TIMESTAMPTZ,
     -- A running job always has a holder and a lease, and no other state has them.
     CONSTRAINT jobs_lease_iff_running
-        CHECK ((state = 'running') = (locked_by IS NOT NULL AND locked_until IS NOT NULL)),
+        CHECK ((state = 'running') = (locked_by IS NOT NULL) AND (state = 'running') = (locked_until IS NOT NULL)),
     CONSTRAINT jobs_finished_iff_terminal
         CHECK ((state IN ('succeeded', 'failed', 'cancelled')) = (finished_at IS NOT NULL))
 ) WITH (
