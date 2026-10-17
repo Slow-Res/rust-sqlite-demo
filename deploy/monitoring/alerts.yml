@@ -66,8 +66,20 @@ groups:
         annotations:
           summary: "jobs queue {{ $labels.queue }}: the oldest ready job has waited {{ $value | humanizeDuration }}"
           runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
+      # Two sources, because neither sees every failure. jobs_completed_total counts
+      # attempts a worker finished (workers pre-register it at 0, so the first failure
+      # is a step); a poison job failed by the reaper never reaches it. The leader's
+      # gauge jobs_failed_recent (failed in the last 24 h, per kind) does see those:
+      # it fires when it rose against 15 minutes ago, or when the kind's series is new
+      # (the gauge has no series for a kind without failures). The latter also fires
+      # for a kind with old failures while Prometheus has under 15 minutes of history.
       - alert: JobsFailing
-        expr: sum by (kind) (increase(jobs_completed_total{outcome="failed"}[15m])) > 0
+        expr: >-
+          sum by (kind) (increase(jobs_completed_total{outcome="failed"}[15m])) > 0
+          or
+          max by (kind) (jobs_failed_recent) > max by (kind) (jobs_failed_recent offset 15m)
+          or
+          (max by (kind) (jobs_failed_recent) > 0 unless max by (kind) (jobs_failed_recent offset 15m))
         annotations:
           summary: "jobs of kind {{ $labels.kind }} failed in the last 15 minutes"
           runbook: "docs/RUNBOOK.md#jobs-failed-jobs"
@@ -79,3 +91,21 @@ groups:
         annotations:
           summary: "no jobs worker is the maintenance leader"
           runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
+      # The next two need the jobs-worker scrape job in prometheus.yml (commented out there).
+      - alert: JobsWorkerDown
+        expr: up{job="jobs-worker"} == 0
+        for: 2m
+        annotations:
+          summary: "{{ $labels.instance }}: the jobs worker does not answer its metrics scrape"
+          runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
+      # A handler was cancelled because its lease could not be renewed, or an outcome
+      # write was refused because the lease was gone: the job may have run twice. Both
+      # counters are registered at 0 when the worker starts, so the first event is a step.
+      - alert: JobsLeaseLost
+        expr: >-
+          increase(jobs_lease_lost_total[15m]) > 0
+          or
+          increase(jobs_fence_rejected_total[15m]) > 0
+        annotations:
+          summary: "{{ $labels.instance }}: a jobs worker lost a lease in the last 15 minutes; a job may have run twice"
+          runbook: "docs/RUNBOOK.md#jobs-a-lease-was-lost"

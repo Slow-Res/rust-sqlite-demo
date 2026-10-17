@@ -119,6 +119,26 @@ impl Drop for ElectionConn {
     }
 }
 
+/// Make the server notice a dead client host within about 25 s (10 s idle, then 3 probes
+/// 5 s apart). The session lock is only released when the server drops the session, and
+/// with the usual 2 h keepalive default a leader whose host vanished (no FIN) would leave
+/// the cluster leaderless that long. Failing to set them costs that detection speed only,
+/// never the lease.
+async fn tune_keepalives(conn: &mut PgConnection) {
+    let set = bounded(
+        "leader keepalive settings",
+        STATEMENT_TIMEOUT,
+        sqlx::raw_sql(
+            "SET tcp_keepalives_idle = 10; SET tcp_keepalives_interval = 5; SET tcp_keepalives_count = 3",
+        )
+        .execute(conn),
+    )
+    .await;
+    if let Err(err) = set {
+        tracing::warn!(error = %err, "jobs: could not set TCP keepalives on the leader connection; a dead leader host may be noticed late");
+    }
+}
+
 async fn try_lead(pool: &PgPool) -> Result<Option<PgConnection>, sqlx::Error> {
     // Tried on a pooled connection: a failed try holds no lock and goes back to
     // the pool. Only the winner is detached, because the session lock lives as
@@ -136,6 +156,7 @@ async fn try_lead(pool: &PgPool) -> Result<Option<PgConnection>, sqlx::Error> {
     .await?;
     // An error, a timeout or a cancelled future leaves the guard armed: it closes the session.
     if got {
+        tune_keepalives(conn.conn()).await;
         Ok(conn.detach())
     } else {
         conn.release();
@@ -373,6 +394,22 @@ mod tests {
             "an armed guard must not return the session"
         );
         assert_eq!(pool.size(), before - 1, "the session is closed");
+    }
+
+    #[tokio::test]
+    async fn the_leader_connection_gets_short_tcp_keepalives() {
+        let pool = pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        tune_keepalives(&mut conn).await;
+        let settings: (String, String, String) = sqlx::query_as(
+            "SELECT current_setting('tcp_keepalives_idle'), current_setting('tcp_keepalives_interval'), current_setting('tcp_keepalives_count')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(settings, ("10".into(), "5".into(), "3".into()));
+        // Do not hand a tuned session back to the pool's other users.
+        drop(conn.detach());
     }
 
     #[tokio::test]

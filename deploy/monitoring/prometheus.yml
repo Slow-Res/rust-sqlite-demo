@@ -16,3 +16,9 @@ scrape_configs:
   - job_name: sync-worker
     static_configs:
       - targets: [node1-worker:9100, node2-worker:9100, node3-worker:9100]
+  # The Postgres deployment's jobs worker (docs/JOBS.md). Enable it where a worker runs
+  # (its JOBS_METRICS_ADDR, default port 9300); the JobsWorkerDown and JobsLeaseLost
+  # alerts need it, and with no target here they stay silent.
+  # - job_name: jobs-worker
+  #   static_configs:
+  #     - targets: [worker:9300]

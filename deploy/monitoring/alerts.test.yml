@@ -170,6 +170,42 @@ tests:
         alertname: JobsFailing
         exp_alerts: []
 
+  - name: jobs, a poison job only the leader's gauge sees fires JobsFailing
+    interval: 1m
+    input_series:
+      # No jobs_completed_total at all: the reaper failed these jobs, no worker did.
+      # A kind whose gauge series appears (the gauge has none without failures).
+      - series: 'jobs_failed_recent{instance="w1:9300", kind="webhook.v1"}'
+        values: "_x20 1x30"
+      # A kind whose gauge rises.
+      - series: 'jobs_failed_recent{instance="w1:9300", kind="loan_email.v1"}'
+        values: "2x20 3x30"
+      # Flat, and falling (old failures ageing out of the 24 h window): never an alert.
+      - series: 'jobs_failed_recent{instance="w1:9300", kind="flat.v1"}'
+        values: "4x50"
+      - series: 'jobs_failed_recent{instance="w1:9300", kind="falling.v1"}'
+        values: "5x20 4x30"
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: JobsFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: JobsFailing
+        exp_alerts:
+          - exp_labels:
+              kind: loan_email.v1
+            exp_annotations:
+              summary: "jobs of kind loan_email.v1 failed in the last 15 minutes"
+              runbook: "docs/RUNBOOK.md#jobs-failed-jobs"
+          - exp_labels:
+              kind: webhook.v1
+            exp_annotations:
+              summary: "jobs of kind webhook.v1 failed in the last 15 minutes"
+              runbook: "docs/RUNBOOK.md#jobs-failed-jobs"
+      - eval_time: 45m
+        alertname: JobsFailing
+        exp_alerts: []
+
   - name: jobs, no leader among scraped workers
     interval: 1m
     input_series:
@@ -187,3 +223,75 @@ tests:
           - exp_annotations:
               summary: "no jobs worker is the maintenance leader"
               runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
+
+  - name: jobs, a worker that stops answering its scrape fires JobsWorkerDown
+    interval: 1m
+    input_series:
+      - series: 'up{job="jobs-worker", instance="w1:9300"}'
+        values: "1x5 0x10"
+      - series: 'up{job="jobs-worker", instance="w2:9300"}'
+        values: "1x15"
+      # Another job's target being down is not this alert's business.
+      - series: 'up{job="sync-worker", instance="node1-worker:9100"}'
+        values: "0x15"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: JobsWorkerDown
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: JobsWorkerDown
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: JobsWorkerDown
+        exp_alerts:
+          - exp_labels:
+              job: jobs-worker
+              instance: "w1:9300"
+            exp_annotations:
+              summary: "w1:9300: the jobs worker does not answer its metrics scrape"
+              runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
+
+  - name: jobs, a lost lease fires JobsLeaseLost once and clears
+    interval: 1m
+    input_series:
+      - series: 'jobs_lease_lost_total{instance="w1:9300"}'
+        values: "0x5 1x30"
+      - series: 'jobs_fence_rejected_total{instance="w1:9300"}'
+        values: "0x35"
+      - series: 'jobs_lease_lost_total{instance="w2:9300"}'
+        values: "0x35"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: JobsLeaseLost
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: JobsLeaseLost
+        exp_alerts:
+          - exp_labels:
+              instance: "w1:9300"
+            exp_annotations:
+              summary: "w1:9300: a jobs worker lost a lease in the last 15 minutes; a job may have run twice"
+              runbook: "docs/RUNBOOK.md#jobs-a-lease-was-lost"
+      - eval_time: 30m
+        alertname: JobsLeaseLost
+        exp_alerts: []
+
+  - name: jobs, a rejected outcome write fires JobsLeaseLost too
+    interval: 1m
+    input_series:
+      - series: 'jobs_fence_rejected_total{instance="w2:9300"}'
+        values: "0x5 2x30"
+      - series: 'jobs_lease_lost_total{instance="w2:9300"}'
+        values: "0x35"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: JobsLeaseLost
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: JobsLeaseLost
+        exp_alerts:
+          - exp_labels:
+              instance: "w2:9300"
+            exp_annotations:
+              summary: "w2:9300: a jobs worker lost a lease in the last 15 minutes; a job may have run twice"
+              runbook: "docs/RUNBOOK.md#jobs-a-lease-was-lost"
