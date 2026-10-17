@@ -34,6 +34,16 @@ impl Running {
         self.map().remove(&id);
     }
 
+    /// Remove the entry for `id` only if it is still the one of `attempt`: a late
+    /// cleanup of a finished attempt must not remove the entry of a newer attempt
+    /// of the same job that this process re-claimed meanwhile.
+    pub fn remove_if(&self, id: i64, attempt: i32) {
+        let mut map = self.map();
+        if map.get(&id).is_some_and(|e| e.attempt == attempt) {
+            map.remove(&id);
+        }
+    }
+
     pub fn ids(&self) -> Vec<i64> {
         self.map().keys().copied().collect()
     }
@@ -120,6 +130,18 @@ mod tests {
             cancel: Arc::new(CancelCell::default()),
             progress: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[test]
+    fn remove_if_removes_only_the_entry_of_that_attempt() {
+        let r = Running::default();
+        r.insert(1, entry(1));
+        r.insert(1, entry(2)); // re-claimed before the old attempt's cleanup ran
+        r.remove_if(1, 1);
+        assert_eq!(r.ids(), vec![1], "the newer attempt stays");
+        r.remove_if(1, 2);
+        assert!(r.is_empty());
+        r.remove_if(1, 2); // already gone: no-op
     }
 
     #[test]

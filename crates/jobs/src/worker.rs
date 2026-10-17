@@ -358,14 +358,18 @@ struct JobGuard {
     metrics: Arc<Metrics>,
     queue: String,
     id: i64,
+    attempt: i32,
     wake: Arc<Notify>,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        self.running.remove(self.id);
+        // Only this attempt's entry: the job may have been re-claimed here already.
+        self.running.remove_if(self.id, self.attempt);
         self.metrics.running_add(&self.queue, -1);
+        // Free the slot first, so the woken loop sees it.
+        drop(self.permit.take());
         self.wake.notify_one();
     }
 }
@@ -395,8 +399,9 @@ fn spawn_job(
         metrics: s.metrics.clone(),
         queue: queue.to_owned(),
         id: job.id,
+        attempt: job.attempt,
         wake,
-        _permit: permit,
+        permit: Some(permit),
     };
     let s = s.clone();
     let tracker = s.tracker.clone();
