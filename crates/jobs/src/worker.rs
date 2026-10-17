@@ -97,6 +97,18 @@ impl Worker {
         self.health.clone()
     }
 
+    /// `/metrics`, `/healthz` and `/readyz` for this worker, ready to serve or
+    /// nest (feature `http`).
+    #[cfg(feature = "http")]
+    pub fn router(&self) -> axum::Router {
+        crate::http::router(
+            self.metrics(),
+            self.health(),
+            self.pool.clone(),
+            self.config.heartbeat,
+        )
+    }
+
     /// Run until `shutdown` fires (graceful, spec §13) or the process is fenced.
     pub async fn run(self, shutdown: CancellationToken) -> Result<ExitReason, WorkerError> {
         let Worker {

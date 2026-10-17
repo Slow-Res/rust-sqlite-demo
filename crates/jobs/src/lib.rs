@@ -14,10 +14,13 @@ pub mod context;
 pub mod enqueue;
 pub mod executor;
 pub mod heartbeat;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod job;
 pub mod maintenance;
 pub mod metrics;
 pub mod rate_limit;
+pub mod ready;
 pub mod registry;
 pub mod running;
 pub mod store;
@@ -29,8 +32,11 @@ pub use context::{Deps, JobContext};
 pub use enqueue::{
     EnqueueError, EnqueueOptions, Enqueued, Enqueuer, MAX_ARGS_BYTES, NOTIFY_CHANNEL,
 };
+pub use heartbeat::Health;
 pub use job::{Job, JobError, JobOptions};
+pub use metrics::Metrics;
 pub use rate_limit::RateLimiter;
+pub use ready::{NotReady, ready};
 pub use registry::{Registry, RegistryError};
 pub use worker::{ExitReason, Worker, WorkerError};
 
