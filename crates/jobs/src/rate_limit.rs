@@ -7,13 +7,18 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-/// Above this many keys, `acquire` first drops the buckets that are full again.
+/// A sweep for full (idle) buckets runs when the map outgrows this many keys.
 /// A full bucket is indistinguishable from a fresh one, so dropping it loses
 /// nothing; only keys that are still being paced stay, which bounds the map.
+/// The threshold then doubles past what survived, so a map full of busy keys is
+/// not rescanned on every call.
 const MAX_IDLE_KEYS: usize = 1024;
 
-/// No single wait is longer than this. A rate below one call per hour is
-/// therefore enforced as one call per hour (and it keeps `Duration` finite).
+/// The slowest pace enforced: one call per hour. Slower rates are clamped to it,
+/// which keeps every wait finite and at most [`MAX_WAIT`].
+const MIN_RATE: f64 = 1.0 / 3600.0;
+
+/// Longest single sleep; only a fallback, since the clamp keeps waits below it.
 const MAX_WAIT: Duration = Duration::from_secs(3600);
 
 struct Bucket {
@@ -30,11 +35,45 @@ impl Bucket {
     }
 }
 
+struct State {
+    buckets: HashMap<String, Bucket>,
+    /// Sweep when `buckets.len()` exceeds this.
+    next_sweep: usize,
+    #[cfg(test)]
+    sweeps: usize,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            next_sweep: MAX_IDLE_KEYS,
+            #[cfg(test)]
+            sweeps: 0,
+        }
+    }
+}
+
+impl State {
+    fn sweep_if_needed(&mut self, now: Instant) {
+        if self.buckets.len() <= self.next_sweep {
+            return;
+        }
+        self.buckets.retain(|_, b| !b.is_full_at(now));
+        self.next_sweep = MAX_IDLE_KEYS.max(2 * self.buckets.len());
+        #[cfg(test)]
+        {
+            self.sweeps += 1;
+        }
+    }
+}
+
 /// Token buckets keyed by a handler-chosen string, e.g. `webhook:example.com`.
-/// Capacity (burst) is `max(1, per_second)`.
+/// Capacity (burst) is `max(1, per_second)`. Rates below one call per hour are
+/// enforced as one call per hour.
 #[derive(Default)]
 pub struct RateLimiter {
-    buckets: Mutex<HashMap<String, Bucket>>,
+    state: Mutex<State>,
 }
 
 impl RateLimiter {
@@ -47,15 +86,14 @@ impl RateLimiter {
         if per_second <= 0.0 || !per_second.is_finite() {
             return;
         }
+        let per_second = per_second.max(MIN_RATE);
         let capacity = per_second.max(1.0);
         loop {
-            let (wait, capped) = {
-                let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+            let wait = {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let now = Instant::now();
-                if buckets.len() > MAX_IDLE_KEYS {
-                    buckets.retain(|_, b| !b.is_full_at(now));
-                }
-                let bucket = buckets.entry(key.to_owned()).or_insert(Bucket {
+                state.sweep_if_needed(now);
+                let bucket = state.buckets.entry(key.to_owned()).or_insert(Bucket {
                     tokens: capacity,
                     last: now,
                     per_second,
@@ -69,24 +107,30 @@ impl RateLimiter {
                     return;
                 }
                 let secs = (1.0 - bucket.tokens) / per_second;
-                match Duration::try_from_secs_f64(secs) {
-                    Ok(wait) if wait <= MAX_WAIT => (wait, false),
-                    _ => (MAX_WAIT, true),
-                }
+                Duration::try_from_secs_f64(secs)
+                    .unwrap_or(MAX_WAIT)
+                    .min(MAX_WAIT)
             };
+            // Always re-check: a concurrent caller may have taken the token.
             tokio::time::sleep(wait).await;
-            if capped {
-                return;
-            }
         }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.buckets
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .buckets
             .len()
+    }
+
+    #[cfg(test)]
+    fn sweeps(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sweeps
     }
 }
 
@@ -138,7 +182,11 @@ mod tests {
         );
         // After a refill every idle bucket is full again and is dropped.
         tokio::time::advance(Duration::from_secs(2)).await;
-        limiter.acquire("fresh", 5.0).await;
+        // The threshold was doubled to 2050, so it takes new keys to trigger the next sweep.
+        for i in 0..100 {
+            limiter.acquire(&format!("fresh{i}"), 5.0).await;
+        }
+        assert_eq!(limiter.sweeps(), 2);
         assert!(
             limiter.len() <= MAX_IDLE_KEYS,
             "{} buckets kept",
@@ -147,15 +195,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn tiny_rate_waits_at_most_the_cap_and_does_not_panic() {
+    async fn tiny_rate_is_clamped_to_one_per_hour_and_never_bursts() {
         let limiter = RateLimiter::new();
         limiter.acquire("k", 1e-20).await;
         let start = tokio::time::Instant::now();
-        limiter.acquire("k", 1e-20).await;
-        assert!(
-            start.elapsed() <= MAX_WAIT + Duration::from_millis(1),
-            "{:?}",
+        // Two waiters at once: each needs its own token, so they pass an hour apart.
+        let pass = || async {
+            limiter.acquire("k", 1e-20).await;
             start.elapsed()
+        };
+        let (a, b) = tokio::join!(pass(), pass());
+        let (first, second) = (a.min(b), a.max(b));
+        assert!(first >= Duration::from_secs(3599), "{first:?}");
+        assert!(
+            second - first >= Duration::from_secs(3599),
+            "{first:?} {second:?}"
         );
     }
 }
