@@ -260,3 +260,29 @@ pub async fn insert_running(
     .await
     .expect("insert running job")
 }
+
+/// Claim `job_id` for `process_id` by hand, as `claim` would; returns the attempt.
+pub async fn force_running(pool: &sqlx::PgPool, job_id: i64, process_id: i64) -> i32 {
+    sqlx::query_scalar(
+        "UPDATE jobs SET state = 'running', attempt = attempt + 1, locked_by = $2,
+                locked_until = now() + make_interval(secs => lease_s), attempt_started_at = now(),
+                finished_at = NULL
+         WHERE id = $1 RETURNING attempt",
+    )
+    .bind(job_id)
+    .bind(process_id)
+    .fetch_one(pool)
+    .await
+    .expect("force running")
+}
+
+pub async fn new_job(pool: &sqlx::PgPool, kind: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO jobs (kind, queue, args, max_attempts, max_crashes, deadline_s, lease_s)
+         VALUES ($1, 'default', '{\"n\": 0}', 10, 2, 900, 60) RETURNING id",
+    )
+    .bind(kind)
+    .fetch_one(pool)
+    .await
+    .expect("insert job")
+}
