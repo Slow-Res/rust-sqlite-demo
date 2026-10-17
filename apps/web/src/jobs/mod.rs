@@ -5,6 +5,7 @@
 pub mod events;
 pub mod loan_email;
 pub mod ops_cli;
+pub mod webhook;
 pub mod worker;
 
 use std::sync::Arc;
@@ -27,7 +28,11 @@ pub fn registry(jobs: &JobsConfig) -> anyhow::Result<Registry> {
             .register::<loan_email::LoanEmail>()
             .provide(Arc::new(mailer));
     }
-    // The webhook kind joins in Task 18.
+    if let Some(sender) = webhook::WebhookSender::from_config(jobs)? {
+        registry = registry
+            .register::<webhook::Webhook>()
+            .provide(Arc::new(sender));
+    }
     Ok(registry)
 }
 

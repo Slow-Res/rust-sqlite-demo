@@ -50,7 +50,7 @@ impl fmt::Debug for WebhookEndpoint {
     }
 }
 
-fn redacted_url(url: &str) -> String {
+pub(crate) fn redacted_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return "***".to_owned();
     };
