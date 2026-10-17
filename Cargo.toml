@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/shared", "crates/sqlite", "apps/web", "apps/sync-worker"]
+members = ["crates/shared", "crates/sqlite", "crates/jobs", "apps/web", "apps/sync-worker"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,7 @@ chrono = { version = "0.4", features = ["serde"] }
 ts-rs = { version = "12", features = ["chrono-impl", "serde-compat"] }
 library-shared = { path = "crates/shared" }
 sqlite-setup = { path = "crates/sqlite" }
+library-jobs = { path = "crates/jobs" }
 # Base features only. Each member adds what it needs (the web app: chrono,
 # migrate, macros; the worker: postgres). A crate that is built on its own
 # gets only its own features, which keeps Postgres out of the web binary.
