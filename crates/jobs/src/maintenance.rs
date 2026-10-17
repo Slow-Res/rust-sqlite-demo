@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use sqlx::pool::PoolConnection;
 use sqlx::{Connection, PgConnection, PgPool, Postgres};
-use tokio::time::{Interval, MissedTickBehavior};
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::MaintenanceConfig;
@@ -198,6 +198,13 @@ async fn lead(l: &Leader, mut conn: PgConnection, stop: &CancellationToken) {
 
 /// The leader's periodic work; runs until the caller drops it. Every step is
 /// bounded, so one stuck statement is logged and retried on the next tick.
+///
+/// Pruning is the one step that is only safe after a healthy stretch (spec §11.5): while
+/// the database is unreachable nobody can write a heartbeat, so right after an outage
+/// every live process looks silent. `healthy_since` restarts when leadership starts and
+/// whenever a statement fails; the prune runs only once it is `prune_after` old. Every
+/// live process beats more often than that (`validate` enforces it), so by then each has
+/// refreshed its row, and only processes that are really gone get pruned.
 async fn work(l: &Leader) {
     let c = &l.config;
     let (mut reap, mut prune) = (every(c.reap_every), every(c.prune_every));
@@ -206,27 +213,42 @@ async fn work(l: &Leader) {
         every(c.retention_every),
         every(c.gauges_every),
     );
+    let mut healthy_since = Instant::now();
     loop {
-        tokio::select! {
+        let ok = tokio::select! {
             _ = reap.tick() => match bounded("reap", STATEMENT_TIMEOUT, sql::reap(&l.pool)).await {
-                Ok(rows) => for r in rows {
-                    tracing::warn!(job_id = r.id, cause = %r.cause, state = %r.state, "jobs.reaped");
-                },
-                Err(err) => { l.metrics.db_error("reap"); tracing::warn!(error = %err, "jobs: reap failed"); }
+                Ok(rows) => {
+                    for r in rows {
+                        tracing::warn!(job_id = r.id, cause = %r.cause, state = %r.state, "jobs.reaped");
+                    }
+                    true
+                }
+                Err(err) => { l.metrics.db_error("reap"); tracing::warn!(error = %err, "jobs: reap failed"); false }
             },
-            _ = prune.tick() => match bounded("prune", STATEMENT_TIMEOUT, sql::prune(&l.pool, c.prune_after)).await {
-                Ok((0, _)) => {}
-                Ok((processes, jobs)) => tracing::warn!(processes, jobs, "process.pruned"),
-                Err(err) => { l.metrics.db_error("prune"); tracing::warn!(error = %err, "jobs: prune failed"); }
+            _ = prune.tick() => if healthy_since.elapsed() < c.prune_after {
+                tracing::debug!("jobs: prune skipped, the database has not been healthy for prune_after yet");
+                true
+            } else {
+                match bounded("prune", STATEMENT_TIMEOUT, sql::prune(&l.pool, c.prune_after)).await {
+                    Ok((0, _)) => true,
+                    Ok((processes, jobs)) => { tracing::warn!(processes, jobs, "process.pruned"); true }
+                    Err(err) => { l.metrics.db_error("prune"); tracing::warn!(error = %err, "jobs: prune failed"); false }
+                }
             },
             _ = recurring.tick() => run_recurring(l).await,
             _ = retention.tick() => run_retention(l).await,
             _ = gauges.tick() => refresh_gauges(l).await,
+        };
+        if !ok {
+            healthy_since = Instant::now();
         }
     }
 }
 
-async fn run_recurring(l: &Leader) {
+/// Returns whether every statement ran ok (the other steps below do too); `work` uses it
+/// to restart its healthy stretch.
+async fn run_recurring(l: &Leader) -> bool {
+    let mut ok = true;
     for r in l.registry.recurring_tasks() {
         let raw = match (r.make)() {
             Ok(raw) => raw,
@@ -247,12 +269,14 @@ async fn run_recurring(l: &Leader) {
             Err(err) => {
                 l.metrics.db_error("recurring");
                 tracing::warn!(task = r.task, error = %err, "jobs: recurring enqueue failed");
+                ok = false;
             }
         }
     }
+    ok
 }
 
-async fn run_retention(l: &Leader) {
+async fn run_retention(l: &Leader) -> bool {
     let c = &l.config;
     match bounded(
         "retention",
@@ -261,16 +285,20 @@ async fn run_retention(l: &Leader) {
     )
     .await
     {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(deleted = n, "jobs: retention"),
+        Ok(0) => true,
+        Ok(n) => {
+            tracing::info!(deleted = n, "jobs: retention");
+            true
+        }
         Err(err) => {
             l.metrics.db_error("retention");
             tracing::warn!(error = %err, "jobs: retention failed");
+            false
         }
     }
 }
 
-async fn refresh_gauges(l: &Leader) {
+async fn refresh_gauges(l: &Leader) -> bool {
     let result = bounded("gauge refresh", STATEMENT_TIMEOUT, async {
         let queues = stats::queue_stats(&l.pool).await?;
         let failed = stats::failed_recent(&l.pool).await?;
@@ -294,10 +322,12 @@ async fn refresh_gauges(l: &Leader) {
                 l.metrics.set_failed_recent(&kind, n);
             }
             l.metrics.set_processes_live(live);
+            true
         }
         Err(err) => {
             l.metrics.db_error("gauges");
             tracing::warn!(error = %err, "jobs: gauge refresh failed");
+            false
         }
     }
 }

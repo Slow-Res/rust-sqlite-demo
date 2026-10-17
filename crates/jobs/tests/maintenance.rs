@@ -318,3 +318,61 @@ async fn the_leader_exports_queue_gauges() {
     })
     .await;
 }
+
+/// Right after an outage every live process looks silent, so the leader prunes only
+/// once the database has been healthy for `prune_after` (spec §11.5). A failing
+/// retention statement (its table is renamed away) keeps the leader "unhealthy".
+#[tokio::test(flavor = "multi_thread")]
+async fn the_leader_does_not_prune_while_its_statements_keep_failing() {
+    with_db(|pool| async move {
+        sqlx::query("ALTER TABLE job_recurring_runs RENAME TO job_recurring_runs_away")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ghost = register_process(&pool, "ghost").await;
+        sqlx::query(
+            "UPDATE job_processes SET last_heartbeat_at = now() - interval '1 hour' WHERE id = $1",
+        )
+        .bind(ghost)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // fast_config: prune_after 1.5 s, retention every 0.5 s, prune every 0.2 s.
+        let w = start(&pool, fast_config("default:1"));
+        eventually(Duration::from_secs(5), "leader", || async {
+            is_leader(&w.metrics)
+        })
+        .await;
+        // Twice prune_after of failing statements: the silent row must survive.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let ghosts = count(
+            &pool,
+            "SELECT count(*) FROM job_processes WHERE name = 'ghost'",
+        )
+        .await;
+        assert_eq!(
+            ghosts, 1,
+            "pruned while the leader's statements were failing"
+        );
+
+        sqlx::query("ALTER TABLE job_recurring_runs_away RENAME TO job_recurring_runs")
+            .execute(&pool)
+            .await
+            .unwrap();
+        eventually(
+            Duration::from_secs(10),
+            "pruned after a healthy stretch",
+            || async {
+                count(
+                    &pool,
+                    "SELECT count(*) FROM job_processes WHERE name = 'ghost'",
+                )
+                .await
+                    == 0
+            },
+        )
+        .await;
+        w.shutdown().await;
+    })
+    .await;
+}

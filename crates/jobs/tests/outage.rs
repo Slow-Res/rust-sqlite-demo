@@ -48,17 +48,8 @@ async fn workers_survive_a_database_outage() {
         sqlx::query("CREATE TABLE test_runs (n BIGINT NOT NULL, attempt INT NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT now())")
             .execute(&pool).await.unwrap();
         for _ in 0..200 { enqueue(&pool, &Sleepy { ms: 200, honour_cancel: true }).await; }
-        // fast_config prunes processes after 1.5 s of silence; the pause is 20 s, so right after
-        // the unpause the leader would delete both live-but-silent registry rows and fence
-        // them (spec §8.2). Production prunes after 180 s, longer than any outage this
-        // test models, so use a value above the pause.
-        let config = || {
-            let mut c = fast_config("default:4");
-            c.maintenance.prune_after = Duration::from_secs(60);
-            c
-        };
-        let a = start(&pool, config());
-        let b = start(&pool, config());
+        let a = start(&pool, fast_config("default:4"));
+        let b = start(&pool, fast_config("default:4"));
         tokio::time::sleep(Duration::from_secs(1)).await;
         docker(&["pause", NAME]);
         tokio::time::sleep(Duration::from_secs(20)).await;
