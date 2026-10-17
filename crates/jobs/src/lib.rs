@@ -14,6 +14,7 @@ pub mod context;
 pub mod enqueue;
 pub mod job;
 pub mod rate_limit;
+pub mod store;
 
 pub use backoff::Backoff;
 pub use config::{ConfigError, MaintenanceConfig, QueueConfig, WorkerConfig};

@@ -218,3 +218,45 @@ impl Job for Keyed {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------- raw rows
+
+pub async fn register_process(pool: &sqlx::PgPool, name: &str) -> i64 {
+    library_jobs::store::process::register(
+        pool,
+        &library_jobs::store::process::ProcessInfo {
+            name: name.to_owned(),
+            kind: "worker".into(),
+            hostname: "test".into(),
+            pid: 1,
+            version: "test".into(),
+            config: serde_json::json!({ "queues": [], "kinds": [] }),
+        },
+    )
+    .await
+    .expect("register process")
+}
+
+/// A job already claimed by `process_id`, with a fresh lease.
+pub async fn insert_running(
+    pool: &sqlx::PgPool,
+    process_id: i64,
+    kind: &str,
+    lease_s: i32,
+    deadline_s: i32,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO jobs (kind, queue, args, state, attempt, max_attempts, max_crashes, deadline_s, lease_s,
+                           locked_by, locked_until, attempt_started_at)
+         VALUES ($1, 'default', '{\"n\": 0}', 'running', 1, 10, 2, $4, $3, $2,
+                 now() + make_interval(secs => $3::float8), now())
+         RETURNING id",
+    )
+    .bind(kind)
+    .bind(process_id)
+    .bind(lease_s)
+    .bind(deadline_s)
+    .fetch_one(pool)
+    .await
+    .expect("insert running job")
+}
