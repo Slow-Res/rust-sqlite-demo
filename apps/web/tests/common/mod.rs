@@ -111,6 +111,18 @@ impl TestApp {
         )
     }
 
+    /// Like [`new`](Self::new) but with background jobs configured (Postgres only).
+    #[cfg(feature = "postgres")]
+    pub fn with_jobs(db: impl Into<Database>, jobs: library_web::jobs_config::JobsConfig) -> Self {
+        Self::with_config(
+            db.into(),
+            Config {
+                jobs,
+                ..test_config()
+            },
+        )
+    }
+
     fn with_config(db: Database, config: Config) -> Self {
         let clock = Arc::new(FixedClock::new(start_time()));
         let config = Arc::new(config);

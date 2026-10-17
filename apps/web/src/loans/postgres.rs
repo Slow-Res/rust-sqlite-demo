@@ -13,6 +13,7 @@ use super::repo::{
 };
 use crate::count_cache::CountCache;
 use crate::db::{RepoError, from_timestamp, to_timestamp};
+use crate::jobs::events::{LoanEventKind, LoanEvents};
 use crate::pagination::PageParams;
 
 /// `SELECT ... FROM loans l` joined with its book and member, shaped like
@@ -31,6 +32,8 @@ macro_rules! select_loans {
 pub struct PostgresLoanRepository {
     pool: PgPool,
     counts: Arc<CountCache>,
+    /// Jobs to enqueue on borrow and return; `None` with jobs disabled.
+    events: Option<LoanEvents>,
 }
 
 impl PostgresLoanRepository {
@@ -39,12 +42,19 @@ impl PostgresLoanRepository {
             pool,
             // Off until `with_count_cache`: totals stay exact.
             counts: Arc::new(CountCache::new(Duration::ZERO)),
+            events: None,
         }
     }
 
     /// Reuse the totals of unfiltered lists through `counts` (see `count_cache`).
     pub fn with_count_cache(mut self, counts: Arc<CountCache>) -> Self {
         self.counts = counts;
+        self
+    }
+
+    /// Enqueue loan-event jobs in the borrow and return transactions (spec §15.1).
+    pub fn with_events(mut self, events: Option<LoanEvents>) -> Self {
+        self.events = events;
         self
     }
 }
@@ -262,6 +272,12 @@ impl LoanRepository for PostgresLoanRepository {
         let created = fetch_loan(&mut tx, id)
             .await?
             .ok_or_else(|| RepoError::Unexpected(anyhow::anyhow!("inserted loan vanished")))?;
+        if let Some(events) = &self.events {
+            events
+                .record(&mut tx, LoanEventKind::Borrowed, &created)
+                .await
+                .map_err(|err| RepoError::Unexpected(err.into()))?;
+        }
         tx.commit().await?;
         Ok(CreateLoanOutcome::Created(created))
     }
@@ -315,6 +331,12 @@ impl LoanRepository for PostgresLoanRepository {
         let returned = fetch_loan(&mut tx, id)
             .await?
             .ok_or_else(|| RepoError::Unexpected(anyhow::anyhow!("returned loan vanished")))?;
+        if let Some(events) = &self.events {
+            events
+                .record(&mut tx, LoanEventKind::Returned, &returned)
+                .await
+                .map_err(|err| RepoError::Unexpected(err.into()))?;
+        }
         tx.commit().await?;
         Ok(ReturnLoanOutcome::Returned(returned))
     }

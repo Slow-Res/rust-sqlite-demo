@@ -79,7 +79,9 @@ impl AppState {
                     PostgresMemberRepository::new(pool.clone()).with_count_cache(counts.clone()),
                 ),
                 Arc::new(
-                    PostgresLoanRepository::new(pool.clone()).with_count_cache(counts.clone()),
+                    PostgresLoanRepository::new(pool.clone())
+                        .with_count_cache(counts.clone())
+                        .with_events(crate::jobs::events::LoanEvents::from_config(&config.jobs)),
                 ),
             ),
         };
