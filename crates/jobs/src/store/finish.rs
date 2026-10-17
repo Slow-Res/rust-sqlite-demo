@@ -12,6 +12,11 @@ use crate::backoff::Backoff;
 /// Longest error message stored in `errors[].message`, in characters.
 pub const MAX_ERROR_CHARS: usize = 2000;
 
+/// Longest retry delay we will schedule. A remote's absurd `Retry-After` must
+/// not overflow Postgres' timestamp range: that would make the write fail and
+/// leave the job running until the reaper counts it as a crash.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// Who holds the job, for which attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fence {
@@ -55,7 +60,8 @@ pub enum Next {
 }
 
 /// Retry while attempts remain and the error allows it; the delay is the
-/// kind's backoff, but never shorter than `min_delay` (a `Retry-After`).
+/// kind's backoff, but never shorter than `min_delay` (a `Retry-After`) and
+/// never longer than [`MAX_RETRY_DELAY`].
 pub fn next_after_failure(
     attempt: i32,
     max_attempts: i32,
@@ -66,11 +72,18 @@ pub fn next_after_failure(
     if !retryable || attempt >= max_attempts {
         return Next::Fail;
     }
-    Next::RetryIn(backoff.delay(attempt).max(min_delay.unwrap_or_default()))
+    let delay = backoff.delay(attempt).max(min_delay.unwrap_or_default());
+    Next::RetryIn(delay.min(MAX_RETRY_DELAY))
 }
 
+/// Cap the length, and replace NUL, which Postgres text and jsonb reject (the
+/// write would fail and the job would stay running until reaped).
 fn truncate(message: &str) -> String {
-    message.chars().take(MAX_ERROR_CHARS).collect()
+    message
+        .chars()
+        .take(MAX_ERROR_CHARS)
+        .map(|c| if c == '\0' { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 /// Mark the job `succeeded`. `false` means the fence rejected the write.
@@ -201,5 +214,17 @@ mod tests {
             next_after_failure(1, 3, true, Some(Duration::from_secs(120)), &b),
             Next::RetryIn(d) if d == Duration::from_secs(120)
         ));
+    }
+
+    #[test]
+    fn retry_delay_is_capped() {
+        let b = Backoff {
+            base: Duration::from_secs(1),
+            cap: Duration::from_secs(1),
+        };
+        assert_eq!(
+            next_after_failure(1, 3, true, Some(Duration::MAX), &b),
+            Next::RetryIn(MAX_RETRY_DELAY)
+        );
     }
 }

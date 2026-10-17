@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use common::{force_running, new_job, register_process, with_db};
 use library_jobs::store::finish::{
-    Cause, Fence, MAX_ERROR_CHARS, Next, cancel, fail_attempt, release, succeed, write_progress,
+    Cause, Fence, MAX_ERROR_CHARS, MAX_RETRY_DELAY, Next, cancel, fail_attempt, release, succeed,
+    write_progress,
 };
 use sqlx::PgPool;
 
@@ -201,6 +202,149 @@ async fn progress_writes_are_fenced() {
                 .await
                 .unwrap();
         assert_eq!(stored, p);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn max_retry_delay_and_nul_in_messages_are_accepted() {
+    with_db(|pool| async move {
+        let me = register_process(&pool, "me").await;
+        let id = new_job(&pool, "k").await;
+        let attempt = force_running(&pool, id, me).await;
+        let f = Fence {
+            job_id: id,
+            process_id: me,
+            attempt,
+        };
+        assert!(
+            fail_attempt(&pool, f, Cause::Error, "x", Next::RetryIn(MAX_RETRY_DELAY))
+                .await
+                .unwrap()
+        );
+
+        let attempt = force_running(&pool, id, me).await;
+        let f = Fence {
+            job_id: id,
+            process_id: me,
+            attempt,
+        };
+        assert!(
+            fail_attempt(&pool, f, Cause::Error, "a\0b", Next::Fail)
+                .await
+                .unwrap()
+        );
+        let msg: String =
+            sqlx::query_scalar("SELECT errors->1->>'message' FROM jobs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!msg.contains('\0'));
+        assert_eq!(msg, "a\u{FFFD}b");
+
+        let other = new_job(&pool, "k").await;
+        let attempt = force_running(&pool, other, me).await;
+        assert!(
+            cancel(
+                &pool,
+                Fence {
+                    job_id: other,
+                    process_id: me,
+                    attempt
+                },
+                "n\0o"
+            )
+            .await
+            .unwrap()
+        );
+    })
+    .await;
+}
+
+/// Apply write number `op` (succeed, fail_attempt, cancel, release, write_progress).
+async fn apply(pool: &PgPool, op: usize, f: Fence) -> bool {
+    match op {
+        0 => succeed(pool, f).await,
+        1 => fail_attempt(pool, f, Cause::Error, "late", Next::Fail).await,
+        2 => cancel(pool, f, "late").await,
+        3 => release(pool, f).await,
+        _ => write_progress(pool, f, &serde_json::json!({ "late": true })).await,
+    }
+    .unwrap()
+}
+
+async fn snapshot(pool: &PgPool, id: i64) -> String {
+    sqlx::query_scalar("SELECT to_jsonb(jobs)::text FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn every_write_rejects_a_stale_fence_and_leaves_the_row_alone() {
+    with_db(|pool| async move {
+        let me = register_process(&pool, "me").await;
+        let other = register_process(&pool, "other").await;
+        for op in 0..5 {
+            // (a) right attempt, wrong holder.
+            let id = new_job(&pool, "k").await;
+            let attempt = force_running(&pool, id, me).await;
+            let before = snapshot(&pool, id).await;
+            assert!(
+                !apply(
+                    &pool,
+                    op,
+                    Fence {
+                        job_id: id,
+                        process_id: other,
+                        attempt
+                    }
+                )
+                .await,
+                "op {op} wrong holder"
+            );
+            assert_eq!(snapshot(&pool, id).await, before, "op {op} wrong holder");
+
+            // (b) released, then claimed by someone else: the old fence is stale.
+            let id = new_job(&pool, "k").await;
+            let old = Fence {
+                job_id: id,
+                process_id: me,
+                attempt: force_running(&pool, id, me).await,
+            };
+            assert!(release(&pool, old).await.unwrap());
+            force_running(&pool, id, other).await;
+            let before = snapshot(&pool, id).await;
+            assert!(
+                !apply(&pool, op, old).await,
+                "op {op} re-claimed by another"
+            );
+            assert_eq!(
+                snapshot(&pool, id).await,
+                before,
+                "op {op} re-claimed by another"
+            );
+
+            // (c) failed for retry, then re-claimed by the same process: only the attempt differs.
+            let id = new_job(&pool, "k").await;
+            let old = Fence {
+                job_id: id,
+                process_id: me,
+                attempt: force_running(&pool, id, me).await,
+            };
+            assert!(
+                fail_attempt(&pool, old, Cause::Error, "x", Next::RetryIn(Duration::ZERO))
+                    .await
+                    .unwrap()
+            );
+            let attempt = force_running(&pool, id, me).await;
+            assert_ne!(attempt, old.attempt);
+            let before = snapshot(&pool, id).await;
+            assert!(!apply(&pool, op, old).await, "op {op} new attempt");
+            assert_eq!(snapshot(&pool, id).await, before, "op {op} new attempt");
+        }
     })
     .await;
 }
