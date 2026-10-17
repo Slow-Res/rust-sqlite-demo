@@ -8,6 +8,14 @@
 
 use sqlx::PgPool;
 
+pub mod backoff;
+pub mod config;
+pub mod rate_limit;
+
+pub use backoff::Backoff;
+pub use config::{ConfigError, MaintenanceConfig, QueueConfig, WorkerConfig};
+pub use rate_limit::RateLimiter;
+
 /// The crate's own migration history table, so its versions never mix with the
 /// app's `_sqlx_migrations` (spec §3.3).
 pub const MIGRATIONS_TABLE: &str = "_jobs_migrations";
