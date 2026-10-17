@@ -8,7 +8,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::pool::PoolConnection;
+use sqlx::{Connection, PgConnection, PgPool, Postgres};
 use tokio::time::{Interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
@@ -85,27 +86,62 @@ async fn bounded<T>(
         .unwrap_or_else(|_| Err(timed_out(what)))
 }
 
+/// A pooled connection that is closed, not returned to the pool, unless it was
+/// released on purpose. `try_lead` can be dropped mid-query (shutdown) after
+/// Postgres has already granted the session lock; a plain drop would put that
+/// lock-holding session back in the pool and no node could lead until it was recycled.
+struct ElectionConn(Option<PoolConnection<Postgres>>);
+
+impl ElectionConn {
+    fn conn(&mut self) -> &mut PgConnection {
+        // Only `release` and `detach` empty the slot, and both consume `self`.
+        self.0.as_mut().map_or_else(
+            || unreachable!("election connection used after release"),
+            |c| &mut **c,
+        )
+    }
+
+    /// The lock was definitely not granted: the session may go back to the pool.
+    fn release(mut self) {
+        drop(self.0.take());
+    }
+
+    /// The lock was granted: the session now belongs to the leader.
+    fn detach(mut self) -> Option<PgConnection> {
+        self.0.take().map(PoolConnection::detach)
+    }
+}
+
+impl Drop for ElectionConn {
+    fn drop(&mut self) {
+        // Armed: the outcome is unknown, so close the session (this releases any lock).
+        if let Some(conn) = self.0.take() {
+            drop(conn.detach());
+        }
+    }
+}
+
 async fn try_lead(pool: &PgPool) -> Result<Option<PgConnection>, sqlx::Error> {
     // Tried on a pooled connection: a failed try holds no lock and goes back to
     // the pool. Only the winner is detached, because the session lock lives as
     // long as that connection and it must never be handed to another user.
-    let mut conn = bounded("leader election", STATEMENT_TIMEOUT, pool.acquire()).await?;
+    let mut conn = ElectionConn(Some(
+        bounded("leader election", STATEMENT_TIMEOUT, pool.acquire()).await?,
+    ));
     let got = bounded(
         "leader election",
         STATEMENT_TIMEOUT,
         sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(LEADER_LOCK)
-            .fetch_one(&mut *conn),
+            .fetch_one(conn.conn()),
     )
-    .await;
-    match got {
-        Ok(true) => Ok(Some(conn.detach())),
-        Ok(false) => Ok(None),
-        Err(err) => {
-            // The outcome is unknown, so the connection may hold the lock: close it for good.
-            drop(conn.detach());
-            Err(err)
-        }
+    .await?;
+    // An error, a timeout or a cancelled future leaves the guard armed: it closes the session.
+    if got {
+        Ok(conn.detach())
+    } else {
+        conn.release();
+        Ok(None)
     }
 }
 
@@ -145,6 +181,8 @@ async fn lead(l: &Leader, mut conn: PgConnection, stop: &CancellationToken) {
     };
     if let Some(err) = lost {
         // Never returned to the pool, never closed gracefully (it may not answer).
+        // Closing our socket does not end a half-open server session at once, so the lock
+        // may linger until TCP keepalive: a leaderless gap, never two leaders.
         tracing::warn!(error = %err, "leader.lost");
         drop(conn);
         return;
@@ -227,5 +265,49 @@ async fn refresh_gauges(l: &Leader) {
             l.metrics.db_error("gauges");
             tracing::warn!(error = %err, "jobs: gauge refresh failed");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    async fn pool() -> PgPool {
+        let url = std::env::var("TEST_POSTGRES_URL").expect("TEST_POSTGRES_URL is not set");
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect")
+    }
+
+    #[tokio::test]
+    async fn a_dropped_election_connection_is_closed_not_pooled() {
+        let pool = pool().await;
+        let conn = ElectionConn(Some(pool.acquire().await.unwrap()));
+        let before = pool.size();
+        drop(conn);
+        assert_eq!(
+            pool.num_idle(),
+            0,
+            "an armed guard must not return the session"
+        );
+        assert_eq!(pool.size(), before - 1, "the session is closed");
+    }
+
+    #[tokio::test]
+    async fn a_released_election_connection_goes_back_to_the_pool() {
+        let pool = pool().await;
+        let conn = ElectionConn(Some(pool.acquire().await.unwrap()));
+        conn.release();
+        // The pool takes the session back on a background task.
+        for _ in 0..100 {
+            if pool.num_idle() == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the released session never came back to the pool");
     }
 }

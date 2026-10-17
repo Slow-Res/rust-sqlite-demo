@@ -24,6 +24,9 @@ use crate::running::{Running, RunningEntry};
 use crate::store::claim::{ClaimRequest, ClaimedJob, claim};
 use crate::store::process::{ProcessInfo, deregister, register, set_stopping};
 
+/// Shutdown's registry writes must not hang on a dead pool.
+const REGISTRY_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
     #[error(transparent)]
@@ -187,8 +190,12 @@ impl Worker {
         maintenance_stop.cancel();
         if reason == ExitReason::Shutdown {
             tracing::info!(process_id, "process.stopping");
-            if let Err(err) = set_stopping(&pool, process_id).await {
-                tracing::warn!(error = %err, "jobs: could not mark the process as stopping");
+            match tokio::time::timeout(REGISTRY_TIMEOUT, set_stopping(&pool, process_id)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "jobs: could not mark the process as stopping");
+                }
+                Err(_) => tracing::warn!("jobs: marking the process as stopping timed out"),
             }
         }
         // A helper stuck on a dead connection must not hold up the rest of the shutdown.
@@ -230,8 +237,14 @@ impl Worker {
                 "jobs: handlers ignored cancellation; their leases will expire and the reaper will retry them"
             );
         }
-        if let Err(err) = deregister(&pool, process_id).await {
-            tracing::warn!(error = %err, "jobs: could not delete the registry row; the pruner will");
+        match tokio::time::timeout(REGISTRY_TIMEOUT, deregister(&pool, process_id)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "jobs: could not delete the registry row; the pruner will");
+            }
+            Err(_) => {
+                tracing::warn!("jobs: deleting the registry row timed out; the pruner will");
+            }
         }
         tracing::info!(process_id, "process.stopped");
         Ok(ExitReason::Shutdown)
