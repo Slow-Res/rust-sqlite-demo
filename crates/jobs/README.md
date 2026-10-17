@@ -81,7 +81,7 @@ impl Job for WelcomeEmail {
 ```
 
 `JobError::Retry` retries with backoff (5 s doubling to 1 h, full jitter, both set by
-`JobOptions::backoff`), `RetryAfter(d)` not before `d`, `Permanent` never, and `Cancelled` ends the
+`JobOptions::backoff`), `RetryAfter(d, msg)` not before `d`, `Permanent` never, and `Cancelled` ends the
 job `cancelled`. No retry delay is longer than 7 days (`MAX_RETRY_DELAY`), whatever the backoff
 or `RetryAfter` says. A panic counts as a retryable error. After `max_attempts` (10) the job ends
 `failed`.
@@ -177,19 +177,29 @@ claiming, waits up to `shutdown_timeout` (25 s) for running jobs, cancels the re
 queue without spending an attempt; one that ignores it keeps its lease until it expires, and
 the reaper retries the job. Then the worker deletes its registry row. Give the process at
 least `shutdown_timeout + cancel_grace + 10 s` before a SIGKILL (Docker's
-`stop_grace_period: 40s`). A killed process loses no job: they are reaped when their
-leases expire (each such expiry counts as a crash, see below).
+`stop_grace_period: 40s`). The worst case is longer: the worker first waits up to
+`shutdown_timeout` for its helper tasks (queue loops, LISTEN, leader), which end at once unless one
+is stuck on a dead connection, then up to `shutdown_timeout` again for the handlers; leave
+`2 × shutdown_timeout + cancel_grace + 10 s` if a stuck database must not cost you a SIGKILL.
+An HTTP drain started by the same token runs alongside this, so it only adds time when its
+budget is longer. A killed process loses no job: they are reaped when their leases expire (each
+such expiry counts as a crash, see below).
 
 **A runtime of its own.** When the worker runs inside your web server, CPU-heavy jobs can
 still slow requests: they share the runtime's threads. Run the worker on a separate runtime
 in its own OS thread. Create its pool **inside** that runtime: a sqlx connection belongs to
 the runtime whose reactor opened it.
 
+`registry()` and `config()` below build the `Registry` and the `WorkerConfig`, as in the axum
+program further down.
+
 ```rust
-let stop = CancellationToken::new();
-let jobs_thread = {
-    let stop = stop.clone();
-    let url = database_url.clone();
+use std::thread::JoinHandle;
+
+use library_jobs::{ExitReason, Worker};
+use tokio_util::sync::CancellationToken;
+
+fn spawn_jobs_runtime(url: String, stop: CancellationToken) -> std::io::Result<JoinHandle<anyhow::Result<()>>> {
     std::thread::Builder::new().name("jobs".into()).spawn(move || -> anyhow::Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -198,14 +208,14 @@ let jobs_thread = {
             .build()?;
         rt.block_on(async move {
             let pool = sqlx::postgres::PgPoolOptions::new().max_connections(8).connect(&url).await?;
-            let worker = Worker::new(pool, registry(), config())?;
+            let worker = Worker::new(pool, registry()?, config())?;
             match worker.run(stop).await? {
                 ExitReason::Shutdown => Ok(()),
                 ExitReason::SelfFenced => anyhow::bail!("jobs worker fenced itself off; restart the process"),
             }
         })
-    })?
-};
+    })
+}
 // ... serve HTTP on the main runtime; on shutdown: stop.cancel(); jobs_thread.join()
 ```
 
@@ -299,17 +309,24 @@ repository the `Enqueuer` and enqueue just before its `commit`, so the handler d
 transaction at all. See `apps/web/src/loans/postgres.rs`.
 
 **Running the worker inside the server** shares one `CancellationToken` with axum's graceful
-shutdown. HTTP drains first, then the worker finishes or releases its jobs:
+shutdown. When a signal arrives, HTTP drains (for a bounded time) while the worker finishes or
+releases its jobs, and `main` waits for both. SIGTERM, which container runtimes send, is handled
+like Ctrl-C:
 
 ```rust
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::routing::post;
 use axum::Router;
 use library_jobs::{Enqueuer, ExitReason, QueueConfig, Registry, Worker, WorkerConfig};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
+
+/// How long the public server may spend draining in-flight requests after `stop` fires.
+const DRAIN_BUDGET: Duration = Duration::from_secs(10);
 
 fn registry() -> anyhow::Result<Registry> {
     Ok(Registry::new()
@@ -320,60 +337,123 @@ fn registry() -> anyhow::Result<Registry> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let url = std::env::args().nth(1).context("usage: axum_app <DATABASE_URL>")?;
+    let url = std::env::args()
+        .nth(1)
+        .context("usage: axum_app <DATABASE_URL>")?;
 
-    let pool = PgPoolOptions::new().max_connections(10).connect(&url).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&url)
+        .await?;
     sqlx::migrate!().run(&pool).await?; // your schema
     library_jobs::migrate(&pool).await?;
 
     // The worker gets a pool of its own, so jobs never wait for the API's connections.
-    let worker_pool = PgPoolOptions::new().max_connections(8).connect(&url).await?;
-    let worker = Worker::new(worker_pool, registry()?, WorkerConfig::new(QueueConfig::parse_list("email:4")?))?;
-    let internal = worker.router(); // /metrics /healthz /readyz (feature `http`)
+    let worker_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await?;
+    let worker = Worker::new(
+        worker_pool,
+        registry()?,
+        WorkerConfig::new(QueueConfig::parse_list("email:4")?),
+    )?;
+    let internal = worker.router();
 
     let stop = CancellationToken::new();
     tokio::spawn({
         let stop = stop.clone();
         async move {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
             stop.cancel();
         }
     });
-    let worker_task = tokio::spawn(worker.run(stop.clone()));
+    let worker_task = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            let result = worker.run(stop.clone()).await;
+            // A fenced worker takes the HTTP server down with it, so the process can restart.
+            stop.cancel();
+            result
+        }
+    });
 
-    // Internal endpoints on their own address, never on the public listener.
+    // Whatever happens to HTTP, cancel `stop` and wait for the worker: it finishes its
+    // jobs or hands them back to the queue instead of leaving them to lease expiry.
+    let served = serve_http(internal, pool, stop.clone()).await;
+    stop.cancel();
+    let reason = worker_task.await??;
+    served?;
+    match reason {
+        ExitReason::Shutdown => Ok(()),
+        ExitReason::SelfFenced => {
+            anyhow::bail!("the jobs worker fenced itself off; restart the process")
+        }
+    }
+}
+
+/// Both listeners, until `stop` fires; the public one then gets `DRAIN_BUDGET` to finish.
+async fn serve_http(internal: Router, pool: PgPool, stop: CancellationToken) -> anyhow::Result<()> {
+    // Internal endpoints on their own address, never on the public listener. Nothing
+    // awaits this task: returning from `main` ends it.
     let private = tokio::net::TcpListener::bind("127.0.0.1:9300").await?;
     tokio::spawn(library_jobs::http::serve(private, internal, stop.clone()));
 
     let app = Router::new()
         .route("/signup", post(sign_up))
-        .with_state(AppState { pool, jobs: Enqueuer::new(true) });
+        .with_state(AppState {
+            pool,
+            jobs: Enqueuer::new(true),
+        });
     let public = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     tracing::info!("API on 127.0.0.1:3000, jobs endpoints on 127.0.0.1:9300; Ctrl-C to stop");
-    axum::serve(public, app).with_graceful_shutdown(stop.clone().cancelled_owned()).await?;
+    let server = axum::serve(public, app).with_graceful_shutdown(stop.clone().cancelled_owned());
+    // The graceful drain waits for in-flight requests and streams, without a limit.
+    let mut server = std::pin::pin!(server.into_future());
+    tokio::select! {
+        served = &mut server => served?,
+        () = async {
+            stop.cancelled().await;
+            tokio::time::sleep(DRAIN_BUDGET).await;
+        } => tracing::warn!("HTTP drain budget spent; dropping the remaining connections"),
+    }
+    Ok(())
+}
 
-    // HTTP has drained; now running jobs finish or go back to the queue.
-    match worker_task.await?? {
-        ExitReason::Shutdown => Ok(()),
-        ExitReason::SelfFenced => anyhow::bail!("the jobs worker fenced itself off; restart the process"),
+/// Resolves on Ctrl-C or, on Unix, SIGTERM, which is what container runtimes send.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
     }
 }
 ```
 
-**Bound the HTTP drain.** `library_jobs::http::serve` (like `axum::serve` with a graceful
-shutdown) returns only when every open connection has closed, and it has no upper bound: one
-client holding a connection open holds the shutdown, and the supervisor's SIGKILL arrives before
-the worker has released its jobs. The example above never awaits the internal server, so
-returning from `main` ends it. If you do await a `serve` task, or the public server, wrap it in
-a timeout, or wrap the whole shutdown:
-
-```rust
-use std::time::Duration;
-
-let internal_task = tokio::spawn(library_jobs::http::serve(private, internal, stop.clone()));
-// ... after `stop` is cancelled and the public server has returned:
-let _ = tokio::time::timeout(Duration::from_secs(10), internal_task).await;
-```
+**Bound the HTTP drain.** A graceful shutdown, whether `axum::serve(..).with_graceful_shutdown(..)`
+or `library_jobs::http::serve`, returns only when the in-flight requests and streams have
+finished (axum closes idle keep-alive connections at once), and it has no upper bound: a slow
+download, an event stream or a hung handler holds the shutdown open, and the supervisor's SIGKILL
+arrives before the worker has released its jobs. `serve_http` above races the public server
+against `DRAIN_BUDGET` from the moment `stop` fires, and whatever happens it cancels `stop` and
+waits for the worker. The internal server is spawned and never awaited, so returning from `main`
+ends it; if you do await `http::serve`, give it the same `select!` with a timer. Keep the drain
+budget inside the supervisor's grace period (see "Graceful shutdown" under [tokio](#tokio)).
 
 **Mounting the internal router** in an existing app instead of a second listener works too
 (`app.nest("/internal/jobs", worker.router())`), but then anyone who can reach your API can read
@@ -406,7 +486,8 @@ and join the thread:
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let stop = CancellationToken::new();
-    let jobs_thread = spawn_jobs_runtime(stop.clone()); // the snippet under "A runtime of its own"
+    let url = std::env::var("DATABASE_URL").map_err(std::io::Error::other)?;
+    let jobs_thread = spawn_jobs_runtime(url.clone(), stop.clone())?; // under "A runtime of its own"
     let enqueuer = web::Data::new(Enqueuer::new(true));
     let pool = web::Data::new(PgPool::connect(&url).await.map_err(std::io::Error::other)?);
     HttpServer::new(move || App::new().app_data(enqueuer.clone()).app_data(pool.clone()).service(sign_up))

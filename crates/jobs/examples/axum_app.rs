@@ -1,7 +1,8 @@
 //! The crate inside an axum app (README, "axum"): a sign-up handler enqueues a
 //! job in its transaction, a worker runs in the same process, /metrics /healthz
-//! /readyz are served on an internal address, and Ctrl-C drains HTTP, then the
-//! worker. Use a scratch database:
+//! /readyz are served on an internal address, and Ctrl-C or SIGTERM drains HTTP
+//! (for at most `DRAIN_BUDGET`) while the worker finishes or releases its jobs.
+//! Use a scratch database:
 //!
 //!   cargo run -p library-jobs --example axum_app -- <DATABASE_URL>
 //!   curl -i -H 'content-type: application/json' -d '{"email":"a@example.com"}' 127.0.0.1:3000/signup
@@ -24,6 +25,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
+
+/// How long the public server may spend draining in-flight requests after `stop` fires.
+const DRAIN_BUDGET: Duration = Duration::from_secs(10);
 
 /// Stands in for an SMTP client: shared services reach handlers through `ctx.require`.
 struct Greeter {
@@ -169,13 +173,38 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn({
         let stop = stop.clone();
         async move {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
             stop.cancel();
         }
     });
-    let worker_task = tokio::spawn(worker.run(stop.clone()));
+    let worker_task = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            let result = worker.run(stop.clone()).await;
+            // A fenced worker takes the HTTP server down with it, so the process can restart.
+            stop.cancel();
+            result
+        }
+    });
 
-    // Internal endpoints on their own address, never on the public listener.
+    // Whatever happens to HTTP, cancel `stop` and wait for the worker: it finishes its
+    // jobs or hands them back to the queue instead of leaving them to lease expiry.
+    let served = serve_http(internal, pool, stop.clone()).await;
+    stop.cancel();
+    let reason = worker_task.await??;
+    served?;
+    match reason {
+        ExitReason::Shutdown => Ok(()),
+        ExitReason::SelfFenced => {
+            anyhow::bail!("the jobs worker fenced itself off; restart the process")
+        }
+    }
+}
+
+/// Both listeners, until `stop` fires; the public one then gets `DRAIN_BUDGET` to finish.
+async fn serve_http(internal: Router, pool: PgPool, stop: CancellationToken) -> anyhow::Result<()> {
+    // Internal endpoints on their own address, never on the public listener. Nothing
+    // awaits this task: returning from `main` ends it.
     let private = tokio::net::TcpListener::bind("127.0.0.1:9300").await?;
     tokio::spawn(library_jobs::http::serve(private, internal, stop.clone()));
 
@@ -187,15 +216,39 @@ async fn main() -> anyhow::Result<()> {
         });
     let public = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     tracing::info!("API on 127.0.0.1:3000, jobs endpoints on 127.0.0.1:9300; Ctrl-C to stop");
-    axum::serve(public, app)
-        .with_graceful_shutdown(stop.clone().cancelled_owned())
-        .await?;
+    let server = axum::serve(public, app).with_graceful_shutdown(stop.clone().cancelled_owned());
+    // The graceful drain waits for in-flight requests and streams, without a limit.
+    let mut server = std::pin::pin!(server.into_future());
+    tokio::select! {
+        served = &mut server => served?,
+        () = async {
+            stop.cancelled().await;
+            tokio::time::sleep(DRAIN_BUDGET).await;
+        } => tracing::warn!("HTTP drain budget spent; dropping the remaining connections"),
+    }
+    Ok(())
+}
 
-    // HTTP has drained; now running jobs finish or go back to the queue.
-    match worker_task.await?? {
-        ExitReason::Shutdown => Ok(()),
-        ExitReason::SelfFenced => {
-            anyhow::bail!("the jobs worker fenced itself off; restart the process")
+/// Resolves on Ctrl-C or, on Unix, SIGTERM, which is what container runtimes send.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
         }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
     }
 }
