@@ -140,3 +140,59 @@ pub async fn count(pool: &PgPool, sql: &'static str) -> i64 {
         .await
         .expect("count query")
 }
+
+// ---------------------------------------------------------------- test job kinds
+
+use library_jobs::{Job, JobContext, JobError};
+use serde::{Deserialize, Serialize};
+
+/// Succeeds at once and records its run in `test_runs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Noop {
+    pub n: i64,
+}
+
+impl Job for Noop {
+    const KIND: &'static str = "test_noop.v1";
+    const QUEUE: &'static str = "default";
+    async fn perform(self, ctx: JobContext) -> Result<(), JobError> {
+        sqlx::query("INSERT INTO test_runs (n, attempt) VALUES ($1, $2)")
+            .bind(self.n)
+            .bind(ctx.attempt())
+            .execute(ctx.pool())
+            .await?;
+        Ok(())
+    }
+}
+
+/// De-duplicated by `key`; `v` lets tests see which payload won.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Unique {
+    pub key: String,
+    pub v: i64,
+}
+
+impl Job for Unique {
+    const KIND: &'static str = "test_unique.v1";
+    const QUEUE: &'static str = "default";
+    fn unique_key(&self) -> Option<String> {
+        Some(self.key.clone())
+    }
+    async fn perform(self, _ctx: JobContext) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+/// Arguments larger than the 64 KB limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Big {
+    pub s: String,
+}
+
+impl Job for Big {
+    const KIND: &'static str = "test_big.v1";
+    const QUEUE: &'static str = "default";
+    async fn perform(self, _ctx: JobContext) -> Result<(), JobError> {
+        Ok(())
+    }
+}

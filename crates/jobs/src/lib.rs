@@ -10,10 +10,18 @@ use sqlx::PgPool;
 
 pub mod backoff;
 pub mod config;
+pub mod context;
+pub mod enqueue;
+pub mod job;
 pub mod rate_limit;
 
 pub use backoff::Backoff;
 pub use config::{ConfigError, MaintenanceConfig, QueueConfig, WorkerConfig};
+pub use context::{Deps, JobContext};
+pub use enqueue::{
+    EnqueueError, EnqueueOptions, Enqueued, Enqueuer, MAX_ARGS_BYTES, NOTIFY_CHANNEL,
+};
+pub use job::{Job, JobError, JobOptions};
 pub use rate_limit::RateLimiter;
 
 /// The crate's own migration history table, so its versions never mix with the
