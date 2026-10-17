@@ -276,3 +276,85 @@ async fn a_worker_claims_only_its_queues_and_records_its_kinds() {
     })
     .await;
 }
+
+/// The value of a metric line like `jobs_running{queue="default"}`, 0 when absent.
+fn metric(text: &str, series: &str) -> i64 {
+    text.lines()
+        .find_map(|l| l.strip_prefix(series).and_then(|v| v.trim().parse().ok()))
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_count_claimed_and_completed_jobs_and_running_returns_to_zero() {
+    with_db(|pool| async move {
+        let w = start(&pool, fast_config("default:2"));
+        for n in 0..5 {
+            enqueue(&pool, &Noop { n }).await;
+        }
+        eventually(T, "all succeeded", || async {
+            count(&pool, "SELECT count(*) FROM jobs WHERE state = 'succeeded'").await == 5
+        })
+        .await;
+        // The gauge drops when the job task ends, just after its outcome is written.
+        eventually(T, "running gauge is back to 0", || async {
+            w.metrics
+                .encode()
+                .contains(r#"jobs_running{queue="default"} 0"#)
+        })
+        .await;
+        let text = w.metrics.encode();
+        assert_eq!(
+            metric(&text, r#"jobs_claimed_total{queue="default"} "#),
+            5,
+            "{text}"
+        );
+        assert_eq!(
+            metric(
+                &text,
+                r#"jobs_completed_total{kind="test_noop.v1",outcome="succeeded"} "#
+            ),
+            5,
+            "{text}"
+        );
+        assert_eq!(
+            metric(&text, r#"jobs_slots{queue="default"} "#),
+            2,
+            "{text}"
+        );
+        w.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_that_panics_while_being_built_is_recorded_and_leaks_nothing() {
+    with_db(|pool| async move {
+        let w = start(&pool, fast_config("default:2"));
+        let id = enqueue(&pool, &Explodes { n: 1 }).await;
+        eventually(T, "failed", || async {
+            job_state(&pool, id).await == "failed"
+        })
+        .await;
+        let cause: String =
+            sqlx::query_scalar("SELECT errors->-1->>'cause' FROM jobs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cause, "panic");
+        eventually(T, "running gauge is back to 0", || async {
+            w.metrics
+                .encode()
+                .contains(r#"jobs_running{queue="default"} 0"#)
+        })
+        .await;
+        // The slot is free again: the worker keeps serving jobs.
+        let ok = enqueue(&pool, &Noop { n: 2 }).await;
+        eventually(T, "next job runs", || async {
+            job_state(&pool, ok).await == "succeeded"
+        })
+        .await;
+        w.shutdown().await;
+    })
+    .await;
+}

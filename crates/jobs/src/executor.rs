@@ -87,6 +87,8 @@ enum Ran {
     Err(JobError),
     Panicked(String),
     Deadline,
+    /// The arguments no longer decode: permanent, never retried.
+    BadArgs(String),
 }
 
 pub async fn execute(
@@ -126,26 +128,23 @@ pub async fn execute(
         limiter,
         registry.deps(),
     );
-    let future = match (entry.handler)(job.args.clone(), ctx) {
-        Ok(f) => f,
-        Err(err) => {
-            let msg = format!("arguments do not decode as {}: {err}", job.kind);
-            tracing::error!(job_id = job.id, kind = %job.kind, error = %msg, "jobs.bad_args");
-            return write(
-                fence,
-                || finish::fail_attempt(pool, fence, Cause::BadArgs, &msg, Next::Fail),
-                Finished::Failed,
-            )
-            .await;
-        }
-    };
     let deadline = Duration::from_secs(u64::try_from(job.deadline_s).unwrap_or(1));
     // Own task: a panic becomes a JoinError instead of unwinding through the worker.
-    let mut handle = tokio::spawn(future);
+    // The handler constructor runs inside it too: it decodes the arguments (a custom
+    // `Deserialize`) and runs the synchronous part of `perform`, both user code.
+    let make = entry.handler.clone();
+    let args = job.args.clone();
+    let mut handle = tokio::spawn(async move {
+        match make(args, ctx) {
+            Ok(future) => Ok(future.await),
+            Err(decode) => Err(decode),
+        }
+    });
     let ran = tokio::select! {
         joined = &mut handle => match joined {
-            Ok(Ok(())) => Ran::Ok,
-            Ok(Err(e)) => Ran::Err(e),
+            Ok(Ok(Ok(()))) => Ran::Ok,
+            Ok(Ok(Err(e))) => Ran::Err(e),
+            Ok(Err(decode)) => Ran::BadArgs(decode.to_string()),
             Err(e) if e.is_panic() => Ran::Panicked(panic_message(e)),
             Err(e) => Ran::Err(JobError::retry(e)),
         },
@@ -154,7 +153,6 @@ pub async fn execute(
             Ran::Deadline
         }
     };
-
     let backoff = entry.options.backoff;
     let retry = |cause: Cause, msg: String, min: Option<Duration>| {
         let next = next_after_failure(job.attempt, job.max_attempts, true, min, &backoff);
@@ -167,7 +165,8 @@ pub async fn execute(
     };
 
     // A fired token decides first: the handler stopped because we asked it to.
-    if token.is_cancelled() && !matches!(ran, Ran::Ok) {
+    // (A decode failure is not caused by the cancellation, so it is recorded regardless.)
+    if token.is_cancelled() && !matches!(ran, Ran::Ok | Ran::BadArgs(_)) {
         match cancel.get() {
             Some(CancelReason::Shutdown) => {
                 return write(fence, || finish::release(pool, fence), Finished::Released).await;
@@ -195,6 +194,11 @@ pub async fn execute(
         Ran::Err(JobError::Permanent(m)) => (Cause::Permanent, m, Next::Fail, Finished::Failed),
         Ran::Err(JobError::Retry(m)) => retry(Cause::Error, m, None),
         Ran::Err(JobError::RetryAfter(d, m)) => retry(Cause::Error, m, Some(d)),
+        Ran::BadArgs(err) => {
+            let msg = format!("arguments do not decode as {}: {err}", job.kind);
+            tracing::error!(job_id = job.id, kind = %job.kind, error = %msg, "jobs.bad_args");
+            (Cause::BadArgs, msg, Next::Fail, Finished::Failed)
+        }
         Ran::Panicked(m) => retry(Cause::Panic, m, None),
         Ran::Deadline => retry(
             Cause::DeadlineExceeded,

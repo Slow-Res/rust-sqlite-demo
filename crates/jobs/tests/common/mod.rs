@@ -409,6 +409,31 @@ impl Job for SleepOnce {
     }
 }
 
+/// Panics while `perform` builds its future, before anything is awaited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Explodes {
+    pub n: i64,
+}
+
+impl Job for Explodes {
+    const KIND: &'static str = "test_explodes.v1";
+    const QUEUE: &'static str = "default";
+    fn options() -> library_jobs::JobOptions {
+        library_jobs::JobOptions {
+            max_attempts: 1,
+            lease: StdDuration::from_secs(1),
+            ..Default::default()
+        }
+    }
+    fn perform(
+        self,
+        _ctx: JobContext,
+    ) -> impl std::future::Future<Output = Result<(), JobError>> + Send {
+        assert!(self.n < 0, "perform panicked while building its future");
+        async { Ok(()) }
+    }
+}
+
 pub fn registry() -> library_jobs::Registry {
     library_jobs::Registry::new()
         .register::<Noop>()
@@ -418,6 +443,7 @@ pub fn registry() -> library_jobs::Registry {
         .register::<Sleepy>()
         .register::<ShortDeadline>()
         .register::<SleepOnce>()
+        .register::<Explodes>()
 }
 
 /// Fast settings for tests: heartbeat 200 ms (test kinds use 1 s leases).

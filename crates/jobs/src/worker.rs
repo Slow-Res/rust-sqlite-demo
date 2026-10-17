@@ -106,7 +106,7 @@ impl Worker {
         } = self;
         let registry = Arc::new(registry);
         let info = process_info(&config, &registry);
-        let Some(process_id) = register_until_ok(&pool, &info, &shutdown).await else {
+        let Some(process_id) = register_until_ok(&pool, &info, &metrics, &shutdown).await else {
             return Ok(ExitReason::Shutdown);
         };
         tracing::info!(process_id, name = %info.name, "process.started");
@@ -145,7 +145,12 @@ impl Worker {
             .collect();
         let mut helpers = JoinSet::new();
         if config.listen {
-            helpers.spawn(listen(pool.clone(), wakes.clone(), claim_stop.clone()));
+            helpers.spawn(listen(
+                pool.clone(),
+                wakes.clone(),
+                metrics.clone(),
+                claim_stop.clone(),
+            ));
         }
         for q in &config.queues {
             let wake = wakes.get(&q.name).cloned().unwrap_or_default();
@@ -180,7 +185,10 @@ impl Worker {
         tracker.close();
 
         if reason == ExitReason::SelfFenced {
-            // Handlers were cancelled with LeaseLost; their writes will be fenced off.
+            // The heartbeat cancels with LeaseLost when it sees the fence, but not when
+            // it died (panicked); the first reason wins, so this is idempotent.
+            // Their writes will be fenced off.
+            running.cancel_all(CancelReason::LeaseLost);
             let _ = tokio::time::timeout(config.cancel_grace, tracker.wait()).await;
             return Ok(ExitReason::SelfFenced);
         }
@@ -241,6 +249,7 @@ fn process_info(config: &WorkerConfig, registry: &Registry) -> ProcessInfo {
 async fn register_until_ok(
     pool: &PgPool,
     info: &ProcessInfo,
+    metrics: &Metrics,
     shutdown: &CancellationToken,
 ) -> Option<i64> {
     let mut wait = Duration::from_secs(1);
@@ -248,6 +257,7 @@ async fn register_until_ok(
         match register(pool, info).await {
             Ok(id) => return Some(id),
             Err(err) => {
+                metrics.db_error("register");
                 tracing::warn!(error = %err, "jobs: could not register the process; retrying")
             }
         }
@@ -340,6 +350,26 @@ async fn queue_loop(s: Shared, q: QueueConfig, wake: Arc<Notify>, stop: Cancella
     }
 }
 
+/// Owns everything a running job holds in this process, so it is released on
+/// every path, a panic included: the slot, the `Running` entry (which the
+/// heartbeat would keep renewing), the gauge, and a wake-up for the loop.
+struct JobGuard {
+    running: Running,
+    metrics: Arc<Metrics>,
+    queue: String,
+    id: i64,
+    wake: Arc<Notify>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        self.running.remove(self.id);
+        self.metrics.running_add(&self.queue, -1);
+        self.wake.notify_one();
+    }
+}
+
 fn spawn_job(
     s: &Shared,
     queue: &str,
@@ -360,10 +390,18 @@ fn spawn_job(
         },
     );
     s.metrics.running_add(queue, 1);
+    let guard = JobGuard {
+        running: s.running.clone(),
+        metrics: s.metrics.clone(),
+        queue: queue.to_owned(),
+        id: job.id,
+        wake,
+        _permit: permit,
+    };
     let s = s.clone();
-    let queue = queue.to_owned();
     let tracker = s.tracker.clone();
     tracker.spawn(async move {
+        let _guard = guard;
         let (id, kind) = (job.id, job.kind.clone());
         tracing::debug!(job_id = id, %kind, attempt = job.attempt, "jobs.claimed");
         s.metrics.waited(&kind, job.waited_s);
@@ -378,16 +416,19 @@ fn spawn_job(
         let finished = execute(&s.pool, &s.registry, s.limiter.clone(), exec).await;
         tracing::debug!(job_id = id, %kind, outcome = finished.as_str(), "jobs.finished");
         s.metrics.finished(&kind, finished, started.elapsed());
-        s.metrics.running_add(&queue, -1);
-        s.running.remove(id);
-        drop(permit);
-        wake.notify_one();
     });
 }
 
 /// LISTEN for enqueue notifications and wake the matching queue loop. Lost
 /// notifications only cost latency: every loop also polls.
-async fn listen(pool: PgPool, wakes: HashMap<String, Arc<Notify>>, stop: CancellationToken) {
+async fn listen(
+    pool: PgPool,
+    wakes: HashMap<String, Arc<Notify>>,
+    metrics: Arc<Metrics>,
+    stop: CancellationToken,
+) {
+    // How long a listener must live before a later failure counts as a new outage.
+    const HEALTHY_AFTER: Duration = Duration::from_secs(30);
     let mut wait = Duration::from_secs(1);
     loop {
         let connect = async {
@@ -400,6 +441,7 @@ async fn listen(pool: PgPool, wakes: HashMap<String, Arc<Notify>>, stop: Cancell
             r = connect => match r {
                 Ok(l) => l,
                 Err(err) => {
+                    metrics.db_error("listen");
                     tracing::warn!(error = %err, "jobs: LISTEN failed; polling meanwhile");
                     tokio::select! { () = stop.cancelled() => return, () = tokio::time::sleep(wait) => {} }
                     wait = (wait * 2).min(Duration::from_secs(30));
@@ -407,7 +449,9 @@ async fn listen(pool: PgPool, wakes: HashMap<String, Arc<Notify>>, stop: Cancell
                 }
             },
         };
-        wait = Duration::from_secs(1);
+        // Notifications sent while there was no listener are gone: look once.
+        wakes.values().for_each(|w| w.notify_one());
+        let connected = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 () = stop.cancelled() => return,
@@ -421,14 +465,22 @@ async fn listen(pool: PgPool, wakes: HashMap<String, Arc<Notify>>, stop: Cancell
                     // notifications may have been missed, so wake everyone once.
                     Ok(None) => wakes.values().for_each(|w| w.notify_one()),
                     Err(err) => {
+                        metrics.db_error("listen");
                         tracing::warn!(error = %err, "jobs: LISTEN connection failed");
                         break;
                     }
                 },
             }
         }
+        // Back off before reconnecting, so a flapping connection cannot spin.
+        if connected.elapsed() >= HEALTHY_AFTER {
+            wait = Duration::from_secs(1);
+        }
+        tokio::select! { () = stop.cancelled() => return, () = tokio::time::sleep(wait) => {} }
+        wait = (wait * 2).min(Duration::from_secs(30));
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

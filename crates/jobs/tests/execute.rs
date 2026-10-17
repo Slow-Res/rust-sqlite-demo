@@ -4,7 +4,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{Fails, Noop, ShortDeadline, Sleepy, register_process, registry, with_db};
+use common::{Explodes, Fails, Noop, ShortDeadline, Sleepy, register_process, registry, with_db};
 use library_jobs::executor::{CancelCell, CancelReason, Execution, Finished, execute};
 use library_jobs::store::claim::{ClaimRequest, claim};
 use library_jobs::{Enqueuer, Job, RateLimiter};
@@ -93,6 +93,21 @@ async fn each_error_kind_maps_to_its_state() {
         ).fetch_one(&pool).await.unwrap();
         assert!(later, "Retry-After must be honoured");
     }).await;
+}
+
+#[tokio::test]
+async fn a_panic_while_building_the_future_is_recorded_like_a_handler_panic() {
+    with_db(|pool| async move {
+        let (id, f) = run(&pool, Explodes { n: 1 }, |_, _| {}).await;
+        assert_eq!(f, Finished::Failed, "max_attempts is 1");
+        let (state, _, cause, msg) = row(&pool, id).await;
+        assert_eq!(
+            (state.as_str(), cause.as_deref()),
+            ("failed", Some("panic"))
+        );
+        assert!(msg.unwrap().contains("while building its future"));
+    })
+    .await;
 }
 
 #[tokio::test]
