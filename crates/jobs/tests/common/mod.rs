@@ -286,3 +286,156 @@ pub async fn new_job(pool: &sqlx::PgPool, kind: &str) -> i64 {
     .await
     .expect("insert job")
 }
+
+// ---------------------------------------------------------------- more kinds, registry, config
+
+use std::time::Duration as StdDuration;
+
+/// Fails in the way `mode` says.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fails {
+    pub mode: String,
+}
+
+impl Job for Fails {
+    const KIND: &'static str = "test_fails.v1";
+    const QUEUE: &'static str = "default";
+    fn options() -> library_jobs::JobOptions {
+        library_jobs::JobOptions {
+            max_attempts: 3,
+            lease: StdDuration::from_secs(1),
+            ..Default::default()
+        }
+    }
+    async fn perform(self, _ctx: JobContext) -> Result<(), JobError> {
+        match self.mode.as_str() {
+            "retry" => Err(JobError::retry("try again")),
+            "retry_after" => Err(JobError::RetryAfter(
+                StdDuration::from_secs(120),
+                "slow down".into(),
+            )),
+            "permanent" => Err(JobError::permanent("bad input")),
+            "panic" => panic!("handler panicked"),
+            "huge" => Err(JobError::Retry("x".repeat(1_000_000))),
+            "cancelled" => Err(JobError::Cancelled),
+            other => Err(JobError::permanent(format!("unknown mode {other}"))),
+        }
+    }
+}
+
+/// Sleeps `ms`; with `honour_cancel` it stops when cancelled (and records n = -1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sleepy {
+    pub ms: u64,
+    pub honour_cancel: bool,
+}
+
+impl Job for Sleepy {
+    const KIND: &'static str = "test_sleepy.v1";
+    const QUEUE: &'static str = "default";
+    fn options() -> library_jobs::JobOptions {
+        library_jobs::JobOptions {
+            lease: StdDuration::from_secs(1),
+            ..Default::default()
+        }
+    }
+    async fn perform(self, ctx: JobContext) -> Result<(), JobError> {
+        let sleep = tokio::time::sleep(StdDuration::from_millis(self.ms));
+        if self.honour_cancel {
+            tokio::select! {
+                () = sleep => Ok(()),
+                () = ctx.cancelled() => {
+                    sqlx::query("INSERT INTO test_runs (n, attempt) VALUES (-1, $1)").bind(ctx.attempt()).execute(ctx.pool()).await?;
+                    Err(JobError::Cancelled)
+                }
+            }
+        } else {
+            sleep.await;
+            Ok(())
+        }
+    }
+}
+
+/// Ignores cancellation and blocks a thread for `ms`; deadline 1 s.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShortDeadline {
+    pub ms: u64,
+}
+
+impl Job for ShortDeadline {
+    const KIND: &'static str = "test_short_deadline.v1";
+    const QUEUE: &'static str = "default";
+    fn options() -> library_jobs::JobOptions {
+        library_jobs::JobOptions {
+            deadline: StdDuration::from_secs(1),
+            lease: StdDuration::from_secs(1),
+            max_attempts: 2,
+            ..Default::default()
+        }
+    }
+    async fn perform(self, _ctx: JobContext) -> Result<(), JobError> {
+        let ms = self.ms;
+        tokio::task::spawn_blocking(move || std::thread::sleep(StdDuration::from_millis(ms)))
+            .await
+            .map_err(JobError::retry)?;
+        Ok(())
+    }
+}
+
+/// Sleeps `ms` on attempt 1 only, then succeeds at once (crash-recovery tests).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SleepOnce {
+    pub ms: u64,
+}
+
+impl Job for SleepOnce {
+    const KIND: &'static str = "test_sleep_once.v1";
+    const QUEUE: &'static str = "default";
+    fn options() -> library_jobs::JobOptions {
+        library_jobs::JobOptions {
+            lease: StdDuration::from_secs(1),
+            ..Default::default()
+        }
+    }
+    async fn perform(self, ctx: JobContext) -> Result<(), JobError> {
+        if ctx.attempt() == 1 {
+            tokio::time::sleep(StdDuration::from_millis(self.ms)).await;
+        }
+        sqlx::query("INSERT INTO test_runs (n, attempt) VALUES (0, $1)")
+            .bind(ctx.attempt())
+            .execute(ctx.pool())
+            .await?;
+        Ok(())
+    }
+}
+
+pub fn registry() -> library_jobs::Registry {
+    library_jobs::Registry::new()
+        .register::<Noop>()
+        .register::<Unique>()
+        .register::<Big>()
+        .register::<Fails>()
+        .register::<Sleepy>()
+        .register::<ShortDeadline>()
+        .register::<SleepOnce>()
+}
+
+/// Fast settings for tests: heartbeat 200 ms (test kinds use 1 s leases).
+pub fn fast_config(queues: &str) -> library_jobs::WorkerConfig {
+    let mut c =
+        library_jobs::WorkerConfig::new(library_jobs::QueueConfig::parse_list(queues).unwrap());
+    c.poll = StdDuration::from_millis(100);
+    c.heartbeat = StdDuration::from_millis(200);
+    c.shutdown_timeout = StdDuration::from_secs(2);
+    c.cancel_grace = StdDuration::from_millis(500);
+    c.version = "test".into();
+    let m = &mut c.maintenance;
+    m.leader_retry = StdDuration::from_millis(200);
+    m.reap_every = StdDuration::from_millis(200);
+    m.prune_every = StdDuration::from_millis(200);
+    m.prune_after = StdDuration::from_millis(1500);
+    m.recurring_every = StdDuration::from_millis(100);
+    m.retention_every = StdDuration::from_millis(500);
+    m.gauges_every = StdDuration::from_millis(200);
+    c
+}
