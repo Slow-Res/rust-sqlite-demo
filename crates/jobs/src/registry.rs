@@ -107,6 +107,12 @@ impl Registry {
         k
     }
 
+    /// The shortest lease of any registered kind: after this long without a
+    /// successful heartbeat, all handlers must stop (spec §8.2).
+    pub(crate) fn min_lease(&self) -> Option<Duration> {
+        self.kinds.values().map(|e| e.options.lease).min()
+    }
+
     pub(crate) fn get(&self, kind: &str) -> Option<&KindEntry> {
         self.kinds.get(kind)
     }

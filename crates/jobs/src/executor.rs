@@ -172,8 +172,14 @@ pub async fn execute(
             Some(CancelReason::Shutdown) => {
                 return write(fence, || finish::release(pool, fence), Finished::Released).await;
             }
-            Some(CancelReason::LeaseLost) => return Finished::LeaseLost,
-            Some(CancelReason::Requested) | None => {}
+            // The heartbeat stops renewing a job at its deadline (in database time), which
+            // can land a few ms before this task's own timer fires. A handler that hit its
+            // deadline is recorded as such; if the lease was really lost, the fence below
+            // rejects the write and nothing changes.
+            Some(CancelReason::LeaseLost) if !matches!(ran, Ran::Deadline) => {
+                return Finished::LeaseLost;
+            }
+            Some(CancelReason::LeaseLost | CancelReason::Requested) | None => {}
         }
     }
     let (cause, msg, next, finished) = match ran {

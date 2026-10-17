@@ -15,10 +15,12 @@ pub mod enqueue;
 pub mod executor;
 pub mod heartbeat;
 pub mod job;
+pub mod metrics;
 pub mod rate_limit;
 pub mod registry;
 pub mod running;
 pub mod store;
+pub mod worker;
 
 pub use backoff::Backoff;
 pub use config::{ConfigError, MaintenanceConfig, QueueConfig, WorkerConfig};
@@ -29,6 +31,7 @@ pub use enqueue::{
 pub use job::{Job, JobError, JobOptions};
 pub use rate_limit::RateLimiter;
 pub use registry::{Registry, RegistryError};
+pub use worker::{ExitReason, Worker, WorkerError};
 
 /// The crate's own migration history table, so its versions never mix with the
 /// app's `_sqlx_migrations` (spec §3.3).

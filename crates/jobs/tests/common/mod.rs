@@ -439,3 +439,64 @@ pub fn fast_config(queues: &str) -> library_jobs::WorkerConfig {
     m.gauges_every = StdDuration::from_millis(200);
     c
 }
+
+// ---------------------------------------------------------------- running workers
+
+use std::sync::Arc;
+
+use library_jobs::heartbeat::Health;
+use library_jobs::metrics::Metrics;
+use library_jobs::worker::{ExitReason, Worker, WorkerError};
+use tokio_util::sync::CancellationToken;
+
+pub struct TestWorker {
+    pub stop: CancellationToken,
+    pub handle: tokio::task::JoinHandle<Result<ExitReason, WorkerError>>,
+    pub metrics: Arc<Metrics>,
+    pub health: Arc<Health>,
+}
+
+pub fn start(pool: &sqlx::PgPool, config: library_jobs::WorkerConfig) -> TestWorker {
+    start_with(pool, registry(), config)
+}
+
+pub fn start_with(
+    pool: &sqlx::PgPool,
+    registry: library_jobs::Registry,
+    config: library_jobs::WorkerConfig,
+) -> TestWorker {
+    let worker = Worker::new(pool.clone(), registry, config).expect("valid worker");
+    let (metrics, health) = (worker.metrics(), worker.health());
+    let stop = CancellationToken::new();
+    let handle = tokio::spawn(worker.run(stop.clone()));
+    TestWorker {
+        stop,
+        handle,
+        metrics,
+        health,
+    }
+}
+
+impl TestWorker {
+    pub async fn shutdown(self) -> ExitReason {
+        self.stop.cancel();
+        self.handle.await.expect("worker task").expect("worker run")
+    }
+}
+
+pub async fn enqueue<J: Job>(pool: &sqlx::PgPool, job: &J) -> i64 {
+    let mut conn = pool.acquire().await.unwrap();
+    library_jobs::Enqueuer::new(true)
+        .enqueue(&mut conn, job)
+        .await
+        .unwrap()
+        .id()
+}
+
+pub async fn job_state(pool: &sqlx::PgPool, id: i64) -> String {
+    sqlx::query_scalar("SELECT state FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
