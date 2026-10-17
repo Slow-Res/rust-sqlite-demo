@@ -3,9 +3,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Big, Keyed, Noop, Unique, count, with_db};
+use common::{Big, Keyed, LogBuf, Noop, Unique, count, with_db};
 use library_jobs::{EnqueueError, EnqueueOptions, Enqueued, Enqueuer};
 use sqlx::postgres::PgListener;
+use tracing::instrument::WithSubscriber;
 
 #[tokio::test]
 async fn commit_makes_the_job_visible_and_rollback_discards_it() {
@@ -299,6 +300,57 @@ async fn replace_keeps_a_retry_backoff_but_still_debounces_a_fresh_job() {
             .await
             .unwrap();
         assert!(moved_earlier, "debounce of a fresh job sets run_at from the new delay");
+    })
+    .await;
+}
+
+/// Spec §17.1: debug-level events with the kind, queue and id, never the arguments.
+#[tokio::test]
+async fn enqueue_and_duplicate_are_logged_at_debug_without_arguments() {
+    with_db(|pool| async move {
+        let enqueuer = Enqueuer::new(false);
+        let logs = LogBuf::default();
+        let mut conn = pool.acquire().await.unwrap();
+        let (first, again) = async {
+            let first = enqueuer
+                .enqueue(
+                    &mut conn,
+                    &Unique {
+                        key: "k".into(),
+                        v: 777_001,
+                    },
+                )
+                .await
+                .unwrap()
+                .id();
+            let again = enqueuer
+                .enqueue(
+                    &mut conn,
+                    &Unique {
+                        key: "k".into(),
+                        v: 777_002,
+                    },
+                )
+                .await
+                .unwrap();
+            (first, again)
+        }
+        .with_subscriber(logs.subscriber(tracing::Level::DEBUG))
+        .await;
+        assert_eq!(again, Enqueued::Duplicate(first));
+        let ev = logs.events();
+        let id = format!("job_id={first}");
+        for name in ["jobs.enqueued", "jobs.duplicate"] {
+            assert!(
+                ev.iter().any(|l| l.contains(name)
+                    && l.contains(&id)
+                    && l.contains("DEBUG")
+                    && l.contains("kind=test_unique.v1")
+                    && l.contains("queue=default")),
+                "{name}: {ev:?}"
+            );
+        }
+        assert!(ev.iter().all(|l| !l.contains("777")), "{ev:?}");
     })
     .await;
 }

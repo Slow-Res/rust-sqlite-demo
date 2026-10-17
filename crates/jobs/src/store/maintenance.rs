@@ -17,7 +17,8 @@ pub struct Reaped {
 /// Expired leases become attempt outcomes. `process_lost` when the holder's
 /// registry row is gone or silent for a lease, else `lease_expired`. A crash
 /// counts; after `max_crashes` (or the last attempt) the job fails. Crash
-/// retries use the default backoff (5 s base, 1 h cap, full jitter).
+/// retries use the default backoff (5 s base, 1 h cap, full jitter). A job
+/// whose cancellation was requested is cancelled instead of requeued.
 pub async fn reap(pool: &PgPool) -> Result<Vec<Reaped>, sqlx::Error> {
     sqlx::query_as(
         "WITH expired AS (
@@ -32,9 +33,9 @@ pub async fn reap(pool: &PgPool) -> Result<Vec<Reaped>, sqlx::Error> {
              FOR UPDATE OF j SKIP LOCKED)
          UPDATE jobs j SET
              crashes = j.crashes + 1,
-             state = CASE WHEN e.give_up THEN 'failed' ELSE 'available' END,
-             finished_at = CASE WHEN e.give_up THEN now() ELSE NULL END,
-             run_at = CASE WHEN e.give_up THEN j.run_at
+             state = CASE WHEN e.give_up THEN 'failed' WHEN j.cancel_requested THEN 'cancelled' ELSE 'available' END,
+             finished_at = CASE WHEN e.give_up OR j.cancel_requested THEN now() ELSE NULL END,
+             run_at = CASE WHEN e.give_up OR j.cancel_requested THEN j.run_at
                       ELSE now() + make_interval(secs => random() * least(3600, 5 * power(2, greatest(j.attempt - 1, 0))))
                       END,
              locked_by = NULL, locked_until = NULL,

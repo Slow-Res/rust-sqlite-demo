@@ -8,6 +8,60 @@ use std::time::Duration;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, PgConnection, PgPool};
 
+/// Captures the log output of a future it is attached to with
+/// `tracing::instrument::WithSubscriber`; [`LogBuf::subscriber`] makes the subscriber.
+#[derive(Clone, Default)]
+pub struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
+    }
+}
+
+impl LogBuf {
+    /// A subscriber writing events up to `level` into this buffer.
+    pub fn subscriber(&self, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
+        // Tests run on several threads: a callsite first hit where no subscriber is
+        // set can be cached as disabled, and a scoped subscriber would miss its events.
+        // A global one that records nothing keeps every callsite enabled.
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::sink)
+                    .with_max_level(tracing::Level::TRACE)
+                    .finish(),
+            );
+        });
+        tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_max_level(level)
+            .with_ansi(false)
+            .finish()
+    }
+
+    /// The captured `jobs.*` event lines.
+    pub fn events(&self) -> Vec<String> {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|l| l.contains(" jobs."))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
 /// A fresh database, migrated, plus the URL a child process can use.
 pub struct TestDb {
     pub pool: PgPool,

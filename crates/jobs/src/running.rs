@@ -56,18 +56,31 @@ impl Running {
         self.map().is_empty()
     }
 
-    pub fn cancel(&self, id: i64, reason: CancelReason) {
-        if let Some(e) = self.map().get(&id) {
-            e.cancel.set(reason);
-            e.token.cancel();
+    /// Cancel one job. True when this call is the first to report its lease lost
+    /// (only meaningful for [`CancelReason::LeaseLost`]; see `jobs_lease_lost_total`).
+    pub fn cancel(&self, id: i64, reason: CancelReason) -> bool {
+        match self.map().get(&id) {
+            Some(e) => {
+                e.cancel.set(reason);
+                e.token.cancel();
+                reason == CancelReason::LeaseLost && e.cancel.mark_lease_lost()
+            }
+            None => false,
         }
     }
 
-    pub fn cancel_all(&self, reason: CancelReason) {
+    /// Cancel every job; returns how many were newly reported as lease lost
+    /// when `reason` is [`CancelReason::LeaseLost`], else 0.
+    pub fn cancel_all(&self, reason: CancelReason) -> u64 {
+        let mut newly_lost = 0;
         for e in self.map().values() {
             e.cancel.set(reason);
             e.token.cancel();
+            if reason == CancelReason::LeaseLost && e.cancel.mark_lease_lost() {
+                newly_lost += 1;
+            }
         }
+        newly_lost
     }
 
     /// Cancel every entry that has no cancel reason yet; returns their ids.
@@ -78,6 +91,9 @@ impl Running {
             if e.cancel.get().is_none() {
                 e.cancel.set(reason);
                 e.token.cancel();
+                if reason == CancelReason::LeaseLost {
+                    e.cancel.mark_lease_lost();
+                }
                 cancelled.push(*id);
             }
         }

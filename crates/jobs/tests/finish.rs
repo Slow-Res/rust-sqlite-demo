@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use common::{force_running, new_job, register_process, with_db};
 use library_jobs::store::finish::{
-    Cause, Fence, MAX_ERROR_CHARS, MAX_RETRY_DELAY, Next, cancel, fail_attempt, release, succeed,
-    write_progress,
+    Cause, Fence, Landed, MAX_ERROR_CHARS, MAX_RETRY_DELAY, Next, cancel, fail_attempt, release,
+    succeed, write_progress,
 };
 use sqlx::PgPool;
 
@@ -88,7 +88,7 @@ async fn failed_attempts_retry_later_or_fail_and_record_the_cause() {
         let id = new_job(&pool, "k").await;
         let attempt = force_running(&pool, id, me).await;
         let f = Fence { job_id: id, process_id: me, attempt };
-        assert!(fail_attempt(&pool, f, Cause::Error, "boom", Next::RetryIn(Duration::from_secs(30))).await.unwrap());
+        assert!(fail_attempt(&pool, f, Cause::Error, "boom", Next::RetryIn(Duration::from_secs(30))).await.unwrap().is_some());
         let (st, later, cause, msg): (String, bool, String, String) = sqlx::query_as(
             "SELECT state, run_at > now() + interval '29 s', errors->0->>'cause', errors->0->>'message' FROM jobs WHERE id = $1",
         ).bind(id).fetch_one(&pool).await.unwrap();
@@ -96,8 +96,84 @@ async fn failed_attempts_retry_later_or_fail_and_record_the_cause() {
 
         let attempt = force_running(&pool, id, me).await;
         let f = Fence { job_id: id, process_id: me, attempt };
-        assert!(fail_attempt(&pool, f, Cause::Permanent, "bad input", Next::Fail).await.unwrap());
+        assert!(fail_attempt(&pool, f, Cause::Permanent, "bad input", Next::Fail).await.unwrap().is_some());
         assert_eq!(state(&pool, id).await, ("failed".into(), 2, true, true));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_retry_of_a_cancel_requested_job_ends_cancelled() {
+    with_db(|pool| async move {
+        let me = register_process(&pool, "me").await;
+        let id = new_job(&pool, "k").await;
+        let attempt = force_running(&pool, id, me).await;
+        sqlx::query("UPDATE jobs SET cancel_requested = true WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let f = Fence {
+            job_id: id,
+            process_id: me,
+            attempt,
+        };
+        let landed = fail_attempt(
+            &pool,
+            f,
+            Cause::Error,
+            "boom",
+            Next::RetryIn(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(landed, Some(Landed::Cancelled));
+        assert_eq!(state(&pool, id).await, ("cancelled".into(), 1, true, true));
+        let cause: String =
+            sqlx::query_scalar("SELECT errors->-1->>'cause' FROM jobs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cause, "error", "the attempt's own cause is kept");
+
+        // Without the request the same call requeues; a terminal failure stays failed.
+        let other = new_job(&pool, "k").await;
+        let attempt = force_running(&pool, other, me).await;
+        let f = Fence {
+            job_id: other,
+            process_id: me,
+            attempt,
+        };
+        assert_eq!(
+            fail_attempt(
+                &pool,
+                f,
+                Cause::Error,
+                "boom",
+                Next::RetryIn(Duration::ZERO)
+            )
+            .await
+            .unwrap(),
+            Some(Landed::Retry)
+        );
+        let attempt = force_running(&pool, other, me).await;
+        sqlx::query("UPDATE jobs SET cancel_requested = true WHERE id = $1")
+            .bind(other)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let f = Fence {
+            job_id: other,
+            process_id: me,
+            attempt,
+        };
+        assert_eq!(
+            fail_attempt(&pool, f, Cause::Permanent, "bad", Next::Fail)
+                .await
+                .unwrap(),
+            Some(Landed::Failed)
+        );
     })
     .await;
 }
@@ -221,6 +297,7 @@ async fn max_retry_delay_and_nul_in_messages_are_accepted() {
             fail_attempt(&pool, f, Cause::Error, "x", Next::RetryIn(MAX_RETRY_DELAY))
                 .await
                 .unwrap()
+                .is_some()
         );
 
         let attempt = force_running(&pool, id, me).await;
@@ -233,6 +310,7 @@ async fn max_retry_delay_and_nul_in_messages_are_accepted() {
             fail_attempt(&pool, f, Cause::Error, "a\0b", Next::Fail)
                 .await
                 .unwrap()
+                .is_some()
         );
         let msg: String =
             sqlx::query_scalar("SELECT errors->1->>'message' FROM jobs WHERE id = $1")
@@ -266,7 +344,9 @@ async fn max_retry_delay_and_nul_in_messages_are_accepted() {
 async fn apply(pool: &PgPool, op: usize, f: Fence) -> bool {
     match op {
         0 => succeed(pool, f).await,
-        1 => fail_attempt(pool, f, Cause::Error, "late", Next::Fail).await,
+        1 => fail_attempt(pool, f, Cause::Error, "late", Next::Fail)
+            .await
+            .map(|landed| landed.is_some()),
         2 => cancel(pool, f, "late").await,
         3 => release(pool, f).await,
         _ => write_progress(pool, f, &serde_json::json!({ "late": true })).await,
@@ -338,6 +418,7 @@ async fn every_write_rejects_a_stale_fence_and_leaves_the_row_alone() {
                 fail_attempt(&pool, old, Cause::Error, "x", Next::RetryIn(Duration::ZERO))
                     .await
                     .unwrap()
+                    .is_some()
             );
             let attempt = force_running(&pool, id, me).await;
             assert_ne!(attempt, old.attempt);

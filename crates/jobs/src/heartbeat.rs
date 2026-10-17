@@ -13,6 +13,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::CancelReason;
+use crate::metrics::Metrics;
 use crate::running::Running;
 use crate::store::finish::{Fence, write_progress};
 use crate::store::process::{Beat, LeaseRow, heartbeat};
@@ -79,6 +80,7 @@ const FLUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Progress is flushed by a separate task, so a slow progress write cannot
 /// delay a beat.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     pool: PgPool,
     process_id: i64,
@@ -86,6 +88,7 @@ pub async fn run(
     every: Duration,
     shortest_lease: Duration,
     health: Arc<Health>,
+    metrics: Arc<Metrics>,
     stop: CancellationToken,
 ) -> HeartbeatExit {
     let flush_stop = stop.child_token();
@@ -106,6 +109,7 @@ pub async fn run(
         every,
         shortest_lease.saturating_sub(every),
         health,
+        metrics,
         stop,
         move |ids: Vec<i64>| {
             let pool = pool.clone();
@@ -118,12 +122,14 @@ pub async fn run(
 /// The beat loop, with the database call injected so the timing is testable
 /// without a database. `grace` is how long after the last successful beat the
 /// handlers may keep running.
+#[allow(clippy::too_many_arguments)]
 async fn beat_loop<B, Fut>(
     running: Running,
     process_id: i64,
     every: Duration,
     grace: Duration,
     health: Arc<Health>,
+    metrics: Arc<Metrics>,
     stop: CancellationToken,
     beat: B,
 ) -> HeartbeatExit
@@ -141,7 +147,7 @@ where
             biased;
             () = stop.cancelled() => return HeartbeatExit::Stopped,
             () = tokio::time::sleep_until(give_up_at) => {
-                give_up_at = give_up(&running, every);
+                give_up_at = give_up(&running, &metrics, every);
             }
             _ = ticker.tick() => {
                 let ids = running.ids();
@@ -154,7 +160,7 @@ where
                         biased;
                         () = stop.cancelled() => return HeartbeatExit::Stopped,
                         () = tokio::time::sleep_until(give_up_at) => {
-                            give_up_at = give_up(&running, every);
+                            give_up_at = give_up(&running, &metrics, every);
                         }
                         outcome = &mut call => break outcome,
                     }
@@ -163,17 +169,23 @@ where
                     Ok(Ok(Beat::Pruned)) => {
                         tracing::error!(process_id, "process.self_fenced: registry row gone; stopping");
                         health.set_fenced();
-                        running.cancel_all(CancelReason::LeaseLost);
+                        metrics.lease_lost(running.cancel_all(CancelReason::LeaseLost));
                         return HeartbeatExit::SelfFenced;
                     }
                     Ok(Ok(Beat::Alive(rows))) => {
                         // The lease was renewed at some point after the call started.
                         give_up_at = started + grace;
                         health.beat_ok();
-                        apply_lease_rows(&running, &ids, &rows);
+                        apply_lease_rows(&running, &metrics, &ids, &rows);
                     }
-                    Ok(Err(err)) => tracing::warn!(error = %err, "jobs: heartbeat failed"),
-                    Err(_) => tracing::warn!("jobs: heartbeat timed out"),
+                    Ok(Err(err)) => {
+                        metrics.db_error("heartbeat");
+                        tracing::warn!(error = %err, "jobs: heartbeat failed");
+                    }
+                    Err(_) => {
+                        metrics.db_error("heartbeat");
+                        tracing::warn!("jobs: heartbeat timed out");
+                    }
                 }
             }
         }
@@ -184,8 +196,10 @@ where
 /// (logging each newly cancelled job once). Returns the next check, one beat
 /// from now, so jobs claimed during the outage are caught too. Nothing running
 /// means nothing to cancel.
-fn give_up(running: &Running, every: Duration) -> Instant {
-    for id in running.cancel_pending(CancelReason::LeaseLost) {
+fn give_up(running: &Running, metrics: &Metrics, every: Duration) -> Instant {
+    let cancelled = running.cancel_pending(CancelReason::LeaseLost);
+    metrics.lease_lost(cancelled.len() as u64);
+    for id in cancelled {
         tracing::error!(
             job_id = id,
             "jobs.lease_expired: no heartbeat for a whole lease; cancelling handler"
@@ -197,11 +211,14 @@ fn give_up(running: &Running, every: Duration) -> Instant {
 /// Apply a successful beat. `ids` is the snapshot sent with that beat: ids in
 /// it that were not renewed lost their lease; a job inserted after the
 /// snapshot was never sent and must not be touched.
-fn apply_lease_rows(running: &Running, ids: &[i64], rows: &[LeaseRow]) {
+fn apply_lease_rows(running: &Running, metrics: &Metrics, ids: &[i64], rows: &[LeaseRow]) {
     let renewed: HashSet<i64> = rows.iter().map(|r| r.id).collect();
     for id in ids.iter().filter(|id| !renewed.contains(id)) {
         tracing::warn!(job_id = id, "jobs.lease_lost");
-        running.cancel(*id, CancelReason::LeaseLost);
+        // Counted once per lost lease: later beats see the same id again.
+        if running.cancel(*id, CancelReason::LeaseLost) {
+            metrics.lease_lost(1);
+        }
     }
     for row in rows.iter().filter(|r| r.cancel_requested) {
         running.cancel(row.id, CancelReason::Requested);
@@ -304,10 +321,14 @@ mod tests {
             id: 1,
             cancel_requested: true,
         }];
-        apply_lease_rows(&running, &snapshot, &rows);
+        let metrics = Metrics::new();
+        apply_lease_rows(&running, &metrics, &snapshot, &rows);
         assert_eq!(ca.get(), Some(CancelReason::Requested));
         assert_eq!(cb.get(), Some(CancelReason::LeaseLost));
         assert_eq!(cc.get(), None);
+        // The same beat result again (the handler is still running): not counted twice.
+        apply_lease_rows(&running, &metrics, &snapshot, &rows);
+        assert!(metrics.encode().contains("jobs_lease_lost_total 1\n"));
     }
 
     type BeatFuture = std::pin::Pin<Box<dyn Future<Output = Result<Beat, sqlx::Error>> + Send>>;
@@ -342,6 +363,7 @@ mod tests {
         let (token, cell) = (e.token.clone(), e.cancel.clone());
         running.insert(1, e);
         let health = Arc::new(Health::default());
+        let metrics = Arc::new(Metrics::new());
         let stop = CancellationToken::new();
         // every 1 s, lease 3 s: grace = 2 s after the last successful beat (t=0).
         let task = tokio::spawn(beat_loop(
@@ -350,6 +372,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(2),
             health.clone(),
+            metrics.clone(),
             stop.clone(),
             hanging_after_first(),
         ));
@@ -365,6 +388,13 @@ mod tests {
         settle().await;
         assert!(token.is_cancelled(), "must cancel at last_ok + grace");
         assert_eq!(cell.get(), Some(CancelReason::LeaseLost));
+        // The give-up re-checks every beat, but the lost lease counts once.
+        advance_by(Duration::from_millis(3000)).await;
+        assert!(
+            metrics.encode().contains("jobs_lease_lost_total 1\n"),
+            "{}",
+            metrics.encode()
+        );
         // An outage cancels but never fences, and the task keeps beating.
         assert!(!health.is_fenced());
         assert!(!task.is_finished());
@@ -390,6 +420,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(2),
             Arc::new(Health::default()),
+            Arc::new(Metrics::new()),
             stop.clone(),
             hanging_after_first(),
         ));
@@ -456,6 +487,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(2),
             Arc::new(Health::default()),
+            Arc::new(Metrics::new()),
             stop.clone(),
             scripted(mode.clone()),
         ));
@@ -487,12 +519,14 @@ mod tests {
         running.insert(1, a);
         running.insert(2, b);
         let health = Arc::new(Health::default());
+        let metrics = Arc::new(Metrics::new());
         let task = tokio::spawn(beat_loop(
             running.clone(),
             7,
             Duration::from_secs(1),
             Duration::from_secs(2),
             health.clone(),
+            metrics.clone(),
             CancellationToken::new(),
             scripted(mode),
         ));
@@ -501,6 +535,7 @@ mod tests {
         assert!(health.is_fenced());
         assert_eq!(ca.get(), Some(CancelReason::LeaseLost));
         assert_eq!(cb.get(), Some(CancelReason::LeaseLost));
+        assert!(metrics.encode().contains("jobs_lease_lost_total 2\n"));
     }
 
     fn running_with_progress(value: Value) -> (Running, Arc<Mutex<Option<Value>>>) {

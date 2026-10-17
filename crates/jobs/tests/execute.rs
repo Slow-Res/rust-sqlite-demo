@@ -4,12 +4,15 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{Explodes, Fails, Noop, ShortDeadline, Sleepy, register_process, registry, with_db};
+use common::{
+    Explodes, Fails, LogBuf, Noop, ShortDeadline, Sleepy, register_process, registry, with_db,
+};
 use library_jobs::executor::{CancelCell, CancelReason, Execution, Finished, execute};
 use library_jobs::store::claim::{ClaimRequest, claim};
 use library_jobs::{Enqueuer, Job, RateLimiter};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
 
 /// Enqueue `job`, claim it as a fresh process, and run it through `execute`.
 async fn run<J: Job>(
@@ -54,7 +57,14 @@ async fn run_claimed(
     };
     (
         id,
-        execute(pool, &registry(), Arc::new(RateLimiter::new()), exec).await,
+        execute(
+            pool,
+            &registry(),
+            Arc::new(RateLimiter::new()),
+            &library_jobs::Metrics::new(),
+            exec,
+        )
+        .await,
     )
 }
 
@@ -249,17 +259,219 @@ async fn a_stolen_job_is_not_overwritten() {
             .id();
         let pool2 = pool.clone();
         let thief = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            sqlx::query("UPDATE jobs SET locked_by = -42 WHERE id = $1")
+            // Steal only once the job is running (a fixed sleep raced with the claim
+            // on a loaded machine and violated `jobs_lease_iff_running`).
+            loop {
+                let stolen = sqlx::query(
+                    "UPDATE jobs SET locked_by = -42 WHERE id = $1 AND state = 'running'",
+                )
                 .bind(id)
                 .execute(&pool2)
                 .await
-                .unwrap();
+                .unwrap()
+                .rows_affected();
+                if stolen == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         });
         let (_, f) = run_claimed(&pool, id, |_, _| {}).await;
         thief.await.unwrap();
         assert_eq!(f, Finished::FenceRejected);
         assert_eq!(row(&pool, id).await.0, "running");
+    })
+    .await;
+}
+
+/// A retryable failure of a job whose cancellation was requested must not requeue it.
+#[tokio::test]
+async fn a_retryable_failure_of_a_cancel_requested_job_ends_cancelled() {
+    with_db(|pool| async move {
+        let mut conn = pool.acquire().await.unwrap();
+        let id = Enqueuer::new(false)
+            .enqueue(
+                &mut conn,
+                &Fails {
+                    mode: "retry".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .id();
+        sqlx::query("UPDATE jobs SET cancel_requested = true WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, f) = run_claimed(&pool, id, |_, _| {}).await;
+        assert_eq!(f, Finished::Cancelled);
+        let (state, finished, locked): (String, bool, bool) = sqlx::query_as(
+            "SELECT state, finished_at IS NOT NULL, locked_by IS NULL FROM jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (state.as_str(), finished, locked),
+            ("cancelled", true, true)
+        );
+        assert_eq!(
+            row(&pool, id).await.2.as_deref(),
+            Some("error"),
+            "the failed attempt is still recorded"
+        );
+    })
+    .await;
+}
+
+/// Like [`run`], also returning the `jobs.*` events logged at or above `level`.
+async fn run_logged<J: Job>(
+    pool: &PgPool,
+    job: J,
+    level: tracing::Level,
+) -> (i64, Finished, Vec<String>) {
+    let buf = LogBuf::default();
+    let subscriber = buf.subscriber(level);
+    let (id, finished) = run(pool, job, |_, _| {}).with_subscriber(subscriber).await;
+    (id, finished, buf.events())
+}
+
+fn has(events: &[String], name: &str, needles: &[&str]) -> bool {
+    events
+        .iter()
+        .any(|l| l.contains(name) && needles.iter().all(|n| l.contains(n)))
+}
+
+#[tokio::test]
+async fn outcomes_are_logged_at_the_spec_levels_without_arguments() {
+    with_db(|pool| async move {
+        // Terminal failure: warn, visible at the default `info` filter, with cause and message.
+        let (id, f, ev) = run_logged(
+            &pool,
+            Fails {
+                mode: "permanent".into(),
+            },
+            tracing::Level::INFO,
+        )
+        .await;
+        assert_eq!(f, Finished::Failed);
+        let job_id = format!("job_id={id}");
+        assert!(
+            has(
+                &ev,
+                "jobs.failed",
+                &[
+                    "WARN",
+                    &job_id,
+                    "kind=test_fails.v1",
+                    "queue=default",
+                    "attempt=1",
+                    "cause=permanent",
+                    "bad input"
+                ]
+            ),
+            "{ev:?}"
+        );
+
+        // Retry: info, with the delay.
+        let (_, f, ev) = run_logged(
+            &pool,
+            Fails {
+                mode: "retry_after".into(),
+            },
+            tracing::Level::INFO,
+        )
+        .await;
+        assert_eq!(f, Finished::Retrying);
+        assert!(
+            has(
+                &ev,
+                "jobs.retry_scheduled",
+                &["INFO", "delay_s=120", "slow down"]
+            ),
+            "{ev:?}"
+        );
+
+        // Cancelled: info.
+        let (_, f, ev) = run_logged(
+            &pool,
+            Fails {
+                mode: "cancelled".into(),
+            },
+            tracing::Level::INFO,
+        )
+        .await;
+        assert_eq!(f, Finished::Cancelled);
+        assert!(has(&ev, "jobs.cancelled", &["INFO"]), "{ev:?}");
+
+        // Success: debug only, and the arguments never appear.
+        let (_, f, ev) = run_logged(&pool, Noop { n: 424_242 }, tracing::Level::INFO).await;
+        assert_eq!(f, Finished::Succeeded);
+        assert!(!has(&ev, "jobs.succeeded", &[]), "{ev:?}");
+        let (_, _, ev) = run_logged(&pool, Noop { n: 424_242 }, tracing::Level::DEBUG).await;
+        assert!(has(&ev, "jobs.succeeded", &["DEBUG"]), "{ev:?}");
+        assert!(ev.iter().all(|l| !l.contains("424242")), "{ev:?}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn released_is_logged_and_undecodable_arguments_log_no_serde_message() {
+    with_db(|pool| async move {
+        let buf = LogBuf::default();
+        let subscriber = buf.subscriber(tracing::Level::INFO);
+        let (released, f) = run(
+            &pool,
+            Sleepy {
+                ms: 10_000,
+                honour_cancel: true,
+            },
+            |t, c| {
+                c.set(CancelReason::Shutdown);
+                t.cancel();
+            },
+        )
+        .with_subscriber(subscriber)
+        .await;
+        assert_eq!(f, Finished::Released);
+        // Park the released job so the next claim gets the next one.
+        sqlx::query("UPDATE jobs SET state = 'cancelled', finished_at = now() WHERE id = $1")
+            .bind(released)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            has(&buf.events(), "jobs.released", &["INFO"]),
+            "{:?}",
+            buf.events()
+        );
+
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO jobs (kind, queue, args, max_attempts, max_crashes, deadline_s, lease_s)
+             VALUES ('test_noop.v1', 'default', '{\"wrong\": true}', 10, 2, 900, 60) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let bad = LogBuf::default();
+        let subscriber = bad.subscriber(tracing::Level::INFO);
+        let (_, f) = run_claimed(&pool, id, |_, _| {})
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(f, Finished::Failed);
+        let ev = bad.events();
+        let job_id = format!("job_id={id}");
+        assert!(
+            has(&ev, "jobs.bad_args", &[&job_id, "kind=test_noop.v1"]),
+            "{ev:?}"
+        );
+        assert!(has(&ev, "jobs.failed", &["cause=bad_args"]), "{ev:?}");
+        assert!(
+            ev.iter().all(|l| !l.contains("missing field")),
+            "the serde message stays in the database: {ev:?}"
+        );
     })
     .await;
 }

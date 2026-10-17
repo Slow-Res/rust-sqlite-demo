@@ -181,6 +181,7 @@ impl Enqueuer {
                 .await?;
             if let Some(id) = inserted {
                 self.notify(conn, raw.queue).await?;
+                tracing::debug!(job_id = id, kind = %raw.kind, queue = %raw.queue, "jobs.enqueued");
                 return Ok(Enqueued::New(id));
             }
             let Some(key) = &raw.unique_key else {
@@ -206,6 +207,7 @@ impl Enqueuer {
                         .await?;
                     self.notify(conn, raw.queue).await?;
                 }
+                tracing::debug!(job_id = id, kind = %raw.kind, queue = %raw.queue, "jobs.duplicate");
                 return Ok(Enqueued::Duplicate(id));
             }
         }

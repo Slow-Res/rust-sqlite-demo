@@ -78,7 +78,7 @@ pub fn next_after_failure(
 
 /// Cap the length, and replace NUL, which Postgres text and jsonb reject (the
 /// write would fail and the job would stay running until reaped).
-fn truncate(message: &str) -> String {
+pub(crate) fn truncate(message: &str) -> String {
     message
         .chars()
         .take(MAX_ERROR_CHARS)
@@ -100,28 +100,43 @@ pub async fn succeed(pool: &PgPool, f: Fence) -> Result<bool, sqlx::Error> {
     Ok(r.rows_affected() == 1)
 }
 
+/// Where [`fail_attempt`] left the job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landed {
+    /// Back to `available`, to run again at the scheduled time.
+    Retry,
+    /// Out of attempts or not retryable: terminal.
+    Failed,
+    /// A retry was due but `cancel_requested` was set: terminal, not requeued.
+    Cancelled,
+}
+
 /// Record a failed attempt, then either schedule a retry or fail the job for
-/// good. A retry leaves `finished_at` NULL (`jobs_finished_iff_terminal`).
+/// good. A retry leaves `finished_at` NULL (`jobs_finished_iff_terminal`); a
+/// retry of a job whose cancellation was requested ends `cancelled` instead,
+/// so the request is not lost when the handler failed before it noticed.
+/// `None` means the fence rejected the write.
 pub async fn fail_attempt(
     pool: &PgPool,
     f: Fence,
     cause: Cause,
     message: &str,
     next: Next,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Option<Landed>, sqlx::Error> {
     let (retry, delay_s) = match next {
         Next::RetryIn(d) => (true, d.as_secs_f64()),
         Next::Fail => (false, 0.0),
     };
-    let r = sqlx::query(
+    let state: Option<String> = sqlx::query_scalar(
         "UPDATE jobs SET
-             state = CASE WHEN $4 THEN 'available' ELSE 'failed' END,
-             run_at = CASE WHEN $4 THEN now() + make_interval(secs => $5::float8) ELSE run_at END,
-             finished_at = CASE WHEN $4 THEN NULL ELSE now() END,
+             state = CASE WHEN NOT $4 THEN 'failed' WHEN cancel_requested THEN 'cancelled' ELSE 'available' END,
+             run_at = CASE WHEN $4 AND NOT cancel_requested THEN now() + make_interval(secs => $5::float8) ELSE run_at END,
+             finished_at = CASE WHEN $4 AND NOT cancel_requested THEN NULL ELSE now() END,
              locked_by = NULL, locked_until = NULL,
              errors = jobs_push_error(errors, jsonb_build_object(
                  'attempt', attempt, 'at', now(), 'cause', $6::text, 'message', $7::text))
-         WHERE id = $1 AND state = 'running' AND locked_by = $2 AND attempt = $3",
+         WHERE id = $1 AND state = 'running' AND locked_by = $2 AND attempt = $3
+         RETURNING state",
     )
     .bind(f.job_id)
     .bind(f.process_id)
@@ -130,9 +145,13 @@ pub async fn fail_attempt(
     .bind(delay_s)
     .bind(cause.as_str())
     .bind(truncate(message))
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(r.rows_affected() == 1)
+    Ok(state.map(|s| match s.as_str() {
+        "available" => Landed::Retry,
+        "cancelled" => Landed::Cancelled,
+        _ => Landed::Failed,
+    }))
 }
 
 /// Mark the job `cancelled` (terminal), recording `message` as the reason.

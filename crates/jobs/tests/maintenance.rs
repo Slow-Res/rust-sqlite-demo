@@ -51,6 +51,36 @@ async fn reaper_requeues_expired_leases_with_the_right_cause() {
 }
 
 #[tokio::test]
+async fn a_reaped_job_with_a_cancel_request_is_cancelled_not_requeued() {
+    with_db(|pool| async move {
+        let me = register_process(&pool, "me").await;
+        let id = insert_running(&pool, me, "k", 60, 900).await;
+        sqlx::query("UPDATE jobs SET cancel_requested = true WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        expire(&pool, id).await;
+        let reaped = reap(&pool).await.unwrap();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].state, "cancelled");
+        assert_eq!(
+            row(&pool, id).await,
+            ("cancelled".into(), 1, "lease_expired".into())
+        );
+        let (finished, unlocked): (bool, bool) = sqlx::query_as(
+            "SELECT finished_at IS NOT NULL, locked_by IS NULL AND locked_until IS NULL FROM jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(finished && unlocked);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn poison_jobs_fail_after_max_crashes_and_attempts_are_respected() {
     with_db(|pool| async move {
         let me = register_process(&pool, "me").await;

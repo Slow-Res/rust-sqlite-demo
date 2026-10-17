@@ -215,14 +215,29 @@ impl Metrics {
                 kind: kind.to_owned(),
             })
             .observe(took.as_secs_f64());
-        match finished {
-            Finished::FenceRejected => {
-                self.fence_rejected.inc();
+        // Lost leases are counted where the heartbeat cancels (`lease_lost`), not here.
+        if finished == Finished::FenceRejected {
+            self.fence_rejected.inc();
+        }
+    }
+
+    /// Create `jobs_completed_total{kind,outcome}` at 0 for every kind and outcome,
+    /// so `increase()` sees the first failure as a step instead of a new series.
+    pub fn preregister(&self, kinds: &[String]) {
+        for kind in kinds {
+            for outcome in Finished::ALL {
+                let _ = self.completed.get_or_create(&OutcomeLabel {
+                    kind: kind.clone(),
+                    outcome: outcome.as_str().to_owned(),
+                });
             }
-            Finished::LeaseLost => {
-                self.lease_lost.inc();
-            }
-            _ => {}
+        }
+    }
+
+    /// Handlers whose lease was found lost (each lost lease once).
+    pub(crate) fn lease_lost(&self, n: u64) {
+        if n > 0 {
+            self.lease_lost.inc_by(n);
         }
     }
 
@@ -302,5 +317,33 @@ mod tests {
         );
         m.clear_leader_gauges();
         assert!(!m.encode().contains("jobs_available{"));
+    }
+
+    #[test]
+    fn preregistered_series_start_at_zero() {
+        let m = Metrics::new();
+        m.preregister(&["a.v1".to_owned(), "b.v1".to_owned()]);
+        m.finished("a.v1", Finished::Failed, Duration::ZERO);
+        let text = m.encode();
+        for kind in ["a.v1", "b.v1"] {
+            for outcome in Finished::ALL {
+                let line = format!(
+                    r#"jobs_completed_total{{kind="{kind}",outcome="{}"}} "#,
+                    outcome.as_str()
+                );
+                assert!(text.contains(&line), "missing {line}\n{text}");
+            }
+        }
+        assert!(
+            text.contains(r#"jobs_completed_total{kind="b.v1",outcome="failed"} 0"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"jobs_completed_total{kind="a.v1",outcome="failed"} 1"#),
+            "{text}"
+        );
+        // Both counters the JobsLeaseLost alert reads exist before the first event.
+        assert!(text.contains("jobs_lease_lost_total 0"), "{text}");
+        assert!(text.contains("jobs_fence_rejected_total 0"), "{text}");
     }
 }

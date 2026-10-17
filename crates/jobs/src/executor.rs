@@ -1,6 +1,6 @@
 //! Running one claimed job and recording its outcome (spec §8.4, §9.1).
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,10 +10,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::JobContext;
 use crate::job::JobError;
+use crate::metrics::Metrics;
 use crate::rate_limit::RateLimiter;
 use crate::registry::Registry;
 use crate::store::claim::ClaimedJob;
-use crate::store::finish::{self, Cause, Fence, Next, next_after_failure};
+use crate::store::finish::{self, Cause, Fence, Landed, Next, next_after_failure};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -28,17 +29,27 @@ pub enum CancelReason {
 
 /// Why a handler's token fired. The first reason set wins.
 #[derive(Debug, Default)]
-pub struct CancelCell(AtomicU8);
+pub struct CancelCell {
+    reason: AtomicU8,
+    /// Set the first time the lease of this attempt is reported lost, whatever
+    /// reason won, so `jobs_lease_lost_total` counts each lost lease once.
+    lost: AtomicBool,
+}
 
 impl CancelCell {
     pub fn set(&self, reason: CancelReason) {
         let _ = self
-            .0
+            .reason
             .compare_exchange(0, reason as u8, Ordering::AcqRel, Ordering::Acquire);
     }
 
+    /// Record that the lease was lost; true only for the first report.
+    pub fn mark_lease_lost(&self) -> bool {
+        !self.lost.swap(true, Ordering::AcqRel)
+    }
+
     pub fn get(&self) -> Option<CancelReason> {
-        match self.0.load(Ordering::Acquire) {
+        match self.reason.load(Ordering::Acquire) {
             1 => Some(CancelReason::Requested),
             2 => Some(CancelReason::LeaseLost),
             3 => Some(CancelReason::Shutdown),
@@ -68,6 +79,17 @@ pub enum Finished {
 }
 
 impl Finished {
+    /// Every outcome, for pre-registering metric series.
+    pub const ALL: [Finished; 7] = [
+        Self::Succeeded,
+        Self::Retrying,
+        Self::Failed,
+        Self::Cancelled,
+        Self::Released,
+        Self::LeaseLost,
+        Self::FenceRejected,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
@@ -95,6 +117,7 @@ pub async fn execute(
     pool: &PgPool,
     registry: &Registry,
     limiter: Arc<RateLimiter>,
+    metrics: &Metrics,
     exec: Execution,
 ) -> Finished {
     let Execution {
@@ -111,12 +134,13 @@ pub async fn execute(
     };
     let Some(entry) = registry.get(&job.kind) else {
         // Claims filter by known kinds, so this means a registry bug; never retry it here.
-        return write(
-            fence,
-            || finish::fail_attempt(pool, fence, Cause::Permanent, "unknown kind", Next::Fail),
-            Finished::Failed,
-        )
+        let msg = "unknown kind";
+        let finished = write(fence, metrics, || {
+            attempt_failed(pool, fence, Cause::Permanent, msg, Next::Fail)
+        })
         .await;
+        log_outcome(&job, finished, Some((Cause::Permanent, msg, None)));
+        return finished;
     };
     let ctx = JobContext::new(
         pool.clone(),
@@ -156,12 +180,7 @@ pub async fn execute(
     let backoff = entry.options.backoff;
     let retry = |cause: Cause, msg: String, min: Option<Duration>| {
         let next = next_after_failure(job.attempt, job.max_attempts, true, min, &backoff);
-        let finished = if matches!(next, Next::Fail) {
-            Finished::Failed
-        } else {
-            Finished::Retrying
-        };
-        (cause, msg, next, finished)
+        (cause, msg, next)
     };
 
     // A fired token decides first: the handler stopped because we asked it to.
@@ -169,7 +188,12 @@ pub async fn execute(
     if token.is_cancelled() && !matches!(ran, Ran::Ok | Ran::BadArgs(_)) {
         match cancel.get() {
             Some(CancelReason::Shutdown) => {
-                return write(fence, || finish::release(pool, fence), Finished::Released).await;
+                let finished = write(fence, metrics, || {
+                    flagged(finish::release(pool, fence), Finished::Released)
+                })
+                .await;
+                log_outcome(&job, finished, None);
+                return finished;
             }
             // The heartbeat stops renewing a job at its deadline (in database time), which
             // can land a few ms before this task's own timer fires. A handler that hit its
@@ -181,23 +205,35 @@ pub async fn execute(
             Some(CancelReason::LeaseLost | CancelReason::Requested) | None => {}
         }
     }
-    let (cause, msg, next, finished) = match ran {
-        Ran::Ok => return write(fence, || finish::succeed(pool, fence), Finished::Succeeded).await,
-        Ran::Err(JobError::Cancelled) => {
-            return write(
-                fence,
-                || finish::cancel(pool, fence, "cancelled"),
-                Finished::Cancelled,
-            )
+    let (cause, msg, next) = match ran {
+        Ran::Ok => {
+            let finished = write(fence, metrics, || {
+                flagged(finish::succeed(pool, fence), Finished::Succeeded)
+            })
             .await;
+            log_outcome(&job, finished, None);
+            return finished;
         }
-        Ran::Err(JobError::Permanent(m)) => (Cause::Permanent, m, Next::Fail, Finished::Failed),
+        Ran::Err(JobError::Cancelled) => {
+            let finished = write(fence, metrics, || {
+                flagged(
+                    finish::cancel(pool, fence, "cancelled"),
+                    Finished::Cancelled,
+                )
+            })
+            .await;
+            log_outcome(&job, finished, None);
+            return finished;
+        }
+        Ran::Err(JobError::Permanent(m)) => (Cause::Permanent, m, Next::Fail),
         Ran::Err(JobError::Retry(m)) => retry(Cause::Error, m, None),
         Ran::Err(JobError::RetryAfter(d, m)) => retry(Cause::Error, m, Some(d)),
         Ran::BadArgs(err) => {
+            // The serde message can quote argument values: it goes to the database
+            // error only, never to the logs.
+            tracing::error!(job_id = job.id, kind = %job.kind, "jobs.bad_args");
             let msg = format!("arguments do not decode as {}: {err}", job.kind);
-            tracing::error!(job_id = job.id, kind = %job.kind, error = %msg, "jobs.bad_args");
-            (Cause::BadArgs, msg, Next::Fail, Finished::Failed)
+            (Cause::BadArgs, msg, Next::Fail)
         }
         Ran::Panicked(m) => retry(Cause::Panic, m, None),
         Ran::Deadline => retry(
@@ -206,26 +242,94 @@ pub async fn execute(
             None,
         ),
     };
-    write(
-        fence,
-        || finish::fail_attempt(pool, fence, cause, &msg, next),
-        finished,
-    )
-    .await
+    let finished = write(fence, metrics, || {
+        attempt_failed(pool, fence, cause, &msg, next)
+    })
+    .await;
+    let delay = match next {
+        Next::RetryIn(d) => Some(d),
+        Next::Fail => None,
+    };
+    log_outcome(&job, finished, Some((cause, &msg, delay)));
+    finished
+}
+
+/// [`finish::fail_attempt`] as a [`Finished`]: where the job landed decides the outcome.
+async fn attempt_failed(
+    pool: &PgPool,
+    fence: Fence,
+    cause: Cause,
+    msg: &str,
+    next: Next,
+) -> Result<Option<Finished>, sqlx::Error> {
+    let landed = finish::fail_attempt(pool, fence, cause, msg, next).await?;
+    Ok(landed.map(|l| match l {
+        Landed::Retry => Finished::Retrying,
+        Landed::Failed => Finished::Failed,
+        Landed::Cancelled => Finished::Cancelled,
+    }))
+}
+
+/// Turn a fenced write's "did a row change" into the outcome it stands for.
+async fn flagged(
+    write: impl std::future::Future<Output = Result<bool, sqlx::Error>>,
+    finished: Finished,
+) -> Result<Option<Finished>, sqlx::Error> {
+    Ok(write.await?.then_some(finished))
+}
+
+/// The spec §17.1 events for an outcome that was written. Never the arguments.
+/// `failure` is the cause, the message (cut like the stored one) and the retry delay.
+fn log_outcome(
+    job: &ClaimedJob,
+    finished: Finished,
+    failure: Option<(Cause, &str, Option<Duration>)>,
+) {
+    let (job_id, kind, queue, attempt) =
+        (job.id, job.kind.as_str(), job.queue.as_str(), job.attempt);
+    // Undecodable arguments: the message can quote argument values, so it stays in
+    // the database error (see `jobs.bad_args`).
+    let failure = failure.map(|(cause, message, delay)| {
+        let message = if cause == Cause::BadArgs { "" } else { message };
+        (cause, message, delay)
+    });
+    match (finished, failure) {
+        (Finished::Failed, Some((cause, message, _))) => tracing::warn!(
+            job_id, %kind, %queue, attempt,
+            cause = %cause.as_str(),
+            error = %finish::truncate(message),
+            "jobs.failed"
+        ),
+        (Finished::Retrying, Some((cause, message, delay))) => tracing::info!(
+            job_id, %kind, %queue, attempt,
+            cause = %cause.as_str(),
+            error = %finish::truncate(message),
+            delay_s = delay.map_or(0.0, |d| d.as_secs_f64()),
+            "jobs.retry_scheduled"
+        ),
+        (Finished::Cancelled, _) => {
+            tracing::info!(job_id, %kind, %queue, attempt, "jobs.cancelled")
+        }
+        (Finished::Released, _) => tracing::info!(job_id, %kind, %queue, attempt, "jobs.released"),
+        (Finished::Succeeded, _) => {
+            tracing::debug!(job_id, %kind, %queue, attempt, "jobs.succeeded")
+        }
+        _ => {}
+    }
 }
 
 /// Run a fenced write, retrying database errors (spec §11.5) until it is
-/// accepted (→ `finished`) or rejected by the fence (→ `FenceRejected`).
-async fn write<F, Fut>(fence: Fence, op: F, finished: Finished) -> Finished
+/// accepted (→ the outcome it reports) or rejected by the fence (→ `FenceRejected`).
+async fn write<F, Fut>(fence: Fence, metrics: &Metrics, op: F) -> Finished
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<bool, sqlx::Error>>,
+    Fut: std::future::Future<Output = Result<Option<Finished>, sqlx::Error>>,
 {
     let mut wait = Duration::from_secs(1);
     loop {
         match op().await {
-            Ok(true) => return finished,
-            Ok(false) => {
+            Ok(Some(finished)) => return finished,
+            Ok(None) => {
                 tracing::warn!(
                     job_id = fence.job_id,
                     attempt = fence.attempt,
@@ -234,6 +338,7 @@ where
                 return Finished::FenceRejected;
             }
             Err(err) => {
+                metrics.db_error("finish");
                 tracing::warn!(job_id = fence.job_id, error = %err, "jobs: outcome write failed; retrying");
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_secs(30));

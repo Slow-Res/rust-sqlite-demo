@@ -134,6 +134,7 @@ impl Worker {
         let running = Running::default();
         let hb_stop = CancellationToken::new();
         let shortest_lease = registry.min_lease().unwrap_or(config.heartbeat * 3);
+        metrics.preregister(&registry.kinds());
         let mut hb = tokio::spawn(heartbeat::run(
             pool.clone(),
             process_id,
@@ -141,6 +142,7 @@ impl Worker {
             config.heartbeat,
             shortest_lease,
             health.clone(),
+            metrics.clone(),
             hb_stop.clone(),
         ));
 
@@ -234,7 +236,7 @@ impl Worker {
             // The heartbeat cancels with LeaseLost when it sees the fence, but not when
             // it died (panicked); the first reason wins, so this is idempotent.
             // Their writes will be fenced off.
-            running.cancel_all(CancelReason::LeaseLost);
+            metrics.lease_lost(running.cancel_all(CancelReason::LeaseLost));
             let _ = tokio::time::timeout(config.cancel_grace, tracker.wait()).await;
             return Ok(ExitReason::SelfFenced);
         }
@@ -470,7 +472,7 @@ fn spawn_job(
             cancel,
             progress,
         };
-        let finished = execute(&s.pool, &s.registry, s.limiter.clone(), exec).await;
+        let finished = execute(&s.pool, &s.registry, s.limiter.clone(), &s.metrics, exec).await;
         tracing::debug!(job_id = id, %kind, outcome = finished.as_str(), "jobs.finished");
         s.metrics.finished(&kind, finished, started.elapsed());
     });
