@@ -72,12 +72,24 @@ pub struct JobDetail {
     pub cancel_requested: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ListFilter {
     pub state: Option<String>,
     pub queue: Option<String>,
     pub kind: Option<String>,
     pub limit: i64,
+}
+
+impl Default for ListFilter {
+    /// No filter, the newest 50.
+    fn default() -> Self {
+        Self {
+            state: None,
+            queue: None,
+            kind: None,
+            limit: 50,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

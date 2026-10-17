@@ -267,7 +267,7 @@ async fn smtp_credentials_never_reach_error_text() {
     })
     .await;
     let Err(err) = Mailer::new(
-        "smtp://mailer:hunter2secret@bad host:99999999",
+        "smtp://mailer:hunter2secret@bad host:99999999?tls=required",
         "l@library.test",
         "library.test",
         Duration::from_secs(1),

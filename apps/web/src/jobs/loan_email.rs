@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use chrono::DateTime;
 use lettre::message::header::ContentType;
 use lettre::message::{Mailbox, Message};
@@ -127,6 +127,12 @@ impl Mailer {
     ) -> anyhow::Result<Self> {
         // The URL may carry credentials, so no part of it (nor of lettre's error
         // about it) goes into the message.
+        if sends_credentials_in_clear(smtp_url) {
+            bail!(
+                "JOBS_SMTP_URL carries a username and password but does not require TLS: \
+                 use smtps://, or add ?tls=required for STARTTLS"
+            );
+        }
         let transport = AsyncSmtpTransport::<Tokio1Executor>::from_url(smtp_url)
             .map_err(|_| anyhow!("JOBS_SMTP_URL is not a valid SMTP URL"))?
             .timeout(Some(timeout))
@@ -195,6 +201,25 @@ impl Mailer {
     }
 }
 
+/// A URL with credentials (`user:pass@`) must not use a connection that may stay in
+/// clear text: only `smtps://` (TLS from the first byte) and `?tls=required` or
+/// `?tls=wrapper` guarantee encryption (`smtp://` alone, or `?tls=opportunistic`, falls
+/// back to plain text when the server or a man in the middle says so).
+fn sends_credentials_in_clear(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false; // not a URL: lettre refuses it
+    };
+    let (rest, _fragment) = rest.split_once('#').unwrap_or((rest, ""));
+    let (before_query, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let authority = before_query.split('/').next().unwrap_or_default();
+    if !authority.contains('@') || scheme.eq_ignore_ascii_case("smtps") {
+        return false;
+    }
+    !query
+        .split('&')
+        .any(|p| p.eq_ignore_ascii_case("tls=required") || p.eq_ignore_ascii_case("tls=wrapper"))
+}
+
 /// 5xx replies are permanent (bad mailbox, rejected sender). Everything else
 /// (4xx, timeouts, refused connections, TLS errors) may pass on a later attempt.
 ///
@@ -214,5 +239,62 @@ fn classify(err: lettre::transport::smtp::Error) -> JobError {
         JobError::retry("SMTP TLS error")
     } else {
         JobError::retry("SMTP connection or protocol error")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_need_tls() {
+        for clear in [
+            "smtp://user:pw@mail.example:587",
+            "smtp://user@mail.example",
+            "smtp://user:pw@mail.example:587?tls=opportunistic",
+            "SMTP://user:pw@mail.example/?x=tls=required",
+            "smtp://user:pw@mail.example#?tls=required",
+        ] {
+            assert!(sends_credentials_in_clear(clear), "{clear}");
+        }
+        for fine in [
+            "smtp://127.0.0.1:55025",
+            "smtp://mail.example:25?tls=opportunistic",
+            "smtps://user:pw@mail.example:465",
+            "SMTPS://user:pw@mail.example",
+            "smtp://user:pw@mail.example:587?tls=required",
+            "smtp://user:pw@mail.example:587?a=b&tls=required",
+            "smtp://user:pw@mail.example:465?tls=wrapper",
+            "smtp://mail.example/path@x",
+        ] {
+            assert!(!sends_credentials_in_clear(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn plain_credentials_are_refused_without_echoing_the_url() {
+        let Err(err) = Mailer::new(
+            "smtp://mailer:hunter2secret@mail.example:587",
+            "l@library.test",
+            "library.test",
+            Duration::from_secs(1),
+        ) else {
+            panic!("credentials over a connection that may be plain must be refused");
+        };
+        let text = format!("{err:#} {err:?}");
+        assert!(text.contains("TLS"), "{text}");
+        for leak in ["hunter2secret", "mailer", "mail.example"] {
+            assert!(!text.contains(leak), "{leak} leaked: {text}");
+        }
+        for ok in [
+            "smtp://127.0.0.1:55025",
+            "smtps://mailer:pw@mail.example:465",
+            "smtp://mailer:pw@mail.example:587?tls=required",
+        ] {
+            assert!(
+                Mailer::new(ok, "l@library.test", "library.test", Duration::from_secs(1)).is_ok(),
+                "{ok}"
+            );
+        }
     }
 }

@@ -179,11 +179,47 @@ async fn hanging_endpoint_times_out_as_retry() {
         .deliver(&endpoint_id(&url), &event())
         .await
         .unwrap_err();
-    assert!(matches!(err, JobError::Retry(_)), "{err:?}");
+    assert!(
+        matches!(&err, JobError::Retry(m) if m.ends_with(": timed out")),
+        "{err:?}"
+    );
     assert!(
         start.elapsed() < Duration::from_secs(5),
         "took {:?}",
         start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_closed_port_is_a_retryable_connection_failure_without_the_url() {
+    // Bind, note the port, and close: the next connect is refused.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook/tok3nvalue", listener.local_addr().unwrap());
+    drop(listener);
+    let err = sender(&[url.as_str()], Duration::from_secs(2))
+        .deliver(&endpoint_id(&url), &event())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, JobError::Retry(m) if m.ends_with(": connection failed")),
+        "{err:?}"
+    );
+    assert!(
+        !format!("{err:?}").contains("tok3n"),
+        "the URL leaked: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_url_that_cannot_become_a_request_is_permanent() {
+    let url = "http://[not-an-address/hook";
+    let err = sender(&[url], Duration::from_secs(1))
+        .deliver(&endpoint_id(url), &event())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, JobError::Permanent(m) if m.ends_with("the request cannot be built")),
+        "{err:?}"
     );
 }
 

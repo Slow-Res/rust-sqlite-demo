@@ -186,6 +186,17 @@ fn webhook_endpoints(
             urls.len()
         );
     }
+    // Secrets are matched by position and the endpoint id is derived from the URL, so a
+    // URL listed twice would silently use only one of its secrets. Name positions only.
+    for (i, url) in urls.iter().enumerate() {
+        if let Some(first) = urls[..i].iter().position(|u| u == url) {
+            bail!(
+                "JOBS_WEBHOOK_ENDPOINTS: endpoints {} and {} are the same URL",
+                first + 1,
+                i + 1
+            );
+        }
+    }
     urls.into_iter()
         .enumerate()
         .map(|(i, url)| {
@@ -294,6 +305,38 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.to_string().contains("JOBS_WEBHOOK_SECRET_2"), "{err}");
+    }
+
+    #[test]
+    fn a_url_listed_twice_is_refused_naming_the_positions_not_the_url() {
+        let url = "https://hooks.example/services/tok3nvalue";
+        let endpoints = format!("https://a.example/x,{url}, {url}");
+        let err = JobsConfig::from_lookup(&lookup(&[
+            ("JOBS_WEBHOOK_ENDPOINTS", endpoints.as_str()),
+            ("JOBS_WEBHOOK_SECRET_1", SECRET),
+            ("JOBS_WEBHOOK_SECRET_2", SECRET),
+            ("JOBS_WEBHOOK_SECRET_3", SECRET),
+        ]))
+        .unwrap_err();
+        let shown = format!("{err:#} {err:?}");
+        assert!(
+            shown.contains("endpoints 2 and 3 are the same URL"),
+            "{shown}"
+        );
+        for leak in ["tok3n", "hooks.example", "whsec_"] {
+            assert!(!shown.contains(leak), "{leak} leaked: {shown}");
+        }
+        // Different URLs on one host stay separate endpoints.
+        let ok = JobsConfig::from_lookup(&lookup(&[
+            (
+                "JOBS_WEBHOOK_ENDPOINTS",
+                "https://a.example/x,https://a.example/y",
+            ),
+            ("JOBS_WEBHOOK_SECRET_1", SECRET),
+            ("JOBS_WEBHOOK_SECRET_2", SECRET),
+        ]))
+        .unwrap();
+        assert_eq!(ok.webhooks.len(), 2);
     }
 
     #[test]

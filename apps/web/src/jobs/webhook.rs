@@ -200,13 +200,30 @@ impl WebhookSender {
             .body(body)
             .send()
             .await
-            // reqwest errors embed the request URL, token and all.
-            .map_err(|err| JobError::retry(format!("POST {endpoint}: {}", err.without_url())))?;
+            .map_err(|err| transport_error(&err, endpoint))?;
         let status = response.status();
         let retry_after = retry_after(response.headers());
         drain(response).await;
         outcome(status, retry_after, endpoint)
     }
+}
+
+/// A request that never produced a response. reqwest's own message embeds the request
+/// URL (token and all) and is the same for most causes, so say only what failed, in a
+/// fixed string. A request that cannot even be built (a configured URL that does not
+/// parse) will not get better by waiting.
+fn transport_error(err: &reqwest::Error, endpoint: &str) -> JobError {
+    if err.is_builder() {
+        return JobError::permanent(format!("POST {endpoint}: the request cannot be built"));
+    }
+    let what = if err.is_timeout() {
+        "timed out"
+    } else if err.is_connect() {
+        "connection failed"
+    } else {
+        "request failed"
+    };
+    JobError::retry(format!("POST {endpoint}: {what}"))
 }
 
 async fn drain(mut response: reqwest::Response) {

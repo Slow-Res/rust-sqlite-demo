@@ -391,3 +391,16 @@ async fn retry_failed_keeps_unique_keys_and_job_ids_apart() {
         assert_eq!(job_state(&pool, keyed).await, "available");
     }).await;
 }
+
+#[tokio::test]
+async fn the_default_filter_lists_the_newest_fifty() {
+    with_db(|pool| async move {
+        assert_eq!(ListFilter::default().limit, 50);
+        for _ in 0..3 {
+            common::new_job(&pool, "k").await;
+        }
+        let listed = ops::list(&pool, &ListFilter::default()).await.unwrap();
+        assert_eq!(listed.len(), 3, "a default filter is not an empty page");
+    })
+    .await;
+}
