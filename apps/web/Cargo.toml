@@ -45,7 +45,7 @@ rpassword.workspace = true
 sha2.workspace = true
 library-jobs = { workspace = true, optional = true }
 tokio-util = { version = "0.7", optional = true }
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "aws-lc-rs", "webpki-roots", "pool"], optional = true }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "aws-lc-rs", "webpki-roots"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 hmac = { version = "0.13", optional = true }
 

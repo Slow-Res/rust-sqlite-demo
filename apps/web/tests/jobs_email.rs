@@ -172,6 +172,11 @@ async fn an_invalid_member_address_is_permanent() {
         .await
         .unwrap_err();
         assert!(matches!(err, JobError::Permanent(_)), "{err:?}");
+        // The stored error must not hold the member's data.
+        let text = format!("{err} {err:?}");
+        for personal in ["not-an-address", "Ann Reader"] {
+            assert!(!text.contains(personal), "`{personal}` leaked into: {text}");
+        }
     })
     .await;
 }
@@ -273,5 +278,91 @@ async fn smtp_credentials_never_reach_error_text() {
     assert!(
         !text.contains("hunter2secret"),
         "password leaked into: {text}"
+    );
+}
+
+/// A server that speaks SMTP up to `354` of DATA. The first connection then goes
+/// silent (the final reply never comes); later ones refuse the recipient (550).
+/// Returns its port and the number of connections it has accepted.
+async fn stalling_then_refusing_server() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let nth = count.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::spawn(async move {
+                let (read, mut write) = socket.into_split();
+                let mut lines = BufReader::new(read).lines();
+                write.write_all(b"220 fake ESMTP\r\n").await.unwrap();
+                let mut in_data = false;
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let upper = line.to_ascii_uppercase();
+                    let reply: &[u8] = if in_data {
+                        if line == "." {
+                            // End of the message: the first connection never answers.
+                            if nth == 1 {
+                                std::future::pending::<()>().await;
+                            }
+                            in_data = false;
+                            b"250 queued\r\n"
+                        } else {
+                            continue;
+                        }
+                    } else if upper.starts_with("EHLO") {
+                        b"250 fake\r\n"
+                    } else if upper.starts_with("MAIL") {
+                        b"250 ok\r\n"
+                    } else if upper.starts_with("RCPT") {
+                        if nth == 1 {
+                            b"250 ok\r\n"
+                        } else {
+                            b"550 no such user\r\n"
+                        }
+                    } else if upper.starts_with("DATA") {
+                        in_data = true;
+                        b"354 go on\r\n"
+                    } else if upper.starts_with("QUIT") {
+                        b"221 bye\r\n"
+                    } else {
+                        b"250 ok\r\n"
+                    };
+                    if write.write_all(reply).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (port, accepted)
+}
+
+/// A send cancelled by the timeout after DATA must not leave a connection that the
+/// next send reuses: its reply would be the old message's (a stale 250 would turn a
+/// failed send into `Ok`). Every send opens its own connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_cancelled_after_data_does_not_poison_the_next_one() {
+    use std::sync::atomic::Ordering;
+
+    let (port, accepted) = stalling_then_refusing_server().await;
+    let mailer = mailer(&format!("smtp://127.0.0.1:{port}"), Duration::from_secs(1));
+    let send = |job_id: i64| {
+        let message = mailer
+            .message(job_id, "Ann", "ann@example.test", "Hi", "Body\n".to_owned())
+            .unwrap();
+        mailer.send(message)
+    };
+    let first = send(1).await.unwrap_err();
+    assert!(matches!(first, JobError::Retry(_)), "{first:?}");
+    let second = send(2).await.unwrap_err();
+    assert!(matches!(second, JobError::Permanent(_)), "{second:?}");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "the second send reused a connection"
     );
 }

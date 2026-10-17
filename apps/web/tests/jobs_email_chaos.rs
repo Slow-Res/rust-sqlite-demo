@@ -34,6 +34,7 @@ async fn chaos(recipient_code: u16, probability: u8) {
 #[tokio::test(flavor = "multi_thread")]
 async fn smtp_5xx_is_permanent_and_4xx_is_retry() {
     common::on_postgres(|db| async move {
+        chaos(0, 0).await; // a killed earlier run may have left chaos on
         let Database::Postgres(pool) = db else { panic!("postgres only") };
         let member: i64 = sqlx::query_scalar("INSERT INTO members (name, email, created_at, updated_at) VALUES ('C', 'chaos@example.test', 0, 0) RETURNING id")
             .fetch_one(&pool).await.unwrap();

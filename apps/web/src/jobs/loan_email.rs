@@ -105,7 +105,10 @@ fn compose(event: LoanEventKind, row: &LoanRow) -> (String, String) {
     }
 }
 
-/// SMTP sender shared by every email job of a process (pooled connections).
+/// SMTP sender shared by every email job of a process. One connection per email:
+/// a send that is cancelled mid-transaction (the timeout in [`Mailer::send`]) must
+/// never leave a connection behind whose next reply belongs to the old message,
+/// and lettre's pool would reuse it. Loan emails are rare enough not to need reuse.
 pub struct Mailer {
     transport: AsyncSmtpTransport<Tokio1Executor>,
     from: Mailbox,
@@ -164,9 +167,12 @@ impl Mailer {
         subject: &str,
         body: String,
     ) -> Result<Message, JobError> {
+        // Fixed texts only: job errors are stored, listed by `jobs show` and kept for
+        // days, and must not hold a member's address or name (the loan id is in the
+        // job's args).
         let address: Address = to_email
             .parse()
-            .map_err(|err| JobError::permanent(format!("member address `{to_email}`: {err}")))?;
+            .map_err(|_| JobError::permanent("member address is not valid"))?;
         Message::builder()
             .message_id(Some(format!("<loan_email.v1.{job_id}@{}>", self.domain)))
             .from(self.from.clone())
@@ -174,13 +180,14 @@ impl Mailer {
             .subject(subject)
             .header(ContentType::TEXT_PLAIN)
             .body(body)
-            .map_err(JobError::permanent)
+            .map_err(|_| JobError::permanent("the email could not be built"))
     }
 
     pub async fn send(&self, message: Message) -> Result<(), JobError> {
         // lettre's own timeout covers only the TCP connect of its async transport,
         // not the replies: a server that accepts and then says nothing would hold
-        // the attempt until the job deadline. So bound the whole send here.
+        // the attempt until the job deadline. So bound the whole send here. Dropping
+        // the future closes its connection (there is no pool, see `Mailer`).
         match tokio::time::timeout(self.timeout, self.transport.send(message)).await {
             Ok(sent) => sent.map(drop).map_err(classify),
             Err(_) => Err(JobError::retry("SMTP server did not answer in time")),
