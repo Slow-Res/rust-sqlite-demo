@@ -1,5 +1,5 @@
 //! A worker process (spec §11, §13): one claim loop per queue, one LISTEN
-//! connection, one heartbeat task, and (Task 10) the maintenance candidate.
+//! connection, one heartbeat task, and the maintenance candidate.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -162,7 +162,17 @@ impl Worker {
             ));
         }
         let maintenance_stop = CancellationToken::new();
-        // Task 10 spawns the maintenance candidate here.
+        if config.maintenance.enabled {
+            let leader = crate::maintenance::Leader {
+                pool: pool.clone(),
+                registry: registry.clone(),
+                config: config.maintenance.clone(),
+                enqueuer: crate::enqueue::Enqueuer::new(config.listen),
+                metrics: metrics.clone(),
+                live_within: config.heartbeat * 3,
+            };
+            helpers.spawn(crate::maintenance::run(leader, maintenance_stop.clone()));
+        }
 
         let reason = tokio::select! {
             () = shutdown.cancelled() => ExitReason::Shutdown,

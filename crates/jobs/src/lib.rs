@@ -15,6 +15,7 @@ pub mod enqueue;
 pub mod executor;
 pub mod heartbeat;
 pub mod job;
+pub mod maintenance;
 pub mod metrics;
 pub mod rate_limit;
 pub mod registry;

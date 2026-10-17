@@ -240,7 +240,6 @@ impl Metrics {
         self.slots.get_or_create(&Self::q(queue)).set(n);
     }
 
-    #[allow(dead_code)] // used by Task 10
     pub(crate) fn set_queue_gauges(
         &self,
         queue: &str,
@@ -256,7 +255,6 @@ impl Metrics {
         self.oldest_available.get_or_create(&l).set(oldest_s);
     }
 
-    #[allow(dead_code)] // used by Task 10
     pub(crate) fn set_failed_recent(&self, kind: &str, n: i64) {
         self.failed_recent
             .get_or_create(&KindLabel {
@@ -265,18 +263,15 @@ impl Metrics {
             .set(n);
     }
 
-    #[allow(dead_code)] // used by Task 10
     pub(crate) fn set_processes_live(&self, n: i64) {
         self.processes_live.set(n);
     }
 
-    #[allow(dead_code)] // used by Task 10
     pub(crate) fn set_leader(&self, leader: bool) {
         self.leader.set(i64::from(leader));
     }
 
     /// Drop the leader-only series, so a former leader stops exporting stale values.
-    #[allow(dead_code)] // used by Task 10
     pub(crate) fn clear_leader_gauges(&self) {
         self.available.clear();
         self.scheduled.clear();
