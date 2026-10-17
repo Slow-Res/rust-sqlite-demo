@@ -3,7 +3,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Big, Noop, Unique, count, with_db};
+use common::{Big, Keyed, Noop, Unique, count, with_db};
 use library_jobs::{EnqueueError, EnqueueOptions, Enqueued, Enqueuer};
 use sqlx::postgres::PgListener;
 
@@ -11,9 +11,13 @@ use sqlx::postgres::PgListener;
 async fn commit_makes_the_job_visible_and_rollback_discards_it() {
     with_db(|pool| async move {
         let enqueuer = Enqueuer::new(true);
+        let mut listener = PgListener::connect_with(&pool).await.unwrap();
+        listener.listen(library_jobs::NOTIFY_CHANNEL).await.unwrap();
         let mut tx = pool.begin().await.unwrap();
         enqueuer.enqueue(&mut tx, &Noop { n: 1 }).await.unwrap();
         tx.rollback().await.unwrap();
+        let after_rollback = tokio::time::timeout(Duration::from_millis(300), listener.recv()).await;
+        assert!(after_rollback.is_err(), "notification delivered for a rolled-back enqueue");
         assert_eq!(count(&pool, "SELECT count(*) FROM jobs").await, 0);
 
         let mut tx = pool.begin().await.unwrap();
@@ -134,12 +138,20 @@ async fn replace_updates_a_waiting_duplicate_but_not_a_running_one() {
     with_db(|pool| async move {
         let enqueuer = Enqueuer::new(false);
         let mut conn = pool.acquire().await.unwrap();
-        let replace = EnqueueOptions { replace: true, ..Default::default() };
+        let replace = EnqueueOptions { replace: true, delay: Some(Duration::from_secs(120)), priority: Some(7) };
         let id = enqueuer.enqueue(&mut conn, &Unique { key: "d".into(), v: 1 }).await.unwrap().id();
         let r = enqueuer.enqueue_with(&mut conn, &Unique { key: "d".into(), v: 2 }, replace.clone()).await.unwrap();
         assert_eq!(r, Enqueued::Duplicate(id));
-        let v: i64 = sqlx::query_scalar("SELECT (args->>'v')::bigint FROM jobs WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
+        let (v, run_later, priority): (i64, bool, i16) = sqlx::query_as(
+            "SELECT (args->>'v')::bigint, run_at > now() + interval '110 seconds', priority FROM jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(v, 2);
+        assert!(run_later, "run_at must follow the replacing job's delay");
+        assert_eq!(priority, 7);
         sqlx::query("UPDATE jobs SET state = 'running', locked_by = 1, locked_until = now() + interval '1 hour' WHERE id = $1")
             .bind(id)
             .execute(&pool)
@@ -194,6 +206,99 @@ async fn delay_and_priority_are_stored() {
         .unwrap();
         assert!(in_future);
         assert_eq!(priority, 5);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn replace_updates_the_concurrency_key() {
+    with_db(|pool| async move {
+        let enqueuer = Enqueuer::new(false);
+        let mut conn = pool.acquire().await.unwrap();
+        let replace = EnqueueOptions {
+            replace: true,
+            ..Default::default()
+        };
+        let id = enqueuer
+            .enqueue(
+                &mut conn,
+                &Keyed {
+                    key: "k".into(),
+                    v: 1,
+                },
+            )
+            .await
+            .unwrap()
+            .id();
+        let before: Option<String> =
+            sqlx::query_scalar("SELECT concurrency_key FROM jobs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before.as_deref(), Some("c1"));
+        let r = enqueuer
+            .enqueue_with(
+                &mut conn,
+                &Keyed {
+                    key: "k".into(),
+                    v: 2,
+                },
+                replace,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r, Enqueued::Duplicate(id));
+        let after: Option<String> =
+            sqlx::query_scalar("SELECT concurrency_key FROM jobs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after.as_deref(), Some("c2"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn replace_keeps_a_retry_backoff_but_still_debounces_a_fresh_job() {
+    with_db(|pool| async move {
+        let enqueuer = Enqueuer::new(false);
+        let mut conn = pool.acquire().await.unwrap();
+        let replace = EnqueueOptions { replace: true, ..Default::default() };
+
+        // Waiting out a backoff (attempt > 0): run_at must not move earlier.
+        let retrying = enqueuer.enqueue(&mut conn, &Unique { key: "b".into(), v: 1 }).await.unwrap().id();
+        sqlx::query("UPDATE jobs SET attempt = 1, run_at = now() + interval '1 hour' WHERE id = $1")
+            .bind(retrying)
+            .execute(&pool)
+            .await
+            .unwrap();
+        enqueuer.enqueue_with(&mut conn, &Unique { key: "b".into(), v: 2 }, replace.clone()).await.unwrap();
+        let (v, still_waiting): (i64, bool) = sqlx::query_as(
+            "SELECT (args->>'v')::bigint, run_at >= now() + interval '59 minutes' FROM jobs WHERE id = $1",
+        )
+        .bind(retrying)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(v, 2, "arguments are still replaced");
+        assert!(still_waiting, "a re-enqueue must not skip the retry backoff");
+
+        // Fresh job (attempt = 0): debounce moves run_at to now() + delay.
+        let fresh = enqueuer.enqueue(&mut conn, &Unique { key: "f".into(), v: 1 }).await.unwrap().id();
+        sqlx::query("UPDATE jobs SET run_at = now() + interval '1 hour' WHERE id = $1")
+            .bind(fresh)
+            .execute(&pool)
+            .await
+            .unwrap();
+        enqueuer.enqueue_with(&mut conn, &Unique { key: "f".into(), v: 2 }, replace).await.unwrap();
+        let moved_earlier: bool = sqlx::query_scalar("SELECT run_at < now() + interval '1 minute' FROM jobs WHERE id = $1")
+            .bind(fresh)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(moved_earlier, "debounce of a fresh job sets run_at from the new delay");
     })
     .await;
 }

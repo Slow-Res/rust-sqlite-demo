@@ -196,3 +196,25 @@ impl Job for Big {
         Ok(())
     }
 }
+
+/// Unique by `key`, but its concurrency key follows `v`: a replacing job can
+/// carry a different concurrency key than the row it replaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Keyed {
+    pub key: String,
+    pub v: i64,
+}
+
+impl Job for Keyed {
+    const KIND: &'static str = "test_keyed.v1";
+    const QUEUE: &'static str = "default";
+    fn unique_key(&self) -> Option<String> {
+        Some(self.key.clone())
+    }
+    fn concurrency_key(&self) -> Option<String> {
+        Some(format!("c{}", self.v))
+    }
+    async fn perform(self, _ctx: JobContext) -> Result<(), JobError> {
+        Ok(())
+    }
+}

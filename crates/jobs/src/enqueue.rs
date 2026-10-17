@@ -19,7 +19,9 @@ pub struct EnqueueOptions {
     pub delay: Option<Duration>,
     /// Overrides the kind's priority.
     pub priority: Option<i16>,
-    /// On a waiting duplicate, replace its arguments, delay and priority (debounce).
+    /// On a waiting duplicate, replace its arguments, concurrency key, delay and
+    /// priority (debounce). A duplicate that is waiting out a retry backoff
+    /// (already attempted) keeps its `run_at` if that is later than the new delay.
     pub replace: bool,
 }
 
@@ -106,8 +108,17 @@ const FIND_DUPLICATE: &str = "
 SELECT id, state FROM jobs
 WHERE kind = $1 AND unique_key = $2 AND state IN ('available', 'running')";
 
+// The concurrency key is replaced with the arguments: it may depend on fields
+// beyond the unique key, and a stale key would let the new arguments run past
+// `jobs_one_running_per_key`. A job waiting out a retry backoff (attempt > 0)
+// never runs earlier than that backoff says.
 const REPLACE: &str = "
-UPDATE jobs SET args = $2, run_at = now() + make_interval(secs => $3::float8), priority = $4
+UPDATE jobs SET args = $2,
+    run_at = CASE WHEN attempt > 0
+                  THEN GREATEST(run_at, now() + make_interval(secs => $3::float8))
+                  ELSE now() + make_interval(secs => $3::float8) END,
+    priority = $4,
+    concurrency_key = $5
 WHERE id = $1 AND state = 'available'";
 
 /// Inserts jobs. Cheap to clone; hold one in app state.
@@ -190,6 +201,7 @@ impl Enqueuer {
                         .bind(&raw.args)
                         .bind(delay_s)
                         .bind(priority)
+                        .bind(&raw.concurrency_key)
                         .execute(&mut *conn)
                         .await?;
                     self.notify(conn, raw.queue).await?;
