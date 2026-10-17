@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use common::*;
@@ -30,28 +30,41 @@ async fn child_worker_entry() {
         .unwrap();
 }
 
+/// `Child` does not kill on drop, and the worker never exits on its own (spec §11.5): a
+/// panic before the explicit kill would leave it running against a dropped database.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sigkill_mid_job_is_recovered_by_another_worker() {
     with_db_url(|pool, url| async move {
         let id = enqueue(&pool, &SleepOnce { ms: 60_000 }).await;
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "child_worker_entry",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env("JOBS_CHILD_DB_URL", &url)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+        let mut child = KillOnDrop(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "child_worker_entry",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("JOBS_CHILD_DB_URL", &url)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
         eventually(Duration::from_secs(20), "child claimed the job", || async {
             job_state(&pool, id).await == "running"
         })
         .await;
-        child.kill().unwrap(); // SIGKILL: no cleanup, no deregistration
-        child.wait().unwrap();
+        child.0.kill().unwrap(); // SIGKILL: no cleanup, no deregistration
+        child.0.wait().unwrap();
         let w = start(&pool, fast_config("default:2"));
         eventually(
             Duration::from_secs(15),

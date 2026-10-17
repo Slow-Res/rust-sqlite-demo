@@ -205,6 +205,11 @@ async fn lead(l: &Leader, mut conn: PgConnection, stop: &CancellationToken) {
 /// whenever a statement fails; the prune runs only once it is `prune_after` old. Every
 /// live process beats more often than that (`validate` enforces it), so by then each has
 /// refreshed its row, and only processes that are really gone get pruned.
+///
+/// A statement that stalls and then succeeds does not reset `healthy_since`; the leader's
+/// liveness watch (`leader_retry`) ends leadership on such a stall, and the next leader
+/// starts a fresh stretch. A step that fails for good starves pruning (dead registry rows
+/// pile up, logged at warn); jobs are still taken back by the reaper through lease expiry.
 async fn work(l: &Leader) {
     let c = &l.config;
     let (mut reap, mut prune) = (every(c.reap_every), every(c.prune_every));
@@ -214,6 +219,10 @@ async fn work(l: &Leader) {
         every(c.gauges_every),
     );
     let mut healthy_since = Instant::now();
+    // When pruning last ran (or leadership began), and whether the starvation warning for
+    // the current stretch without a prune was logged: once per episode, not per tick.
+    let mut last_prune = Instant::now();
+    let mut starving_logged = false;
     loop {
         let ok = tokio::select! {
             _ = reap.tick() => match bounded("reap", STATEMENT_TIMEOUT, sql::reap(&l.pool)).await {
@@ -226,9 +235,15 @@ async fn work(l: &Leader) {
                 Err(err) => { l.metrics.db_error("reap"); tracing::warn!(error = %err, "jobs: reap failed"); false }
             },
             _ = prune.tick() => if healthy_since.elapsed() < c.prune_after {
-                tracing::debug!("jobs: prune skipped, the database has not been healthy for prune_after yet");
+                if last_prune.elapsed() >= c.prune_after * 3 && !starving_logged {
+                    starving_logged = true;
+                    tracing::warn!("jobs: no prune for 3x prune_after, the database keeps failing");
+                } else {
+                    tracing::debug!("jobs: prune skipped, the database has not been healthy for prune_after yet");
+                }
                 true
             } else {
+                (last_prune, starving_logged) = (Instant::now(), false);
                 match bounded("prune", STATEMENT_TIMEOUT, sql::prune(&l.pool, c.prune_after)).await {
                     Ok((0, _)) => true,
                     Ok((processes, jobs)) => { tracing::warn!(processes, jobs, "process.pruned"); true }

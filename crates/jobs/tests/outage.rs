@@ -20,10 +20,22 @@ fn docker(args: &[&str]) {
     assert!(ok, "docker {args:?} failed");
 }
 
+/// Removes the container however the test ends: a failed `docker run`, a panic, an early return.
+struct RemoveContainer;
+
+impl Drop for RemoveContainer {
+    fn drop(&mut self) {
+        let _ = Command::new("docker").args(["rm", "-f", NAME]).status();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs Docker; starts, pauses and removes its own container"]
 async fn workers_survive_a_database_outage() {
+    // A leftover from an earlier aborted run would hold the name and the port.
     let _ = Command::new("docker").args(["rm", "-f", NAME]).status();
+    // Armed before `docker run`, so even a failing run leaves nothing behind.
+    let _cleanup = RemoveContainer;
     docker(&[
         "run",
         "-d",
@@ -38,10 +50,17 @@ async fn workers_survive_a_database_outage() {
         "postgres:18.6",
     ]);
     let result = tokio::spawn(async {
+        let ready_by = tokio::time::Instant::now() + Duration::from_secs(60);
         let pool = loop {
             match sqlx::postgres::PgPoolOptions::new().max_connections(20).acquire_timeout(Duration::from_secs(60)).connect(URL).await {
                 Ok(p) => break p,
-                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                Err(err) => {
+                    assert!(
+                        tokio::time::Instant::now() < ready_by,
+                        "Postgres in {NAME} was not ready within 60 s: {err}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
         };
         library_jobs::migrate(&pool).await.unwrap();
@@ -61,7 +80,6 @@ async fn workers_survive_a_database_outage() {
         a.shutdown().await;
         b.shutdown().await;
     }).await;
-    let _ = Command::new("docker").args(["rm", "-f", NAME]).status();
     if let Err(err) = result {
         std::panic::resume_unwind(err.into_panic());
     }

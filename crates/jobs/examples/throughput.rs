@@ -1,12 +1,17 @@
 //! No-op jobs per second with one worker process (spec §21: ≥ 1,000/s on the
 //! 2-core box). Usage: cargo run --release -p library-jobs --example throughput -- <DATABASE_URL> [jobs] [slots]
-//! It drops and recreates the jobs tables' rows in that database: use a scratch database.
+//! The rows are bulk-inserted before the timer starts, so enqueueing is not measured: it
+//! times claim + run + finish only. At start it deletes only earlier `bench_nothing.v1`
+//! rows (other rows stay) and the succeeded rows are left behind: use a scratch database.
 
 use std::time::{Duration, Instant};
 
 use library_jobs::{Job, JobContext, JobError, QueueConfig, Registry, Worker, WorkerConfig};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+
+/// Longest the drain loop waits before it reports a stuck run.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Serialize, Deserialize)]
 struct Nothing;
@@ -53,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
     let stop = CancellationToken::new();
     let handle = tokio::spawn(worker.run(stop.clone()));
     let start = Instant::now();
+    let give_up = Instant::now() + DRAIN_TIMEOUT;
     loop {
         let left: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM jobs WHERE kind = 'bench_nothing.v1' AND state <> 'succeeded'",
@@ -61,6 +67,10 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         if left == 0 {
             break;
+        }
+        if Instant::now() > give_up {
+            eprintln!("error: {left} of {jobs} jobs still not succeeded after {DRAIN_TIMEOUT:?}");
+            std::process::exit(1);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
