@@ -191,7 +191,19 @@ impl Worker {
                 tracing::warn!(error = %err, "jobs: could not mark the process as stopping");
             }
         }
-        while helpers.join_next().await.is_some() {}
+        // A helper stuck on a dead connection must not hold up the rest of the shutdown.
+        let joined = tokio::time::timeout(config.shutdown_timeout, async {
+            while helpers.join_next().await.is_some() {}
+        })
+        .await;
+        if joined.is_err() {
+            tracing::warn!(
+                "jobs: helper tasks did not stop in time; aborting {}",
+                helpers.len()
+            );
+            helpers.abort_all();
+            while helpers.join_next().await.is_some() {}
+        }
         tracker.close();
 
         if reason == ExitReason::SelfFenced {

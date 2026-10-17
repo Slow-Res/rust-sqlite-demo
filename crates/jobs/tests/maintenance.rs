@@ -147,32 +147,149 @@ async fn leaders(pool: &PgPool) -> i64 {
     .unwrap()
 }
 
+/// The backend pid holding the leader lock in this database, if any.
+async fn leader_pid(pool: &PgPool) -> Option<i32> {
+    sqlx::query_scalar(
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 1
+           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(LEADER_LOCK)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn exactly_one_leader_and_failover_when_its_connection_dies() {
     with_db(|pool| async move {
         let a = start(&pool, fast_config("default:1"));
         let b = start(&pool, fast_config("default:1"));
-        eventually(Duration::from_secs(5), "a leader", || async { leaders(&pool).await == 1 }).await;
+        eventually(Duration::from_secs(5), "a leader", || async {
+            leaders(&pool).await == 1
+        })
+        .await;
         for _ in 0..20 {
             assert!(leaders(&pool).await <= 1);
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        sqlx::query(
-            "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 1
-           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-               AND ((classid::bigint << 32) | objid::bigint) = $1",
-        ).bind(LEADER_LOCK).execute(&pool).await.unwrap();
-        // A lease that expires now must still be reaped by the new leader.
+        let old_pid = leader_pid(&pool).await.expect("a leader holds the lock");
+        sqlx::query("SELECT pg_terminate_backend($1)")
+            .bind(old_pid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A different backend must take the lock over.
+        eventually(
+            Duration::from_secs(5),
+            "a different backend holds the lock",
+            || async { leader_pid(&pool).await.is_some_and(|pid| pid != old_pid) },
+        )
+        .await;
+        // The old leader's loop notices its dead connection within one `leader_retry`
+        // (200 ms here); give it two, so only the new backend's leader can reap below.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // A lease that expires now can only be reaped by the new leader.
         let me = register_process(&pool, "victim").await;
         let id = insert_running(&pool, me, "k", 60, 900).await;
         expire(&pool, id).await;
-        eventually(Duration::from_secs(5), "reaped after failover", || async { job_state(&pool, id).await == "available" }).await;
-        // The old leader keeps working until its next connection check (at most one
-        // `leader_retry`), so the reap can precede the new election: wait for it.
-        eventually(Duration::from_secs(5), "a new leader", || async { leaders(&pool).await == 1 }).await;
+        eventually(Duration::from_secs(5), "reaped after failover", || async {
+            job_state(&pool, id).await == "available"
+        })
+        .await;
+        assert_eq!(leaders(&pool).await, 1);
         a.shutdown().await;
         b.shutdown().await;
-    }).await;
+    })
+    .await;
+}
+
+/// The `jobs_leader` gauge as a whole line: its HELP text also contains "jobs_leader 1".
+fn is_leader(m: &library_jobs::metrics::Metrics) -> bool {
+    m.encode().lines().any(|l| l == "jobs_leader 1")
+}
+
+/// A TCP relay to Postgres that can start swallowing traffic without closing
+/// anything: what a network partition looks like to the client (no error, no data).
+struct Blackhole {
+    addr: std::net::SocketAddr,
+    swallow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn blackhole_proxy(upstream: &str) -> Blackhole {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let swallow = std::sync::Arc::new(AtomicBool::new(false));
+    let (upstream, flag) = (upstream.to_owned(), swallow.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                continue;
+            };
+            let (mut cr, mut cw) = client.into_split();
+            let (mut sr, mut sw) = server.into_split();
+            let (f1, f2) = (flag.clone(), flag.clone());
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = cr.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if !f1.load(Ordering::Relaxed) && sw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = sr.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if !f2.load(Ordering::Relaxed) && cw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    Blackhole { addr, swallow }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_open_leader_connection_is_noticed_and_leadership_given_up() {
+    with_db_url(|_pool, url| async move {
+        let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let proxy = blackhole_proxy(&format!("{}:{}", opts.get_host(), opts.get_port())).await;
+        let via_proxy = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(10)
+            .connect_with(opts.clone().host("127.0.0.1").port(proxy.addr.port()))
+            .await
+            .unwrap();
+        let w = start(&via_proxy, fast_config("default:1"));
+        eventually(Duration::from_secs(5), "leader", || async {
+            is_leader(&w.metrics)
+        })
+        .await;
+        // The connection stays open but nothing gets through any more.
+        proxy
+            .swallow
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        eventually(
+            Duration::from_secs(5),
+            "leadership given up on a silent connection",
+            || async { !is_leader(&w.metrics) },
+        )
+        .await;
+        // The worker's other connections are dead too, so its own shutdown cannot finish: abandon it.
+        w.handle.abort();
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -196,7 +313,7 @@ async fn the_leader_exports_queue_gauges() {
                 .contains(r#"jobs_scheduled{queue="default"} 2"#)
         })
         .await;
-        assert!(w.metrics.encode().contains("jobs_leader 1"));
+        assert!(is_leader(&w.metrics));
         w.shutdown().await;
     })
     .await;
