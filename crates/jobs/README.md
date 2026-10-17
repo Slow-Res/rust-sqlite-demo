@@ -83,8 +83,9 @@ impl Job for WelcomeEmail {
 `JobError::Retry` retries with backoff (5 s doubling to 1 h, full jitter, both set by
 `JobOptions::backoff`), `RetryAfter(d, msg)` not before `d`, `Permanent` never, and `Cancelled` ends the
 job `cancelled`. No retry delay is longer than 7 days (`MAX_RETRY_DELAY`), whatever the backoff
-or `RetryAfter` says. A panic counts as a retryable error. After `max_attempts` (10) the job ends
-`failed`.
+or `RetryAfter` says. A panic counts as a retryable error. After `max_attempts` (10 by default, at most `MAX_ATTEMPTS` = 1000) the job ends
+`failed`. A cancellation request is not lost on the way: a retryable failure, or a reap, of a job
+whose cancellation was requested ends it `cancelled` instead of requeueing it.
 
 Migrate once at start-up, after your own migrations. The crate keeps its own migration table
 (`_jobs_migrations`), so it never touches yours:
@@ -171,7 +172,9 @@ deadline, so the job is reaped and retried elsewhere.
 compare their clocks. `tokio::time` is used only for local waits (poll interval, heartbeat
 period).
 
-**Graceful shutdown.** Cancel the `CancellationToken` passed to `run`. The worker stops
+**Graceful shutdown.** Stop `Worker::run` through its token, never by dropping or aborting
+the future: the heartbeat runs as a task of its own, so a dropped `run` would leave it renewing
+the leases of jobs nobody is running. Cancel the `CancellationToken` passed to `run`. The worker stops
 claiming, waits up to `shutdown_timeout` (25 s) for running jobs, cancels the rest, and waits
 `cancel_grace` (5 s). A handler that stops after that cancellation is released back to the
 queue without spending an attempt; one that ignores it keeps its lease until it expires, and
@@ -225,8 +228,10 @@ cannot take the API with it, and workers scale and restart on their own. The lib
 it that way by default ([docs/JOBS.md](../../docs/JOBS.md)).
 
 **Connections.** Give the worker its own pool so job work never waits for the API's
-connections. It holds one connection for LISTEN and, while leader, one for the advisory lock;
-claims, heartbeats and handlers share the rest. `slots + 4` is a safe size.
+connections. It holds one connection for LISTEN and, while leader, one for the advisory lock
+(a dedicated connection taken out of the pool, so it comes on top of the pool's size and its
+TCP keepalives are shortened for a faster take-over); claims, heartbeats and handlers share the
+rest. `slots + 4` is a safe size.
 
 ## axum
 
@@ -538,7 +543,8 @@ With `default-features = false` the crate does not depend on axum; `Metrics::enc
 ## Guarantees and limits
 
 - **At least once.** A job can run again after a crash between its side effect and the
-  completion write. Make handlers idempotent, or give the receiver a stable id to de-duplicate on
+  completion write, and a handler that ignores cancellation after it lost its lease can still be
+  running when the retry starts, so the two overlap. Make handlers idempotent, or give the receiver a stable id to de-duplicate on
   (`ctx.id()` is the same on every attempt; the library app's emails use it as `Message-ID`).
 - **Never lost.** A job ends `succeeded`, `failed` (attempts or crashes used up, or a permanent
   error) or `cancelled`. Lease expiry counts as a crash; after `max_crashes` (2) the job fails

@@ -146,6 +146,7 @@ Postgres 5434, Prometheus 9091), so it can run next to `make up`.
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the picture, one write step by step, the guarantees.
 - [docs/RUNBOOK.md](docs/RUNBOOK.md): what to do when something breaks, and how to add a node or deploy.
+- [docs/JOBS.md](docs/JOBS.md): the Postgres deployment's background jobs (emails and webhooks): how they run, configure and operate.
 - [docs/LOADTEST.md](docs/LOADTEST.md): how much load one node (2 CPUs, 4 GB) handles, and how to measure it (`make loadtest`).
 - [docs/decisions](docs/decisions): why it is built this way.
   - [0001 SQLite as the primary database](docs/decisions/0001-sqlite-as-the-primary-database.md)
@@ -154,3 +155,4 @@ Postgres 5434, Prometheus 9091), so it can run next to `make up`.
   - [0004 Change log written by triggers](docs/decisions/0004-change-log-written-by-triggers.md)
   - [0005 Tokens and epochs detect restores](docs/decisions/0005-tokens-and-epochs-detect-restores.md)
   - [0006 Garage instead of MinIO](docs/decisions/0006-garage-instead-of-minio.md)
+  - [0007 Our own Postgres job queue](docs/decisions/0007-own-job-queue.md)

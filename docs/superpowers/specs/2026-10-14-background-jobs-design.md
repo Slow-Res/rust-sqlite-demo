@@ -714,6 +714,45 @@ The web app (`apps/web`):
 - Known gap: a second signal does not skip to step 5 of §13; the worker keeps waiting out its
   shutdown timeouts.
 
+Final review fixes (the code is the authority where §4 to §19 differ):
+
+- Webhook jobs use `max_attempts` 10 like emails (the kind keeps `JobOptions`' default), not 15
+  as §4.1 says. A kind's `max_attempts` is validated to 1 to 1000, so retry arithmetic cannot
+  overflow; the reaper clamps its backoff exponent too.
+- §17.2 `jobs_running_total{queue}` is `jobs_running_all{queue}` (leader), and `jobs_leader` (1 on
+  the leader, 0 elsewhere, exported by every worker) is added. `jobs_db_errors_total{op}` also
+  counts `heartbeat` and `finish`. `jobs_lease_lost_total` counts each lost lease once, where
+  the heartbeat cancels the handler, not when the handler returns. Every `jobs_completed_total`
+  series (registered kind × outcome) exists at 0 from worker start.
+- The log events are those of §17.1 with these changes: `jobs.failed` is warn, `jobs.retry_scheduled`,
+  `jobs.cancelled` and `jobs.released` info, `jobs.succeeded`, `jobs.enqueued`, `jobs.duplicate`,
+  `jobs.claimed` and `jobs.finished` debug; there is no `trace` field; `jobs.bad_args` and
+  `jobs.lease_expired` are added. Arguments are never logged, and `jobs.bad_args` carries no decode message.
+- §17.2's suggested alerts are `JobsQueueStalled`, `JobsFailing` (the workers' failed outcomes,
+  or a rise of the leader's `jobs_failed_recent`, which also sees jobs failed by the reaper),
+  `JobsNoLeader`, `JobsWorkerDown` ("no live process": a `jobs-worker` scrape target down for
+  2 minutes) and `JobsLeaseLost` ("lease-lost or fence-rejected non-zero": either counter rose in
+  15 minutes). The last two need the `jobs-worker` scrape job, which is commented out in
+  `deploy/monitoring/prometheus.yml`.
+- §19: the `worker` compose service exists only in the load-test compose
+  (`deploy/compose/local/loadtest.web-pg.yml`, profile `jobs`); `deploy/compose` has none, because
+  the production stack runs SQLite.
+- A cancellation request now sticks: a retryable failure, or a reap, of a job with
+  `cancel_requested` ends it `cancelled` instead of requeueing it (the claim is unchanged).
+- The leader connection sets `tcp_keepalives_idle = 10`, `tcp_keepalives_interval = 5` and
+  `tcp_keepalives_count = 3` once the lock is granted, so a leader whose host dies without
+  closing the connection is replaced in about 30 s rather than after the server's keepalive
+  default (§8.5's "within 10 s" holds for a closed connection or a stopped process).
+- New validations: `prune_after` at least the shortest lease minus a heartbeat; no zero
+  maintenance interval (tokio's `interval` panics on one) while maintenance is enabled; the
+  `heartbeat × 3` checks cannot overflow. A claim and a heartbeat renewal give a job a lease of
+  at least the worker's shortest lease, so a row enqueued with a shorter one is not reaped under
+  a live handler. `ListFilter::default()` lists 50.
+- App: `JOBS_WEBHOOK_ENDPOINTS` refuses a URL listed twice (naming the two positions); webhook
+  transport errors read "timed out", "connection failed" or "request failed", and a request that
+  cannot be built is permanent; `JOBS_SMTP_URL` with credentials must use `smtps://` or
+  `?tls=required` (or `wrapper`).
+
 Measured (§21):
 
 - Throughput smoke: about 16,700 no-op jobs/s with one worker, 64 slots and 2 cores (`taskset`

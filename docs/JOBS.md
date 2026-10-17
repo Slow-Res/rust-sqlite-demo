@@ -39,13 +39,18 @@ Several workers can run at once, on one VM or several. They agree through the da
 - **Claims** use `FOR UPDATE SKIP LOCKED`, so two workers never take the same job.
 - **Leases**: a running job belongs to one worker until `locked_until`, 60 s ahead (the lease is
   per kind, `JobOptions::lease`). Each worker renews the leases of all its jobs every 20 s, in one
-  statement (the heartbeat).
+  transaction of two statements: it touches its registry row, then renews the leases (the
+  heartbeat).
 - **The registry** (`job_processes`) has one row per worker, updated by the same heartbeat.
 - **The leader** is whichever worker holds a Postgres advisory lock. It re-queues jobs whose lease
   ran out (every 5 s), deletes workers silent for 3 minutes (every 30 s), enqueues recurring jobs,
   deletes old jobs (succeeded after 24 h, failed after 14 days) and publishes the queue gauges.
   It holds the lock on one dedicated connection (one beyond `JOBS_DB_POOL`). If that connection
-  dies, another worker takes over within 10 s. A leader removes silent workers from the registry
+  closes, or the leader's process exits, another worker takes over within about 10 s. If the
+  leader's host dies without closing it, Postgres frees the lock only when it notices the dead
+  client: the leader connection sets TCP keepalives of 10 s idle and 3 probes 5 s apart, so
+  that is up to about 30 s (the server default would be about 2 hours). See
+  [the runbook](RUNBOOK.md#jobs-a-queue-is-not-moving) to find and end a stuck holder. A leader removes silent workers from the registry
   only after the database has answered every maintenance step for 3 minutes, so after an outage it
   does not delete every live worker that could not beat meanwhile.
 - **A database outage** never fences a worker and never ends the process. The worker stops
@@ -76,7 +81,8 @@ A borrow that is refused (no copy free, limit reached) rolls back and enqueues n
 | `webhook.v1` | `webhooks` | borrow and return, once per endpoint in `JOBS_WEBHOOK_ENDPOINTS` | `POST`s `{id, type, occurred_at, data: {loan}}` with Standard Webhooks headers: `webhook-id` (`loan.<id>.<borrowed\|returned>`), `webhook-timestamp`, `webhook-signature` (`v1,<base64 HMAC-SHA256>`). Redirects are not followed. The payload is the loan at the time of the event. | 408, 429 (waits for `Retry-After`, up to 1 h), 5xx, timeouts and connection errors retry; other 4xx and redirects fail at once. |
 
 Both retry up to 10 attempts. The delay before retry *n* is random between 0 and 5 s × 2^(n-1)
-(full jitter, capped at 1 h), so all nine retries take at most 43 minutes and about 21 on average.
+(full jitter, capped at 1 h), so all nine retries take at most about 43 minutes (longer when a
+receiver sends `Retry-After`) and about 21 on average.
 A `Retry-After` from a webhook receiver is honoured instead, up to 1 h; no delay ever exceeds 7
 days. A job that fails permanently is never retried.
 
@@ -116,11 +122,11 @@ malformed value stops the process at start with a message naming the variable.
 | `JOBS_KEEP_SUCCEEDED_H` | `24` | Retention of succeeded jobs |
 | `JOBS_KEEP_FAILED_H` | `336` | Retention of failed and cancelled jobs (14 days) |
 | `JOBS_METRICS_ADDR` | `0.0.0.0:9300` | The worker's `/metrics`, `/healthz`, `/readyz`. Keep it off the public network. |
-| `JOBS_SMTP_URL` | unset | `smtp://host:25`, `smtp://user:pass@host:587?tls=required` (STARTTLS) or `smtps://user:pass@host:465`. Unset: no emails are enqueued, and the worker does not run `loan_email.v1`. |
+| `JOBS_SMTP_URL` | unset | `smtp://host:25`, `smtp://user:pass@host:587?tls=required` (STARTTLS) or `smtps://user:pass@host:465`. A URL with a username and password must use `smtps://` or `?tls=required` (or `?tls=wrapper`); otherwise the process refuses to start. Unset: no emails are enqueued, and the worker does not run `loan_email.v1`. |
 | `JOBS_SMTP_TIMEOUT_S` | `30` | Bounds connecting and the whole send of one email; a slower server fails the attempt as retryable |
 | `JOBS_EMAIL_FROM` | `library@localhost` | Sender address |
 | `JOBS_EMAIL_DOMAIN` | `library.local` | Right-hand side of the `Message-ID` |
-| `JOBS_WEBHOOK_ENDPOINTS` | unset | Comma-separated `http(s)` URLs, at most 10. Connect timeout 5 s, whole request 15 s. |
+| `JOBS_WEBHOOK_ENDPOINTS` | unset | Comma-separated `http(s)` URLs, at most 10, each listed once (a repeated URL stops the process at start, naming the two positions). Connect timeout 5 s, whole request 15 s. |
 | `JOBS_WEBHOOK_SECRET_<n>` | – | Secret of the n-th endpoint (1-based): `whsec_` and the base64 of a 24 to 64 byte key |
 
 Generate a webhook secret with `echo "whsec_$(openssl rand -base64 32)"`. Secrets, webhook URLs and
@@ -162,22 +168,46 @@ Scrape each worker at `:9300/metrics`.
 | `jobs_duration_seconds{kind}` | every worker | Handler time |
 | `jobs_wait_seconds{kind}` | every worker | From due to claimed: queue latency as each job saw it |
 | `jobs_running{queue}`, `jobs_slots{queue}` | every worker | Busy and total handler slots |
-| `jobs_fence_rejected_total`, `jobs_lease_lost_total` | every worker | Outcome writes refused and handlers cancelled because the lease was lost. Both should stay at 0. |
-| `jobs_db_errors_total{op}` | every worker | Failed database calls of the loops: `claim`, `listen`, `register`, `reap`, `prune`, `recurring`, `retention`, `gauges` |
+| `jobs_fence_rejected_total`, `jobs_lease_lost_total` | every worker | Outcome writes refused and handlers cancelled because the lease was lost (each lost lease once, counted where the heartbeat cancels the handler). Both exist at 0 from the start and should stay there. |
+| `jobs_db_errors_total{op}` | every worker | Failed database calls of the loops: `claim`, `listen`, `register`, `heartbeat`, `finish` (an outcome write, retried until it lands), `reap`, `prune`, `recurring`, `retention`, `gauges` |
 | `jobs_available{queue}`, `jobs_scheduled{queue}`, `jobs_running_all{queue}` | the leader | Queue depth across all workers |
 | `jobs_oldest_available_seconds{queue}` | the leader | Age of the oldest job ready to run. The best single alarm. |
 | `jobs_failed_recent{kind}` | the leader | Failed in the last 24 h |
-| `jobs_processes_live`, `jobs_leader` | the leader | Workers with a recent heartbeat; 1 on the leader |
+| `jobs_processes_live` | the leader | Workers with a recent heartbeat |
+| `jobs_leader` | every worker | 1 on the leader, 0 on the others (`JobsNoLeader` relies on the 0s) |
 
-Only the leader exports the queue-wide gauges, so sum or max them across workers.
+Only the leader exports the queue-wide gauges, so sum or max them across workers. The `jobs_completed_total` series of every registered kind and outcome exist at 0 from the start, so `increase()` sees the first failure.
+
+### Logs
+
+One line per event. The outcome events (`jobs.failed` to `jobs.succeeded`) carry `job_id`, `kind`,
+`queue` and `attempt`; the enqueue events carry `job_id`, `kind` and `queue`. No event carries a
+job's arguments.
+
+| Event | Level (default `RUST_LOG=info` shows warn and info) | Extra fields |
+|---|---|---|
+| `jobs.failed` | warn | `cause`, `error` (cut to 2,000 characters; not set for `bad_args`, whose message can quote argument values) |
+| `jobs.retry_scheduled` | info | `cause`, `error`, `delay_s` |
+| `jobs.cancelled`, `jobs.released` | info | |
+| `jobs.bad_args` | error | `job_id` and `kind` only; the decode message is in the job's `errors` |
+| `jobs.lease_lost`, `jobs.lease_expired`, `jobs.fence_rejected`, `jobs.reaped` | warn / error | the job, or the reaper's cause and new state |
+| `jobs.succeeded`, `jobs.enqueued`, `jobs.duplicate`, `jobs.claimed`, `jobs.finished` | debug | |
+| `process.started`, `process.stopping`, `process.stopped`, `process.pruned`, `process.self_fenced`, `leader.acquired`, `leader.lost`, `recurring.enqueued` | info / warn | |
 
 ### Alerts
 
 | Alert | Fires when | Runbook |
 |---|---|---|
 | `JobsQueueStalled` | The oldest ready job in a queue is over 5 minutes old, for 10 minutes | [A queue is not moving](RUNBOOK.md#jobs-a-queue-is-not-moving) |
-| `JobsFailing` | Jobs of one kind failed in the last 15 minutes | [Failed jobs](RUNBOOK.md#jobs-failed-jobs) |
+| `JobsFailing` | Jobs of one kind failed in the last 15 minutes: a worker finished an attempt as failed, or the leader's `jobs_failed_recent` rose (a job failed by the reaper after `max_crashes`) | [Failed jobs](RUNBOOK.md#jobs-failed-jobs) |
 | `JobsNoLeader` | No worker has been leader for 5 minutes (no reaping, no retention) | [A queue is not moving](RUNBOOK.md#jobs-a-queue-is-not-moving) |
+| `JobsWorkerDown` | A `jobs-worker` scrape target has not answered for 2 minutes | [A queue is not moving](RUNBOOK.md#jobs-a-queue-is-not-moving) |
+| `JobsLeaseLost` | A handler lost its lease or an outcome write was refused in the last 15 minutes; a job may have run twice | [A lease was lost](RUNBOOK.md#jobs-a-lease-was-lost) |
+
+All five read the workers' metrics, so they need the `jobs-worker` scrape job in
+`deploy/monitoring/prometheus.yml` (commented out there until a worker exists to scrape);
+`JobsWorkerDown` and `JobsLeaseLost` stay silent without it. The metrics table above says which
+series each uses.
 
 ### Health
 

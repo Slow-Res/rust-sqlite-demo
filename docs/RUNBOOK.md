@@ -567,13 +567,18 @@ borrowing and returning keep working while jobs wait.
 
 | Alert | Section |
 |---|---|
-| `JobsQueueStalled`, `JobsNoLeader` | [Jobs: a queue is not moving](#jobs-a-queue-is-not-moving) |
+| `JobsQueueStalled`, `JobsNoLeader`, `JobsWorkerDown` | [Jobs: a queue is not moving](#jobs-a-queue-is-not-moving) |
 | `JobsFailing` | [Jobs: failed jobs](#jobs-failed-jobs) |
+| `JobsLeaseLost` | [Jobs: a lease was lost](#jobs-a-lease-was-lost) |
+
+`JobsWorkerDown` and `JobsLeaseLost` need the `jobs-worker` scrape job in
+`deploy/monitoring/prometheus.yml` (commented out there until a worker exists to scrape).
 
 ## Jobs: a queue is not moving
 
 **When:** `JobsQueueStalled` (the oldest ready job in a queue is over 5 minutes old, for 10
-minutes), `JobsNoLeader`, or members report missing emails.
+minutes), `JobsNoLeader`, `JobsWorkerDown` (a worker's metrics scrape fails for 2 minutes), or
+members report missing emails.
 
 **Steps**
 
@@ -594,7 +599,22 @@ minutes), `JobsNoLeader`, or members report missing emails.
    `JOBS_QUEUES` or run a second worker.
 6. `JobsNoLeader` alone: a leader election needs a worker and the database. Check that a worker
    runs and that its `/readyz` answers 200. Without a leader nothing reaps crashed jobs or deletes
-   old ones, but running jobs still finish.
+   old ones, but running jobs still finish. If every worker is healthy and still none is leader,
+   a dead worker's database session may still hold the leader lock (Postgres frees it only when
+   it notices the client is gone, which takes up to about 30 s after a host dies). Find the holder, in `psql` against
+   the application database (the key `0x6A6F_6273_6C65_6164` is 1785684595 in `classid` and
+   1818583396 in `objid`):
+
+   ```sql
+   SELECT l.pid, a.client_addr, a.backend_start, a.state, a.state_change
+   FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+   WHERE l.locktype = 'advisory' AND l.classid = 1785684595
+     AND l.objid = 1818583396 AND l.objsubid = 1;
+   ```
+
+   If its `client_addr` is a worker that is gone (or one that is not leader), end the session:
+   `SELECT pg_terminate_backend(<pid>);`. A live worker takes the lock within 10 s. Never end
+   the session of the worker that exports `jobs_leader 1`.
 
 **Check it worked**
 
@@ -606,8 +626,9 @@ minutes), `JobsNoLeader`, or members report missing emails.
 
 **When:** `JobsFailing`, or `jobs status` shows failures in the last 24 h.
 
-A job fails when its attempts run out (10, over at most 43 minutes), when its handler reports a
-permanent error, or when its worker died twice while running it.
+A job fails when its attempts run out (10, over at most about 43 minutes, longer when a receiver
+sends `Retry-After`), when its handler reports a permanent error, or when its worker died twice
+while running it.
 
 **Steps**
 
@@ -636,6 +657,32 @@ permanent error, or when its worker died twice while running it.
 
 - The retried jobs reach `succeeded` (`jobs list --kind <kind> --limit 20`).
 - `jobs_failed_recent` stops growing.
+
+## Jobs: a lease was lost
+
+**When:** `JobsLeaseLost`: in the last 15 minutes a worker cancelled a handler because it could
+not renew the job's lease (`jobs_lease_lost_total`), or found its outcome write refused because
+the job had been taken over (`jobs_fence_rejected_total`). The job may have run twice, once
+under each worker; emails and webhooks carry stable ids, so receivers can drop the repeat.
+
+**Steps**
+
+1. `docker compose logs worker --since 30m`, and look for `jobs.lease_lost`,
+   `jobs.lease_expired` and `jobs.fence_rejected` (they name the job), and for
+   `jobs: heartbeat failed` or `timed out` just before them. A heartbeat that fails means the
+   worker could not reach Postgres, or Postgres was too slow to answer within one heartbeat
+   (20 s): check the database ([Postgres down](#postgres-down)) and `jobs_db_errors_total{op="heartbeat"}`.
+2. A worker whose host froze or was starved of CPU for longer than a lease (60 s by default)
+   shows the same signs, with `process_lost` in `jobs show <id>` for the jobs it held. Look at
+   the host, then at the memory limit of the worker's container.
+3. `jobs show <id>` of a job named in the logs: the last `errors` entries say how its attempts
+   ended. Nothing needs repairing: the job was retried or finished by the other worker.
+4. If it keeps happening on one worker, restart it (`docker compose up -d worker`).
+
+**Check it worked**
+
+- `increase(jobs_lease_lost_total[15m])` and `increase(jobs_fence_rejected_total[15m])` are 0 and
+  the alert clears.
 
 ## Jobs: add a webhook endpoint
 
