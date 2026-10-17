@@ -235,3 +235,159 @@ async fn retry_clears_a_stale_cancel_request() {
         assert!(d.summary.finished_at.is_none());
     }).await;
 }
+
+async fn fail_job(pool: &sqlx::PgPool, id: i64) {
+    sqlx::query("UPDATE jobs SET state = 'failed', finished_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Inserts a waiting job with this unique key inside an open transaction: the
+/// retry's write then blocks on the unique index until the commit, and fails
+/// with a unique violation (its `NOT EXISTS` check could not see the insert).
+async fn hold_key_in_open_tx(
+    pool: &sqlx::PgPool,
+    key: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO jobs (kind, queue, args, max_attempts, max_crashes, deadline_s, lease_s, unique_key)
+         VALUES ('test_unique.v1', 'default', '{}', 3, 2, 60, 60, $1)",
+    )
+    .bind(key)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx
+}
+
+#[tokio::test]
+async fn parallel_retries_of_twin_rows_move_exactly_one() {
+    with_db(|pool| async move {
+        let a = enqueue(
+            &pool,
+            &Unique {
+                key: "k".into(),
+                v: 1,
+            },
+        )
+        .await;
+        fail_job(&pool, a).await;
+        let b = enqueue(
+            &pool,
+            &Unique {
+                key: "k".into(),
+                v: 2,
+            },
+        )
+        .await;
+        fail_job(&pool, b).await;
+        let (ra, rb) = tokio::join!(ops::retry(&pool, a), ops::retry(&pool, b));
+        let mut results = [ra.unwrap(), rb.unwrap()];
+        results.sort();
+        assert_eq!(results, [false, true]);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM jobs WHERE unique_key = 'k' AND state = 'available'"
+            )
+            .await,
+            1
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn retry_returns_false_when_an_enqueue_commits_mid_write() {
+    with_db(|pool| async move {
+        let old = enqueue(
+            &pool,
+            &Unique {
+                key: "k".into(),
+                v: 1,
+            },
+        )
+        .await;
+        fail_job(&pool, old).await;
+        let tx = hold_key_in_open_tx(&pool, "k").await;
+        let retrying = tokio::spawn({
+            let pool = pool.clone();
+            async move { ops::retry(&pool, old).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !retrying.is_finished(),
+            "the write should be blocked on the open insert"
+        );
+        tx.commit().await.unwrap();
+        assert!(!retrying.await.unwrap().unwrap());
+        assert_eq!(job_state(&pool, old).await, "failed");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn retry_failed_survives_a_key_taken_mid_statement() {
+    with_db(|pool| async move {
+        let conflicted = enqueue(
+            &pool,
+            &Unique {
+                key: "k".into(),
+                v: 1,
+            },
+        )
+        .await;
+        fail_job(&pool, conflicted).await;
+        let free = enqueue(
+            &pool,
+            &Unique {
+                key: "free".into(),
+                v: 2,
+            },
+        )
+        .await;
+        fail_job(&pool, free).await;
+        let tx = hold_key_in_open_tx(&pool, "k").await;
+        let retrying = tokio::spawn({
+            let pool = pool.clone();
+            async move { ops::retry_failed(&pool, None, None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !retrying.is_finished(),
+            "the batch should be blocked on the open insert"
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            retrying.await.unwrap().unwrap(),
+            1,
+            "the free row still moves"
+        );
+        assert_eq!(job_state(&pool, free).await, "available");
+        assert_eq!(job_state(&pool, conflicted).await, "failed");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn retry_failed_keeps_unique_keys_and_job_ids_apart() {
+    with_db(|pool| async move {
+        // Same kind: a keyless row whose id equals another row's unique_key text must both move.
+        let keyless = enqueue(&pool, &Noop { n: 1 }).await;
+        fail_job(&pool, keyless).await;
+        let keyed: i64 = sqlx::query_scalar(
+            "INSERT INTO jobs (kind, queue, args, state, max_attempts, max_crashes, deadline_s, lease_s, unique_key, finished_at)
+             VALUES ('test_noop.v1', 'default', '{}', 'failed', 3, 2, 60, 60, $1, now()) RETURNING id",
+        )
+        .bind(keyless.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ops::retry_failed(&pool, None, None).await.unwrap(), 2);
+        assert_eq!(job_state(&pool, keyless).await, "available");
+        assert_eq!(job_state(&pool, keyed).await, "available");
+    }).await;
+}

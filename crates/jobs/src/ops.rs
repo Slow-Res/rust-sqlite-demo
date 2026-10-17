@@ -178,7 +178,9 @@ pub async fn show(pool: &PgPool, id: i64) -> Result<Option<JobDetail>, sqlx::Err
 /// Failed or cancelled → available now, with attempts and crashes reset.
 /// Returns false when the job is not failed/cancelled, or when another waiting
 /// or running job holds its unique key (a finished job gave the key up, so
-/// retrying it would violate `jobs_unique`).
+/// retrying it would violate `jobs_unique`). The `NOT EXISTS` check is not
+/// serialised against a concurrent enqueue or retry, so a unique violation
+/// from the write itself also means false.
 pub async fn retry(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
     let r = sqlx::query(
         "UPDATE jobs SET state = 'available', attempt = 0, crashes = 0, run_at = now(), finished_at = NULL,
@@ -191,13 +193,25 @@ pub async fn retry(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
     )
     .bind(id)
     .execute(pool)
-    .await?;
-    Ok(r.rows_affected() == 1)
+    .await;
+    match r {
+        Ok(r) => Ok(r.rows_affected() == 1),
+        Err(err) if is_unique_violation(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn is_unique_violation(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .is_some_and(|e| e.is_unique_violation())
 }
 
 /// Every failed job (optionally of one kind, optionally finished within `since`)
 /// → available. Rows whose unique key is held by a waiting or running job are
 /// skipped, and of several failed rows sharing a key only the newest moves.
+/// If a concurrent enqueue or retry takes a key mid-statement (which aborts the
+/// whole statement), the candidates are retried one by one, so one conflicting
+/// row never blocks the rest; the count is the rows that moved.
 pub async fn retry_failed(
     pool: &PgPool,
     kind: Option<&str>,
@@ -206,8 +220,9 @@ pub async fn retry_failed(
     let r = sqlx::query(
         "UPDATE jobs SET state = 'available', attempt = 0, crashes = 0, run_at = now(), finished_at = NULL,
                 cancel_requested = false
-         WHERE id IN (
-             SELECT DISTINCT ON (f.kind, COALESCE(f.unique_key, f.id::text)) f.id
+         WHERE state = 'failed' AND id IN (SELECT id FROM (
+             SELECT f.id, f.unique_key,
+                    row_number() OVER (PARTITION BY f.kind, f.unique_key ORDER BY f.id DESC) AS rn
              FROM jobs f
              WHERE f.state = 'failed' AND ($1::text IS NULL OR f.kind = $1)
                AND ($2::float8 IS NULL OR f.finished_at > now() - make_interval(secs => $2::float8))
@@ -215,17 +230,39 @@ pub async fn retry_failed(
                     SELECT 1 FROM jobs o
                     WHERE o.kind = f.kind AND o.unique_key = f.unique_key
                       AND o.state IN ('available', 'running')))
-             ORDER BY f.kind, COALESCE(f.unique_key, f.id::text), f.id DESC
-         )",
+         ) c WHERE c.unique_key IS NULL OR c.rn = 1)",
     )
     .bind(kind)
     .bind(since.map(|d| d.as_secs_f64()))
     .execute(pool)
-    .await?;
-    Ok(r.rows_affected())
+    .await;
+    match r {
+        Ok(r) => Ok(r.rows_affected()),
+        Err(err) if is_unique_violation(&err) => {
+            let ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT id FROM jobs
+                 WHERE state = 'failed' AND ($1::text IS NULL OR kind = $1)
+                   AND ($2::float8 IS NULL OR finished_at > now() - make_interval(secs => $2::float8))
+                 ORDER BY id DESC",
+            )
+            .bind(kind)
+            .bind(since.map(|d| d.as_secs_f64()))
+            .fetch_all(pool)
+            .await?;
+            let mut moved = 0;
+            for id in ids {
+                if retry(pool, id).await? {
+                    moved += 1;
+                }
+            }
+            Ok(moved)
+        }
+        Err(err) => Err(err),
+    }
 }
 
-/// A waiting job → cancelled. Running jobs need `cancel`.
+/// A waiting or failed job → cancelled (a failed job's `finished_at` is reset to
+/// now). Running jobs need `cancel`.
 pub async fn discard(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
     let r = sqlx::query(
         "UPDATE jobs SET state = 'cancelled', finished_at = now()
