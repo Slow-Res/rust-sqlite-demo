@@ -177,10 +177,11 @@ claiming, waits up to `shutdown_timeout` (25 s) for running jobs, cancels the re
 queue without spending an attempt; one that ignores it keeps its lease until it expires, and
 the reaper retries the job. Then the worker deletes its registry row. Give the process at
 least `shutdown_timeout + cancel_grace + 10 s` before a SIGKILL (Docker's
-`stop_grace_period: 40s`). The worst case is longer: the worker first waits up to
-`shutdown_timeout` for its helper tasks (queue loops, LISTEN, leader), which end at once unless one
-is stuck on a dead connection, then up to `shutdown_timeout` again for the handlers; leave
-`2 × shutdown_timeout + cancel_grace + 10 s` if a stuck database must not cost you a SIGKILL.
+`stop_grace_period: 40s`). The worst case is longer: the worker first waits up to 5 s for its
+helper tasks (queue loops, LISTEN, leader), which end at once unless one is stuck on a dead
+connection, then up to `shutdown_timeout` for the handlers, then `cancel_grace`, plus up to 5 s
+each for the registry writes; leave `shutdown_timeout + cancel_grace + 20 s` if a stuck database
+must not cost you a SIGKILL.
 An HTTP drain started by the same token runs alongside this, so it only adds time when its
 budget is longer. A killed process loses no job: they are reaped when their leases expire (each
 such expiry counts as a crash, see below).

@@ -439,6 +439,7 @@ where
     on_postgres_url(|db, _url| body(db)).await;
 }
 
+/// Like [`on_postgres`], also passing the database's URL (for tests that start
 /// the `library-web` binary against it).
 #[cfg(feature = "postgres")]
 pub async fn on_postgres_url<F, Fut>(body: F)

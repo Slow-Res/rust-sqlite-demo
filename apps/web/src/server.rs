@@ -15,8 +15,6 @@ use crate::{build_router, checkpoint, db};
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let database = db::connect(&config).await?;
     db::migrate(&database).await?;
-    #[cfg(feature = "postgres")]
-    let embedded_jobs = crate::jobs::worker::on_serve(&database, &config).await?;
 
     // SQLite only; Postgres checkpoints itself.
     let checkpoints = match &database {
@@ -32,13 +30,18 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     };
 
     let bind_addr = config.bind_addr;
-    let state = AppState::new(database.clone(), Arc::new(config), Arc::new(SystemClock));
+    let config = Arc::new(config);
+    let state = AppState::new(database.clone(), config.clone(), Arc::new(SystemClock));
     let router = build_router(state);
 
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("binding {bind_addr}"))?;
     tracing::info!(%bind_addr, "listening");
+
+    // After the bind, so a port that is taken never leaves an embedded worker behind.
+    #[cfg(feature = "postgres")]
+    let embedded_jobs = crate::jobs::worker::on_serve(&database, &config).await?;
 
     // An embedded worker that ends on its own (fenced, failed) also ends the
     // server; the process then exits non-zero (spec §8.2).
@@ -71,10 +74,18 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     #[cfg(not(feature = "postgres"))]
     let jobs_outcome: anyhow::Result<()> = Ok(());
     database.close().await;
-    served?;
-    jobs_outcome?;
-    tracing::info!("shut down cleanly");
-    Ok(())
+    match (served, jobs_outcome) {
+        (Ok(()), Ok(())) => {
+            tracing::info!("shut down cleanly");
+            Ok(())
+        }
+        (Err(server), Err(worker)) => {
+            // Only one error can be returned; the other must not vanish.
+            tracing::error!(error = %format!("{worker:#}"), "the embedded jobs worker also failed");
+            Err(server)
+        }
+        (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+    }
 }
 
 /// Resolves on Ctrl-C or (on Unix) SIGTERM, which is what container runtimes send.

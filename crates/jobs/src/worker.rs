@@ -27,6 +27,11 @@ use crate::store::process::{ProcessInfo, deregister, register, set_stopping};
 /// Shutdown's registry writes must not hang on a dead pool.
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long shutdown waits for the helper tasks (claim loops, LISTEN, leader).
+/// They honour the stop token at once, so only one stuck on a dead connection
+/// ever uses this; `shutdown_timeout` is kept for the handler drain.
+const HELPERS_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
     #[error(transparent)]
@@ -211,7 +216,7 @@ impl Worker {
             }
         }
         // A helper stuck on a dead connection must not hold up the rest of the shutdown.
-        let joined = tokio::time::timeout(config.shutdown_timeout, async {
+        let joined = tokio::time::timeout(HELPERS_JOIN_TIMEOUT, async {
             while helpers.join_next().await.is_some() {}
         })
         .await;

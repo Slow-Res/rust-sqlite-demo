@@ -41,10 +41,25 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     library_jobs::migrate(pool).await.context("jobs migrations")
 }
 
-/// A pool of its own, so job work never takes the API's connections.
+/// Longest a single statement of a worker connection may run (spec §11.4): a
+/// stuck query must not hold a claim or a lease write forever.
+const STATEMENT_TIMEOUT: &str = "30s";
+
+/// A pool of its own, so job work never takes the API's connections. Every
+/// connection gets `statement_timeout`; the app's own pool is left alone.
 pub async fn connect(database_url: &str, max_connections: u32) -> anyhow::Result<PgPool> {
     PgPoolOptions::new()
         .max_connections(max_connections)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SET statement_timeout = '{STATEMENT_TIMEOUT}'"
+                )))
+                .execute(&mut *conn)
+                .await?;
+                Ok(())
+            })
+        })
         .connect(database_url)
         .await
         .context("connecting to DATABASE_URL")

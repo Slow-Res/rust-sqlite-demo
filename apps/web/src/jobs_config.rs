@@ -32,11 +32,35 @@ impl fmt::Debug for Secret {
 
 /// An outgoing-webhook receiver. Only operators configure these, never API input
 /// (spec §15.3: no SSRF surface).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WebhookEndpoint {
     pub url: String,
     /// `whsec_<base64 key>`, the Standard Webhooks format.
     pub secret: Secret,
+}
+
+/// Receivers often carry a token in the path, query or userinfo, so `Debug`
+/// shows only `scheme://host`.
+impl fmt::Debug for WebhookEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebhookEndpoint")
+            .field("url", &redacted_url(&self.url))
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+fn redacted_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "***".to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    if host.is_empty() {
+        "***".to_owned()
+    } else {
+        format!("{scheme}://{host}")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +114,9 @@ impl Default for JobsConfig {
 
 const MAX_WEBHOOK_ENDPOINTS: usize = 10;
 
+/// Ten years; keeps `hours * 3600` far from overflow.
+const MAX_KEEP_H: u64 = 87_600;
+
 impl JobsConfig {
     pub fn from_lookup(get: &impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         // An empty value is the same as an unset one (compose writes `VAR:` as "").
@@ -104,16 +131,22 @@ impl JobsConfig {
         };
         let db_pool = u32::try_from(positive("JOBS_DB_POOL", u64::from(d.db_pool))?)
             .context("JOBS_DB_POOL is too large")?;
+        let enabled = parse_or(&get, "JOBS_ENABLED", d.enabled)?;
+        let embedded = parse_or(&get, "JOBS_EMBEDDED", d.embedded)?;
+        // Fail fast: an embedded worker that silently never starts would leave jobs waiting.
+        if embedded && !enabled {
+            bail!("JOBS_EMBEDDED=true needs JOBS_ENABLED=true");
+        }
         Ok(Self {
-            enabled: parse_or(&get, "JOBS_ENABLED", d.enabled)?,
-            embedded: parse_or(&get, "JOBS_EMBEDDED", d.embedded)?,
+            enabled,
+            embedded,
             queues: get("JOBS_QUEUES").unwrap_or(d.queues),
             poll_ms: positive("JOBS_POLL_MS", d.poll_ms)?,
             notify: parse_or(&get, "JOBS_NOTIFY", d.notify)?,
             db_pool,
             shutdown_timeout_s: positive("JOBS_SHUTDOWN_TIMEOUT_S", d.shutdown_timeout_s)?,
-            keep_succeeded_h: positive("JOBS_KEEP_SUCCEEDED_H", d.keep_succeeded_h)?,
-            keep_failed_h: positive("JOBS_KEEP_FAILED_H", d.keep_failed_h)?,
+            keep_succeeded_h: keep_hours(&positive, "JOBS_KEEP_SUCCEEDED_H", d.keep_succeeded_h)?,
+            keep_failed_h: keep_hours(&positive, "JOBS_KEEP_FAILED_H", d.keep_failed_h)?,
             metrics_addr: parse_or(&get, "JOBS_METRICS_ADDR", d.metrics_addr)?,
             smtp_url: get("JOBS_SMTP_URL").map(Secret::new),
             smtp_timeout_s: positive("JOBS_SMTP_TIMEOUT_S", d.smtp_timeout_s)?,
@@ -122,6 +155,18 @@ impl JobsConfig {
             webhooks: webhook_endpoints(&get)?,
         })
     }
+}
+
+fn keep_hours(
+    positive: &impl Fn(&str, u64) -> anyhow::Result<u64>,
+    key: &str,
+    default: u64,
+) -> anyhow::Result<u64> {
+    let hours = positive(key, default)?;
+    if hours > MAX_KEEP_H {
+        bail!("{key} must be at most {MAX_KEEP_H} hours (10 years), got {hours}");
+    }
+    Ok(hours)
 }
 
 fn webhook_endpoints(
@@ -148,11 +193,15 @@ fn webhook_endpoints(
                 && url.len() <= 2048
                 && !url.chars().any(char::is_whitespace);
             if !ok {
-                bail!("JOBS_WEBHOOK_ENDPOINTS: `{url}` is not an http(s) URL");
+                // Names the position only: the URL may carry a token.
+                bail!(
+                    "JOBS_WEBHOOK_ENDPOINTS: endpoint {} is not an http(s) URL",
+                    i + 1
+                );
             }
             let var = format!("JOBS_WEBHOOK_SECRET_{}", i + 1);
             let secret = get(&var)
-                .with_context(|| format!("{var} is required for webhook endpoint {url}"))?;
+                .with_context(|| format!("{var} is required for webhook endpoint {}", i + 1))?;
             decode_secret(&secret).with_context(|| format!("{var} is invalid"))?;
             Ok(WebhookEndpoint {
                 url: url.to_owned(),
@@ -167,9 +216,10 @@ pub fn decode_secret(secret: &str) -> anyhow::Result<Vec<u8>> {
     let encoded = secret
         .strip_prefix("whsec_")
         .context("the secret must start with `whsec_`")?;
+    // The decoder's own error names the offending symbol and offset: leave it out.
     let key = STANDARD
         .decode(encoded)
-        .context("the part after `whsec_` must be base64")?;
+        .map_err(|_| anyhow::anyhow!("the part after `whsec_` must be base64"))?;
     if !(24..=64).contains(&key.len()) {
         bail!("the key must be 24 to 64 bytes, got {}", key.len());
     }
@@ -281,6 +331,60 @@ mod tests {
         ] {
             let err = JobsConfig::from_lookup(&lookup(&[(var, bad)])).unwrap_err();
             assert!(err.to_string().contains(var), "{var}: {err}");
+        }
+    }
+
+    #[test]
+    fn embedded_needs_jobs_enabled() {
+        let err = JobsConfig::from_lookup(&lookup(&[("JOBS_EMBEDDED", "true")])).unwrap_err();
+        assert!(err.to_string().contains("JOBS_EMBEDDED"), "{err}");
+        let ok = JobsConfig::from_lookup(&lookup(&[
+            ("JOBS_EMBEDDED", "true"),
+            ("JOBS_ENABLED", "true"),
+        ]))
+        .unwrap();
+        assert!(ok.enabled && ok.embedded);
+    }
+
+    #[test]
+    fn retention_is_capped_so_hours_to_seconds_cannot_overflow() {
+        for var in ["JOBS_KEEP_SUCCEEDED_H", "JOBS_KEEP_FAILED_H"] {
+            let ok = JobsConfig::from_lookup(&lookup(&[(var, "87600")])).unwrap();
+            assert!(ok.keep_succeeded_h <= 87_600 && ok.keep_failed_h <= 87_600);
+            for bad in ["87601", "18446744073709551615"] {
+                let err = JobsConfig::from_lookup(&lookup(&[(var, bad)])).unwrap_err();
+                assert!(err.to_string().contains(var), "{var}={bad}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn errors_and_debug_never_echo_webhook_urls_or_secret_bytes() {
+        let token_url = "https://user:pw123@hooks.example/services/T0/B1/tok3nvalue?key=q7";
+        // A bad URL (spaces) and a missing secret both name the position, not the URL.
+        for (endpoints, secret) in [
+            ("ftp://user:pw123@hooks.example/tok3nvalue", Some(SECRET)),
+            ("https://hooks.example/tok3nvalue x", Some(SECRET)),
+            (token_url, None),
+            (token_url, Some("whsec_tok3n value!")),
+        ] {
+            let mut pairs = vec![("JOBS_WEBHOOK_ENDPOINTS", endpoints)];
+            pairs.extend(secret.map(|s| ("JOBS_WEBHOOK_SECRET_1", s)));
+            let err = JobsConfig::from_lookup(&lookup(&pairs)).unwrap_err();
+            let shown = format!("{err:#} {err:?}");
+            for leak in ["pw123", "tok3n", "q7", "offset", "symbol"] {
+                assert!(!shown.contains(leak), "{leak} leaked: {shown}");
+            }
+        }
+        let c = JobsConfig::from_lookup(&lookup(&[
+            ("JOBS_WEBHOOK_ENDPOINTS", token_url),
+            ("JOBS_WEBHOOK_SECRET_1", SECRET),
+        ]))
+        .unwrap();
+        let shown = format!("{c:?}");
+        assert!(shown.contains("https://hooks.example"), "{shown}");
+        for leak in ["pw123", "tok3n", "q7", "services"] {
+            assert!(!shown.contains(leak), "{leak} leaked: {shown}");
         }
     }
 

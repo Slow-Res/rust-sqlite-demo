@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use library_jobs::{ExitReason, Worker};
+use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +15,29 @@ use crate::db::{self, Database};
 /// The metrics server drains without a bound of its own (a scraper holding a
 /// connection open would stall it), so the process gives it this long.
 const HTTP_DRAIN: Duration = Duration::from_secs(5);
+
+/// `Pool::close` waits for every connection to come back, so a handler that
+/// ignored cancellation and still holds one would block it forever. The process
+/// is exiting, so after this the pool is simply dropped.
+const POOL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What `Embedded::stop` allows beyond the worker's own `shutdown_timeout +
+/// cancel_grace`: helper join, registry writes and pool close.
+const EMBEDDED_STOP_SLACK: Duration = Duration::from_secs(15);
+
+/// Close `pool`, but not for longer than [`POOL_CLOSE_TIMEOUT`].
+async fn close_pool(pool: PgPool) {
+    within(POOL_CLOSE_TIMEOUT, "closing the jobs pool", pool.close()).await;
+}
+
+/// Wait for `fut` at most `limit`; a timeout is logged, not an error.
+async fn within(limit: Duration, what: &str, fut: impl std::future::Future<Output = ()>) -> bool {
+    let done = tokio::time::timeout(limit, fut).await.is_ok();
+    if !done {
+        tracing::warn!("{what} did not finish in {limit:?}; moving on");
+    }
+    done
+}
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     if !config.jobs.enabled {
@@ -51,7 +75,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tracing::warn!("the metrics server did not drain in {HTTP_DRAIN:?}; aborting it");
         http.abort();
     }
-    pool.close().await;
+    close_pool(pool).await;
     match reason? {
         ExitReason::Shutdown => Ok(()),
         ExitReason::SelfFenced => {
@@ -68,6 +92,8 @@ pub struct Embedded {
     /// Cancelled when the worker task ends for any reason, a panic included.
     ended: CancellationToken,
     handle: JoinHandle<anyhow::Result<()>>,
+    /// How long `stop` waits for the task before aborting it.
+    stop_timeout: Duration,
 }
 
 impl Embedded {
@@ -81,11 +107,21 @@ impl Embedded {
 
     /// Graceful stop: finish or release running jobs (spec §13). `Err` only when
     /// the worker had already failed on its own; a requested stop is `Ok`.
-    pub async fn stop(self) -> anyhow::Result<()> {
+    /// Bounded by `stop_timeout`: a worker stuck past its own limits is aborted
+    /// (its leases expire and the reaper retries the jobs), never waited on forever.
+    pub async fn stop(mut self) -> anyhow::Result<()> {
         self.stop.cancel();
-        match self.handle.await {
-            Ok(result) => result,
-            Err(err) => Err(anyhow!("the embedded jobs worker task failed: {err}")),
+        match tokio::time::timeout(self.stop_timeout, &mut self.handle).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => Err(anyhow!("the embedded jobs worker task failed: {err}")),
+            Err(_) => {
+                tracing::warn!(
+                    "the embedded jobs worker did not stop in {:?}; aborting it",
+                    self.stop_timeout
+                );
+                self.handle.abort();
+                Ok(())
+            }
         }
     }
 }
@@ -104,11 +140,10 @@ pub async fn on_serve(database: &Database, config: &Config) -> anyhow::Result<Op
         return Ok(None);
     }
     let pool = super::connect(&config.database_url, config.jobs.db_pool).await?;
-    let worker = Worker::new(
-        pool.clone(),
-        super::registry(&config.jobs)?,
-        super::worker_config(&config.jobs, "embedded")?,
-    )?;
+    let worker_config = super::worker_config(&config.jobs, "embedded")?;
+    let stop_timeout =
+        worker_config.shutdown_timeout + worker_config.cancel_grace + EMBEDDED_STOP_SLACK;
+    let worker = Worker::new(pool.clone(), super::registry(&config.jobs)?, worker_config)?;
     let stop = CancellationToken::new();
     let ended = CancellationToken::new();
     let handle = {
@@ -124,7 +159,7 @@ pub async fn on_serve(database: &Database, config: &Config) -> anyhow::Result<Op
                 )),
                 Err(err) => Err(anyhow::Error::new(err).context("the embedded jobs worker failed")),
             };
-            pool.close().await;
+            close_pool(pool).await;
             result
         })
     };
@@ -133,5 +168,30 @@ pub async fn on_serve(database: &Database, config: &Config) -> anyhow::Result<Op
         stop,
         ended,
         handle,
+        stop_timeout,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_gives_up_on_a_worker_that_never_ends() {
+        let handle = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+        let embedded = Embedded {
+            stop: CancellationToken::new(),
+            ended: CancellationToken::new(),
+            handle,
+            stop_timeout: Duration::from_millis(50),
+        };
+        let stopped = tokio::time::timeout(Duration::from_secs(5), embedded.stop()).await;
+        assert!(stopped.expect("stop must be bounded").is_ok());
+    }
+
+    #[tokio::test]
+    async fn within_reports_a_timeout_instead_of_waiting() {
+        assert!(within(Duration::from_secs(5), "x", async {}).await);
+        assert!(!within(Duration::from_millis(20), "x", std::future::pending()).await);
+    }
 }

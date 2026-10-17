@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use library_jobs::ops::{self, CancelOutcome, ListFilter, ProcessRow};
 use sqlx::PgPool;
 
@@ -252,19 +252,19 @@ fn write_processes(out: &mut String, processes: &[ProcessRow]) -> anyhow::Result
 
 /// `45s`, `30m`, `2h`, `7d`.
 pub fn parse_age(raw: &str) -> anyhow::Result<Duration> {
+    let bad = || anyhow::anyhow!("`{raw}` is not an age like 30m, 2h or 7d");
     let raw = raw.trim();
-    let split = raw.len().saturating_sub(1);
-    let (n, unit) = raw.split_at(split);
-    let n: u64 = n
-        .parse()
-        .with_context(|| format!("`{raw}` is not an age like 30m, 2h or 7d"))?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86_400,
-        _ => bail!("`{raw}` is not an age like 30m, 2h or 7d"),
+    // The unit is the last character, which may be multi-byte in bad input.
+    let (split, unit) = raw.char_indices().next_back().ok_or_else(bad)?;
+    let n: u64 = raw[..split].parse().map_err(|_| bad())?;
+    let per_unit: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(bad()),
     };
+    let secs = n.checked_mul(per_unit).ok_or_else(bad)?;
     Ok(Duration::from_secs(secs))
 }
 
@@ -277,7 +277,23 @@ mod tests {
         assert_eq!(parse_age("45s").unwrap(), Duration::from_secs(45));
         assert_eq!(parse_age("2h").unwrap(), Duration::from_secs(7200));
         assert_eq!(parse_age("7d").unwrap(), Duration::from_secs(604_800));
-        for bad in ["", "h", "2", "2w", "-1h", "1.5h"] {
+        assert_eq!(
+            parse_age("18446744073709551615s").unwrap(),
+            Duration::from_secs(u64::MAX)
+        );
+        for bad in [
+            "",
+            "h",
+            "2",
+            "2w",
+            "-1h",
+            "1.5h",
+            "5é",
+            "é",
+            "日",
+            "99999999999999999d",
+            "18446744073709551615s1",
+        ] {
             assert!(parse_age(bad).is_err(), "{bad}");
         }
     }
