@@ -16,6 +16,9 @@ pub mod db;
 pub mod error;
 pub mod extract;
 pub mod health;
+#[cfg(feature = "postgres")]
+pub mod jobs;
+pub mod jobs_config;
 pub mod loans;
 pub mod members;
 pub mod pagination;

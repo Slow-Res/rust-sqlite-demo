@@ -24,5 +24,9 @@ async fn main() -> anyhow::Result<()> {
         } => commands::create_user(config, &username, password_stdin).await,
         Command::Seed => commands::seed(config).await,
         Command::CheckDb => commands::check_db(config).await,
+        #[cfg(feature = "postgres")]
+        Command::Worker => library_web::jobs::worker::run(config).await,
+        #[cfg(feature = "postgres")]
+        Command::Jobs { command } => library_web::jobs::ops_cli::run(config, command).await,
     }
 }

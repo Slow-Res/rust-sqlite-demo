@@ -13,9 +13,9 @@ name = "library-web"
 path = "src/main.rs"
 
 [features]
-# Postgres backend for the load-test comparison only; off by default so the
-# default web binary has no Postgres driver (spec §4).
-postgres = ["sqlx/postgres"]
+# Postgres backend for the load-test comparison, and background jobs (Postgres
+# only). Off by default so the default web binary has no Postgres driver (spec §4).
+postgres = ["sqlx/postgres", "dep:library-jobs", "dep:tokio-util", "dep:lettre", "dep:reqwest", "dep:hmac"]
 
 [dependencies]
 library-shared.workspace = true
@@ -43,6 +43,11 @@ hex.workspace = true
 rand.workspace = true
 rpassword.workspace = true
 sha2.workspace = true
+library-jobs = { workspace = true, optional = true }
+tokio-util = { version = "0.7", optional = true }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "aws-lc-rs", "webpki-roots", "pool"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+hmac = { version = "0.13", optional = true }
 
 [dev-dependencies]
 http-body-util = "0.1"

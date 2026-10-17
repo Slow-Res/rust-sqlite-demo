@@ -38,6 +38,8 @@ pub struct Config {
     /// Size of the database pool, on either backend; `None` takes the default of
     /// `db` (10).
     pub database_max_connections: Option<u32>,
+    /// Background jobs (Postgres only; see `jobs_config`).
+    pub jobs: crate::jobs_config::JobsConfig,
 }
 
 impl Config {
@@ -87,9 +89,17 @@ impl Config {
             },
         };
 
+        let database_url =
+            get("DATABASE_URL").unwrap_or_else(|| "sqlite://data/library.db".to_owned());
+        let jobs = crate::jobs_config::JobsConfig::from_lookup(&get)?;
+        if jobs.enabled && !crate::db::is_postgres_url(&database_url) {
+            bail!(
+                "JOBS_ENABLED=true needs a Postgres DATABASE_URL: background jobs are Postgres only"
+            );
+        }
+
         Ok(Self {
-            database_url: get("DATABASE_URL")
-                .unwrap_or_else(|| "sqlite://data/library.db".to_owned()),
+            database_url,
             bind_addr: parse_or(&get, "BIND_ADDR", SocketAddr::from(([127, 0, 0, 1], 4000)))?,
             frontend_dir: get("FRONTEND_DIR")
                 .filter(|v| !v.is_empty())
@@ -102,12 +112,17 @@ impl Config {
             sqlite_checkpoint_interval_ms: parse_or(&get, "SQLITE_CHECKPOINT_INTERVAL_MS", 0)?,
             password_hash_permits,
             database_max_connections,
+            jobs,
         })
     }
 }
 
 /// Parse `key` if present, otherwise use `default`.
-fn parse_or<T>(get: &impl Fn(&str) -> Option<String>, key: &str, default: T) -> anyhow::Result<T>
+pub(crate) fn parse_or<T>(
+    get: &impl Fn(&str) -> Option<String>,
+    key: &str,
+    default: T,
+) -> anyhow::Result<T>
 where
     T: std::str::FromStr,
     T::Err: std::error::Error + Send + Sync + 'static,
@@ -146,6 +161,18 @@ mod tests {
         assert_eq!(config.sqlite_checkpoint_interval_ms, 0);
         assert_eq!(config.password_hash_permits, None);
         assert_eq!(config.database_max_connections, None);
+    }
+
+    #[test]
+    fn jobs_need_a_postgres_database() {
+        let err = Config::from_lookup(lookup(&[("JOBS_ENABLED", "true")])).unwrap_err();
+        assert!(err.to_string().contains("JOBS_ENABLED"), "{err}");
+        let ok = Config::from_lookup(lookup(&[
+            ("JOBS_ENABLED", "true"),
+            ("DATABASE_URL", "postgres://u:p@localhost/db"), // local only
+        ]))
+        .unwrap();
+        assert!(ok.jobs.enabled);
     }
 
     #[test]

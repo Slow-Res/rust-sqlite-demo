@@ -15,6 +15,8 @@ use crate::{build_router, checkpoint, db};
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let database = db::connect(&config).await?;
     db::migrate(&database).await?;
+    #[cfg(feature = "postgres")]
+    let embedded_jobs = crate::jobs::worker::on_serve(&database, &config).await?;
 
     // SQLite only; Postgres checkpoints itself.
     let checkpoints = match &database {
@@ -38,21 +40,45 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("binding {bind_addr}"))?;
     tracing::info!(%bind_addr, "listening");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+    // An embedded worker that ends on its own (fenced, failed) also ends the
+    // server; the process then exits non-zero (spec §8.2).
+    #[cfg(feature = "postgres")]
+    let worker_ended = embedded_jobs.as_ref().map(|jobs| jobs.ended());
+    let stop_serving = async move {
+        #[cfg(feature = "postgres")]
+        if let Some(ended) = worker_ended {
+            tokio::select! {
+                () = shutdown_signal() => {},
+                () = ended.cancelled() => tracing::error!("the embedded jobs worker ended; shutting down"),
+            }
+            return;
+        }
+        shutdown_signal().await;
+    };
+    let served = axum::serve(listener, router)
+        .with_graceful_shutdown(stop_serving)
         .await
-        .context("server error")?;
+        .context("server error");
 
     if let Some(task) = checkpoints {
         task.abort();
     }
+    #[cfg(feature = "postgres")]
+    let jobs_outcome = match embedded_jobs {
+        Some(jobs) => jobs.stop().await,
+        None => Ok(()),
+    };
+    #[cfg(not(feature = "postgres"))]
+    let jobs_outcome: anyhow::Result<()> = Ok(());
     database.close().await;
+    served?;
+    jobs_outcome?;
     tracing::info!("shut down cleanly");
     Ok(())
 }
 
 /// Resolves on Ctrl-C or (on Unix) SIGTERM, which is what container runtimes send.
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::error!(error = ?err, "failed to listen for Ctrl-C");

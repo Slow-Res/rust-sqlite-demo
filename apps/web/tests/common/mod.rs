@@ -338,6 +338,7 @@ pub fn test_config() -> Config {
         sqlite_checkpoint_interval_ms: 0,
         password_hash_permits: None,
         database_max_connections: None,
+        jobs: library_web::jobs_config::JobsConfig::default(),
     }
 }
 
@@ -435,7 +436,24 @@ where
     F: FnOnce(Database) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
+    on_postgres_url(|db, _url| body(db)).await;
+}
+
+/// the `library-web` binary against it).
+#[cfg(feature = "postgres")]
+pub async fn on_postgres_url<F, Fut>(body: F)
+where
+    F: FnOnce(Database, String) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let pg = TestPg::new().await;
+    let url = {
+        let base = std::env::var("TEST_POSTGRES_URL").expect("TEST_POSTGRES_URL");
+        let (server, _) = base
+            .rsplit_once('/')
+            .expect("TEST_POSTGRES_URL ends in /<database>");
+        format!("{server}/{}", pg.name)
+    };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(16)
         .connect_with(pg.options.clone())
@@ -443,7 +461,7 @@ where
         .expect("connect to test database");
     let db = Database::Postgres(pool.clone());
     library_web::db::migrate(&db).await.expect("migrate");
-    let outcome = tokio::spawn(body(db)).await;
+    let outcome = tokio::spawn(body(db, url)).await;
     pool.close().await;
     pg.cleanup().await;
     if let Err(err) = outcome {
