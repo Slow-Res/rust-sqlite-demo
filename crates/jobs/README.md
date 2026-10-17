@@ -1,10 +1,5 @@
 # library-jobs
 
-> **Draft.** This describes the crate as designed in
-> [the spec](../../docs/superpowers/specs/2026-10-14-background-jobs-design.md) and built by
-> [the plan](../../docs/superpowers/plans/2026-10-14-background-jobs.md). It is not implemented yet.
-> Plan Task 15 checks every name and snippet here against the code and removes this note.
-
 A Postgres job queue with a transactional outbox. A job is a row you insert **with your own
 connection, inside your own transaction**, so it exists exactly when your data change commits.
 Worker processes claim jobs with `FOR UPDATE SKIP LOCKED` and hold each one by a lease that a
@@ -85,9 +80,11 @@ impl Job for WelcomeEmail {
 }
 ```
 
-`JobError::Retry` retries with backoff (5 s doubling to 1 h, full jitter), `RetryAfter(d)` not
-before `d`, `Permanent` never. A panic counts as a retryable error. After `max_attempts` (10)
-the job ends `failed`.
+`JobError::Retry` retries with backoff (5 s doubling to 1 h, full jitter, both set by
+`JobOptions::backoff`), `RetryAfter(d)` not before `d`, `Permanent` never, and `Cancelled` ends the
+job `cancelled`. No retry delay is longer than 7 days (`MAX_RETRY_DELAY`), whatever the backoff
+or `RetryAfter` says. A panic counts as a retryable error. After `max_attempts` (10) the job ends
+`failed`.
 
 Migrate once at start-up, after your own migrations. The crate keeps its own migration table
 (`_jobs_migrations`), so it never touches yours:
@@ -106,7 +103,7 @@ let id: i64 = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNIN
     .bind(email)
     .fetch_one(&mut *tx)
     .await?;
-jobs.enqueue(&mut *tx, &WelcomeEmail { user_id: id }).await?;
+jobs.enqueue(&mut tx, &WelcomeEmail { user_id: id }).await?;
 tx.commit().await?; // the job and the user commit together; a rollback drops both
 ```
 
@@ -127,17 +124,22 @@ let reason = worker.run(stop.clone()).await?; // until `stop` is cancelled
 ```
 
 `run` returns `ExitReason::Shutdown` after a graceful stop, or `ExitReason::SelfFenced` when
-the process's registry row was deleted because it stopped heartbeating (a suspended VM, a long
-GC pause in the database). On `SelfFenced`, exit non-zero and let your supervisor restart the
-process; its jobs have already gone back to the queue.
+the process's registry row was deleted: the maintenance leader pruned it after it was silent
+for `prune_after` (3 minutes by default), as happens to a suspended VM or a frozen container.
+On `SelfFenced`, exit non-zero and let your supervisor restart the process; its handlers were
+cancelled and any result they still write is rejected, because the job is no longer theirs.
+
+A database outage is not a reason to exit. See
+[Guarantees and limits](#guarantees-and-limits) for what the worker does meanwhile.
 
 ## tokio
 
 **Runtime flavour.** The worker spawns one task per queue, one per running job, a heartbeat
 task, a LISTEN task and a leader candidate. A `current_thread` runtime runs them all on one
-thread, so a handler that blocks or burns CPU stalls the heartbeat; after three missed
-heartbeats the process loses its leases. Use the multi-threaded runtime (`#[tokio::main]`'s
-default).
+thread, so a handler that blocks or burns CPU stalls the heartbeat. Once no beat has succeeded
+for the shortest lease minus one heartbeat (40 s with the defaults), the worker cancels every
+handler and stops claiming until a beat succeeds, because the lease could expire next. Use the
+multi-threaded runtime (`#[tokio::main]`'s default).
 
 **Handlers are `Send + 'static`.** `perform` takes `self` and returns a `Send` future. Hold no
 `std::sync::MutexGuard` across an `.await`; share state through `ctx.require::<T>()`, where
@@ -160,17 +162,23 @@ tokio::select! {
 ```
 
 A handler that ignores it is stopped by its deadline (`JobOptions::deadline`, 15 min by
-default): the worker drops its future and records `deadline_exceeded`.
+default): the worker aborts its task, which drops the future at its next `.await`, and records
+`deadline_exceeded`. A handler that never yields (a blocking call outside `spawn_blocking`)
+cannot be aborted and keeps its thread; the heartbeat stops renewing the job's lease at the
+deadline, so the job is reaped and retried elsewhere.
 
 **Time.** Every stored time is the database's `now()`. Workers on several machines never
 compare their clocks. `tokio::time` is used only for local waits (poll interval, heartbeat
 period).
 
 **Graceful shutdown.** Cancel the `CancellationToken` passed to `run`. The worker stops
-claiming, waits up to `shutdown_timeout` (25 s) for running jobs, cancels the rest, waits
-`cancel_grace` (5 s), releases what is still running back to the queue without spending an
-attempt, and deletes its registry row. Give the process at least
-`shutdown_timeout + cancel_grace + 10 s` before a SIGKILL (Docker's `stop_grace_period: 40s`).
+claiming, waits up to `shutdown_timeout` (25 s) for running jobs, cancels the rest, and waits
+`cancel_grace` (5 s). A handler that stops after that cancellation is released back to the
+queue without spending an attempt; one that ignores it keeps its lease until it expires, and
+the reaper retries the job. Then the worker deletes its registry row. Give the process at
+least `shutdown_timeout + cancel_grace + 10 s` before a SIGKILL (Docker's
+`stop_grace_period: 40s`). A killed process loses no job: they are reaped when their
+leases expire (each such expiry counts as a crash, see below).
 
 **A runtime of its own.** When the worker runs inside your web server, CPU-heavy jobs can
 still slow requests: they share the runtime's threads. Run the worker on a separate runtime
@@ -191,8 +199,10 @@ let jobs_thread = {
         rt.block_on(async move {
             let pool = sqlx::postgres::PgPoolOptions::new().max_connections(8).connect(&url).await?;
             let worker = Worker::new(pool, registry(), config())?;
-            worker.run(stop).await?;
-            Ok(())
+            match worker.run(stop).await? {
+                ExitReason::Shutdown => Ok(()),
+                ExitReason::SelfFenced => anyhow::bail!("jobs worker fenced itself off; restart the process"),
+            }
         })
     })?
 };
@@ -210,7 +220,13 @@ claims, heartbeats and handlers share the rest. `slots + 4` is a safe size.
 ## axum
 
 `Enqueuer` is `Clone` and cheap: put it in your state. With `#[derive(FromRef)]` a handler
-can ask for just the piece it needs.
+can ask for just the piece it needs. (The derive is behind axum's `macros` feature, which your
+own `Cargo.toml` enables; `library-jobs` itself does not need it.)
+
+The complete program is `crates/jobs/examples/axum_app.rs`, built by `cargo build -p library-jobs
+--examples` and exercised by `crates/jobs/tests/axum_integration.rs`. It differs from the
+snippets below only in names (a table called `example_users`, a `Greeter` standing in for the
+`Mailer`) and in creating that table itself instead of running your migrations.
 
 ```rust
 use axum::extract::{FromRef, State};
@@ -232,14 +248,21 @@ struct SignUp {
     email: String,
 }
 
-async fn sign_up(State(pool): State<PgPool>, State(jobs): State<Enqueuer>, Json(body): Json<SignUp>) -> Result<StatusCode, AppError> {
+async fn sign_up(
+    State(pool): State<PgPool>,
+    State(jobs): State<Enqueuer>,
+    Json(body): Json<SignUp>,
+) -> Result<StatusCode, AppError> {
     let mut tx = pool.begin().await?;
-    let id: i64 = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
-        .bind(&body.email)
-        .fetch_one(&mut *tx)
-        .await?;
-    jobs.enqueue(&mut *tx, &WelcomeEmail { user_id: id }).await?;
-    tx.commit().await?;
+    let id: Option<i64> =
+        sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) ON CONFLICT (email) DO NOTHING RETURNING id")
+            .bind(&body.email)
+            .fetch_optional(&mut *tx)
+            .await?;
+    // Returning drops `tx`: a rollback, and no job.
+    let Some(id) = id else { return Ok(StatusCode::CONFLICT) };
+    jobs.enqueue(&mut tx, &WelcomeEmail { user_id: id }).await?;
+    tx.commit().await?; // the user and the job commit together; NOTIFY goes out now
     Ok(StatusCode::CREATED)
 }
 
@@ -266,9 +289,10 @@ impl IntoResponse for AppError {
 }
 ```
 
-`EnqueueError::TooLarge` (arguments over 64 KB) and `EnqueueError::Options` are programming
-errors; `Db` is the database. A duplicate unique key is not an error: `enqueue` returns
-`Enqueued::Duplicate(id)` and your transaction stays usable.
+`EnqueueError::TooLarge` (arguments over 64 KB), `Options` (invalid `JobOptions`) and `Encode`
+(the arguments do not serialize) are programming errors; `Db` is the database. A duplicate
+unique key is not an error: `enqueue` returns `Enqueued::Duplicate(id)` and your transaction
+stays usable.
 
 If your handlers go through a repository layer (as the library app's do), give the
 repository the `Enqueuer` and enqueue just before its `commit`, so the handler does not see a
@@ -278,18 +302,33 @@ transaction at all. See `apps/web/src/loans/postgres.rs`.
 shutdown. HTTP drains first, then the worker finishes or releases its jobs:
 
 ```rust
-use library_jobs::{ExitReason, Worker};
+use std::sync::Arc;
+
+use anyhow::Context;
+use axum::routing::post;
+use axum::Router;
+use library_jobs::{Enqueuer, ExitReason, QueueConfig, Registry, Worker, WorkerConfig};
+use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
+
+fn registry() -> anyhow::Result<Registry> {
+    Ok(Registry::new()
+        .register::<WelcomeEmail>()
+        .provide(Arc::new(Mailer::from_env()?)))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let url = std::env::var("DATABASE_URL")?;
-    let pool = PgPool::connect(&url).await?;
-    sqlx::migrate!().run(&pool).await?;
+    tracing_subscriber::fmt::init();
+    let url = std::env::args().nth(1).context("usage: axum_app <DATABASE_URL>")?;
+
+    let pool = PgPoolOptions::new().max_connections(10).connect(&url).await?;
+    sqlx::migrate!().run(&pool).await?; // your schema
     library_jobs::migrate(&pool).await?;
 
-    let worker_pool = sqlx::postgres::PgPoolOptions::new().max_connections(8).connect(&url).await?;
-    let worker = Worker::new(worker_pool, registry(), config())?;
+    // The worker gets a pool of its own, so jobs never wait for the API's connections.
+    let worker_pool = PgPoolOptions::new().max_connections(8).connect(&url).await?;
+    let worker = Worker::new(worker_pool, registry()?, WorkerConfig::new(QueueConfig::parse_list("email:4")?))?;
     let internal = worker.router(); // /metrics /healthz /readyz (feature `http`)
 
     let stop = CancellationToken::new();
@@ -302,31 +341,46 @@ async fn main() -> anyhow::Result<()> {
     });
     let worker_task = tokio::spawn(worker.run(stop.clone()));
 
-    // Internal endpoints on their own address: never on the public listener.
+    // Internal endpoints on their own address, never on the public listener.
     let private = tokio::net::TcpListener::bind("127.0.0.1:9300").await?;
     tokio::spawn(library_jobs::http::serve(private, internal, stop.clone()));
 
     let app = Router::new()
         .route("/signup", post(sign_up))
         .with_state(AppState { pool, jobs: Enqueuer::new(true) });
-    let public = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let public = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    tracing::info!("API on 127.0.0.1:3000, jobs endpoints on 127.0.0.1:9300; Ctrl-C to stop");
     axum::serve(public, app).with_graceful_shutdown(stop.clone().cancelled_owned()).await?;
 
+    // HTTP has drained; now running jobs finish or go back to the queue.
     match worker_task.await?? {
         ExitReason::Shutdown => Ok(()),
-        ExitReason::SelfFenced => anyhow::bail!("jobs worker fenced itself off; restart the process"),
+        ExitReason::SelfFenced => anyhow::bail!("the jobs worker fenced itself off; restart the process"),
     }
 }
 ```
 
-This is `crates/jobs/examples/axum_app.rs`; it builds in CI, so it stays in step with the API.
+**Bound the HTTP drain.** `library_jobs::http::serve` (like `axum::serve` with a graceful
+shutdown) returns only when every open connection has closed, and it has no upper bound: one
+client holding a connection open holds the shutdown, and the supervisor's SIGKILL arrives before
+the worker has released its jobs. The example above never awaits the internal server, so
+returning from `main` ends it. If you do await a `serve` task, or the public server, wrap it in
+a timeout, or wrap the whole shutdown:
+
+```rust
+use std::time::Duration;
+
+let internal_task = tokio::spawn(library_jobs::http::serve(private, internal, stop.clone()));
+// ... after `stop` is cancelled and the public server has returned:
+let _ = tokio::time::timeout(Duration::from_secs(10), internal_task).await;
+```
 
 **Mounting the internal router** in an existing app instead of a second listener works too
 (`app.nest("/internal/jobs", worker.router())`), but then anyone who can reach your API can read
 your queue metrics: put it behind your admin auth layer, or keep the separate address.
 
-**Tower.** The crate adds no middleware. Enqueue is a few hundred microseconds of SQL inside
-your transaction; it does not need a layer.
+**Tower.** The crate adds no middleware. Enqueue is one `INSERT` (and a `pg_notify`) on your
+own connection, inside your transaction; it does not need a layer.
 
 ## Other web frameworks
 
@@ -381,8 +435,11 @@ async fn readyz(health: web::Data<Arc<Health>>, pool: web::Data<PgPool>) -> Http
   (`PgPoolOptions::new().connect_lazy("postgres://unused@127.0.0.1:1/x")`).
 - **The enqueue:** drive your axum router with `tower::ServiceExt::oneshot`, then
   `SELECT kind, args FROM jobs`. Check that a refused request (409, 422) enqueued nothing.
-- **End to end:** start a `Worker` with a short poll (`config.poll = 100 ms`) in the test, make
-  the request, wait for the side effect, then cancel the token and await `run`.
+  `crates/jobs/tests/axum_integration.rs` does this with the handler from the axum section.
+- **End to end:** start a `Worker` with a short poll (`config.poll = 100 ms`) and a short
+  `config.heartbeat` in the test, make the request, wait for the side effect, then cancel the
+  token and await `run`; it returns `ExitReason::Shutdown`. A kind's lease must be at least three
+  heartbeats, so a test kind with a 1 s lease needs a heartbeat of 300 ms or less.
 
 Each test should use a fresh database; the crate's own tests create and drop one per test
 (`crates/jobs/tests/common/mod.rs`).
@@ -405,9 +462,20 @@ With `default-features = false` the crate does not depend on axum; `Metrics::enc
   error) or `cancelled`. Lease expiry counts as a crash; after `max_crashes` (2) the job fails
   instead of killing worker after worker.
 - **Unique keys** de-duplicate while waiting or running, not after: a finished job's key can be
-  used again.
+  used again. That is also why `ops::retry` of a failed or cancelled job returns `false` when
+  another waiting or running job now holds its key. `enqueue_with` and
+  `EnqueueOptions { replace: true, .. }` debounce: a waiting duplicate takes the new arguments,
+  concurrency key, delay and priority (a running one is left alone), except that a duplicate
+  waiting out a retry backoff keeps its later `run_at`.
 - **No ordering** between jobs, even in one queue. Use `concurrency_key` to keep jobs with one key
   from running at the same time.
+- **A database outage stops claims, not the process.** If heartbeats fail, handlers are
+  cancelled one beat before the shortest lease can expire (the last good beat + the shortest
+  lease - `heartbeat`; 40 s with the defaults) and the worker claims nothing while its last good
+  beat is older than that. It keeps running and retrying, and picks up work again once a beat
+  succeeds; it never exits for an outage. Only a deleted registry row ends it
+  (`ExitReason::SelfFenced`). The leader prunes dead processes only after the database has been
+  healthy for `prune_after`, so an outage does not make every live process look dead.
 - **Throughput.** At least 1,000 no-op jobs per second with one worker on a 2-core box
   (`examples/throughput.rs`). Each job costs a claim, a completion write and a share of a heartbeat.
 - **Not included:** cron expressions (recurring jobs use a fixed interval), job dependencies or
