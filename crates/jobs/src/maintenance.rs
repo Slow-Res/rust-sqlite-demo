@@ -31,10 +31,8 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct Leader {
     pub(crate) pool: PgPool,
-    #[allow(dead_code)] // used by Task 11
     pub(crate) registry: Arc<Registry>,
     pub(crate) config: MaintenanceConfig,
-    #[allow(dead_code)] // used by Task 11
     pub(crate) enqueuer: Enqueuer,
     pub(crate) metrics: Arc<Metrics>,
     /// Live-process window for the gauge: three heartbeats.
@@ -228,12 +226,48 @@ async fn work(l: &Leader) {
     }
 }
 
-async fn run_recurring(_l: &Leader) {
-    // Task 11.
+async fn run_recurring(l: &Leader) {
+    for r in l.registry.recurring_tasks() {
+        let raw = match (r.make)() {
+            Ok(raw) => raw,
+            Err(err) => {
+                tracing::error!(task = r.task, error = %err, "jobs: recurring task cannot be encoded");
+                continue;
+            }
+        };
+        let tick = tokio::time::timeout(
+            STATEMENT_TIMEOUT,
+            sql::enqueue_tick(&l.pool, &l.enqueuer, r.task, r.every, &raw),
+        )
+        .await
+        .unwrap_or_else(|_| Err(timed_out("recurring enqueue").into()));
+        match tick {
+            Ok(Some(id)) => tracing::info!(task = r.task, job_id = id, "recurring.enqueued"),
+            Ok(None) => {}
+            Err(err) => {
+                l.metrics.db_error("recurring");
+                tracing::warn!(task = r.task, error = %err, "jobs: recurring enqueue failed");
+            }
+        }
+    }
 }
 
-async fn run_retention(_l: &Leader) {
-    // Task 11.
+async fn run_retention(l: &Leader) {
+    let c = &l.config;
+    match bounded(
+        "retention",
+        STATEMENT_TIMEOUT,
+        sql::delete_finished(&l.pool, c.keep_succeeded, c.keep_failed, 1000),
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(deleted = n, "jobs: retention"),
+        Err(err) => {
+            l.metrics.db_error("retention");
+            tracing::warn!(error = %err, "jobs: retention failed");
+        }
+    }
 }
 
 async fn refresh_gauges(l: &Leader) {

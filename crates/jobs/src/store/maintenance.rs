@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+
+use crate::enqueue::{EnqueueError, EnqueueOptions, Enqueuer, RawJob};
 
 #[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
 pub struct Reaped {
@@ -63,4 +66,86 @@ pub async fn prune(pool: &PgPool, after: Duration) -> Result<(i64, i64), sqlx::E
     .bind(after.as_secs_f64())
     .fetch_one(pool)
     .await
+}
+
+/// Enqueue the current tick of `task` unless some leader already did (spec §14).
+/// The tick is the latest multiple of `every` since the epoch, in database time,
+/// so missed ticks are never replayed. The `(task, run_at)` key makes this
+/// exactly-once even while two leaders overlap after a lock loss.
+pub(crate) async fn enqueue_tick(
+    pool: &PgPool,
+    enqueuer: &Enqueuer,
+    task: &str,
+    every: Duration,
+    raw: &RawJob,
+) -> Result<Option<i64>, EnqueueError> {
+    let mut tx = pool.begin().await?;
+    let tick: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT to_timestamp(floor(extract(epoch FROM now()) / $1::float8) * $1::float8)",
+    )
+    .bind(every.as_secs_f64())
+    .fetch_one(&mut *tx)
+    .await?;
+    let fresh: Option<String> = sqlx::query_scalar(
+        "INSERT INTO job_recurring_runs (task, run_at) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING task",
+    )
+    .bind(task)
+    .bind(tick)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if fresh.is_none() {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let id = enqueuer
+        .insert_raw(&mut tx, raw, &EnqueueOptions::default())
+        .await?
+        .id();
+    sqlx::query("UPDATE job_recurring_runs SET job_id = $3 WHERE task = $1 AND run_at = $2")
+        .bind(task)
+        .bind(tick)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(id))
+}
+
+/// Batched deletes of finished jobs past their window (spec §16), then
+/// recurring-run rows older than 7 days.
+pub async fn delete_finished(
+    pool: &PgPool,
+    keep_succeeded: Duration,
+    keep_failed: Duration,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    let mut total = 0;
+    for (states, keep) in [
+        (vec!["succeeded"], keep_succeeded),
+        (vec!["failed", "cancelled"], keep_failed),
+    ] {
+        loop {
+            let n = sqlx::query(
+                "DELETE FROM jobs WHERE id IN (
+                     SELECT id FROM jobs
+                     WHERE state = ANY($1) AND finished_at < now() - make_interval(secs => $2::float8)
+                     LIMIT $3)",
+            )
+            .bind(&states)
+            .bind(keep.as_secs_f64())
+            .bind(batch)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            total += n;
+            if i64::try_from(n).unwrap_or(i64::MAX) < batch {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    sqlx::query("DELETE FROM job_recurring_runs WHERE created_at < now() - interval '7 days'")
+        .execute(pool)
+        .await?;
+    Ok(total)
 }

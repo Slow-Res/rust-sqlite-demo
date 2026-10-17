@@ -30,7 +30,6 @@ pub(crate) struct Recurring {
     pub(crate) task: &'static str,
     pub(crate) every: Duration,
     pub(crate) kind: &'static str,
-    #[allow(dead_code)] // used by Task 11
     pub(crate) make: Arc<dyn Fn() -> Result<RawJob, EnqueueError> + Send + Sync>,
 }
 
@@ -117,7 +116,6 @@ impl Registry {
         self.kinds.get(kind)
     }
 
-    #[allow(dead_code)] // used by Task 11
     pub(crate) fn recurring_tasks(&self) -> &[Recurring] {
         &self.recurring
     }
