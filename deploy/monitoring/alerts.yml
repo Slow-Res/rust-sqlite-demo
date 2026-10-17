@@ -58,3 +58,24 @@ groups:
         annotations:
           summary: "{{ $labels.instance }}: the SQLite WAL is {{ $value | humanize1024 }}B; checkpoints are blocked and the disk may fill"
           runbook: "docs/RUNBOOK.md#disk-filling-up"
+      # Background jobs (Postgres deployments; docs/JOBS.md). The queue gauges come
+      # from the leader only, so `max by (queue)` merges the workers' scrapes.
+      - alert: JobsQueueStalled
+        expr: max by (queue) (jobs_oldest_available_seconds) > 300
+        for: 10m
+        annotations:
+          summary: "jobs queue {{ $labels.queue }}: the oldest ready job has waited {{ $value | humanizeDuration }}"
+          runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
+      - alert: JobsFailing
+        expr: sum by (kind) (increase(jobs_completed_total{outcome="failed"}[15m])) > 0
+        annotations:
+          summary: "jobs of kind {{ $labels.kind }} failed in the last 15 minutes"
+          runbook: "docs/RUNBOOK.md#jobs-failed-jobs"
+      # Workers are scraped but none holds the leader lock: nothing reaps
+      # crashed jobs or deletes old ones.
+      - alert: JobsNoLeader
+        expr: count(jobs_leader) > 0 and max(jobs_leader) == 0
+        for: 5m
+        annotations:
+          summary: "no jobs worker is the maintenance leader"
+          runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"

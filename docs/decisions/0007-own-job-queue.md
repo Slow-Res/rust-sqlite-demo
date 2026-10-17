@@ -1,6 +1,6 @@
 # 7. Our own Postgres job queue
 
-Status: proposed (2026-10-15). Becomes accepted when `feat/jobs` merges.
+Status: accepted (2026-10-17).
 
 ## Context
 
@@ -46,9 +46,9 @@ We read the source of each, not only the docs.
 
 ## Consequences
 
-- About 3,000 lines of Rust that we own: the claim, lease, fencing and leader code is where bugs
-  would lose or duplicate jobs, so it carries the most tests (concurrent claims, fencing, leader
-  failover, a real SIGKILL, a database outage).
+- About 4,500 lines of Rust that we own (unit tests included): the claim, lease, fencing and
+  leader code is where bugs would lose or duplicate jobs, so it carries the most tests
+  (concurrent claims, fencing, leader failover, a real SIGKILL, a database outage).
 - Postgres only. The SQLite deployment has no background jobs.
 - The queue shares the database with the app: job traffic costs app capacity. At about 2 to 4
   statements per job, that is small next to the request load, and sub-project 5 measures it.

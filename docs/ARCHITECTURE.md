@@ -197,7 +197,7 @@ alert. After a restore it means the node lost some writes; the rows are in
 | [db.rs](../apps/web/src/db.rs) | The connection pool and the SQLite migrations. |
 | [config.rs](../apps/web/src/config.rs), [state.rs](../apps/web/src/state.rs) | Settings, and the state handed to handlers. |
 | [health.rs](../apps/web/src/health.rs) | `GET /api/health`, with a `SELECT 1` on the database. |
-| [commands.rs](../apps/web/src/commands.rs), [cli.rs](../apps/web/src/cli.rs), [seed.rs](../apps/web/src/seed.rs) | `seed`, `create-user` and `check-db`. |
+| [commands.rs](../apps/web/src/commands.rs), [cli.rs](../apps/web/src/cli.rs), [seed.rs](../apps/web/src/seed.rs) | `seed`, `create-user` and `check-db`; with the `postgres` feature also `worker` and `jobs`. |
 | `error.rs`, `extract.rs`, `pagination.rs`, `clock.rs`, `telemetry.rs` | Shared helpers: errors, request extractors, paging, a testable clock, logging. |
 
 Shared crates: [crates/sqlite](../crates/sqlite/src/lib.rs) (package `sqlite-setup`)
@@ -206,7 +206,7 @@ holds the API types and `is_valid_node_id`.
 
 ### Background jobs (Postgres only)
 
-> **Draft:** being built on `feat/jobs`; see [JOBS.md](JOBS.md). Links are added when the files exist.
+[JOBS.md](JOBS.md) covers how it behaves and how to run it.
 
 `crates/jobs` (package `library-jobs`) is a generic Postgres job queue with no web framework in
 its core; its [README](../crates/jobs/README.md) covers using it from axum, tokio and other
@@ -214,29 +214,29 @@ frameworks.
 
 | Module | Job |
 |---|---|
-| `lib.rs` | Module list, re-exports, `migrate()` (its own `_jobs_migrations` table). |
-| `job.rs`, `context.rs` | The `Job` trait, `JobOptions`, `JobError`; the `JobContext` a handler gets, with `require::<T>()`. |
-| `enqueue.rs` | `Enqueuer`: insert a job on the caller's connection, de-duplicate on its unique key, `NOTIFY` on commit. |
-| `config.rs`, `backoff.rs`, `rate_limit.rs` | Queue and worker settings, retry delays, per-process rate limits. |
-| `store/` | The SQL: claim, heartbeat and registry, fenced outcome writes, reaping and retention, counts. |
-| `registry.rs`, `executor.rs` | Kind to handler; running one job to a recorded outcome (deadline, panic, cancel). |
-| `running.rs`, `heartbeat.rs` | The jobs this process runs, and the one task that renews their leases. |
-| `worker.rs` | `Worker`: a claim loop per queue, LISTEN wake-ups, graceful shutdown, self-fencing. |
-| `maintenance.rs` | The advisory-lock leader: reaper, pruner, recurring jobs, retention, gauges. |
-| `metrics.rs`, `ready.rs`, `http.rs` | Prometheus metrics, readiness, and the optional axum router for `/metrics`, `/healthz`, `/readyz`. |
-| `ops.rs` | Queries behind `library-web jobs …`. |
+| [lib.rs](../crates/jobs/src/lib.rs) | Module list, re-exports, `migrate()` (its own `_jobs_migrations` table). |
+| [job.rs](../crates/jobs/src/job.rs), [context.rs](../crates/jobs/src/context.rs) | The `Job` trait, `JobOptions`, `JobError`; the `JobContext` a handler gets, with `require::<T>()`. |
+| [enqueue.rs](../crates/jobs/src/enqueue.rs) | `Enqueuer`: insert a job on the caller's connection, de-duplicate on its unique key, `NOTIFY` on commit. |
+| [config.rs](../crates/jobs/src/config.rs), [backoff.rs](../crates/jobs/src/backoff.rs), [rate_limit.rs](../crates/jobs/src/rate_limit.rs) | Queue and worker settings, retry delays, per-process rate limits. |
+| [store/](../crates/jobs/src/store/) | The SQL: claim, heartbeat and registry, fenced outcome writes, reaping and retention, counts. |
+| [registry.rs](../crates/jobs/src/registry.rs), [executor.rs](../crates/jobs/src/executor.rs) | Kind to handler; running one job to a recorded outcome (deadline, panic, cancel). |
+| [running.rs](../crates/jobs/src/running.rs), [heartbeat.rs](../crates/jobs/src/heartbeat.rs) | The jobs this process runs, and the one task that renews their leases. |
+| [worker.rs](../crates/jobs/src/worker.rs) | `Worker`: a claim loop per queue, LISTEN wake-ups, graceful shutdown, self-fencing. |
+| [maintenance.rs](../crates/jobs/src/maintenance.rs) | The advisory-lock leader: reaper, pruner, recurring jobs, retention, gauges. |
+| [metrics.rs](../crates/jobs/src/metrics.rs), [ready.rs](../crates/jobs/src/ready.rs), [http.rs](../crates/jobs/src/http.rs) | Prometheus metrics, readiness, and the optional axum router for `/metrics`, `/healthz`, `/readyz`. |
+| [ops.rs](../crates/jobs/src/ops.rs) | Queries behind `library-web jobs …`. |
 
 `apps/web/src/jobs/` holds the app's side:
 
 | Module | Job |
 |---|---|
-| `mod.rs` | The registry of the app's kinds and the worker settings from `JOBS_*`. |
-| `events.rs` | `LoanEvents`: the jobs borrow and return enqueue, inside their transaction. |
-| `loan_email.rs`, `webhook.rs` | `loan_email.v1` (SMTP) and `webhook.v1` (signed HTTP). |
-| `worker.rs`, `ops_cli.rs` | `library-web worker`, embedded mode, and `library-web jobs …`. |
+| [mod.rs](../apps/web/src/jobs/mod.rs) | The registry of the app's kinds and the worker settings from `JOBS_*`. |
+| [events.rs](../apps/web/src/jobs/events.rs) | `LoanEvents`: the jobs borrow and return enqueue, inside their transaction. |
+| [loan_email.rs](../apps/web/src/jobs/loan_email.rs), [webhook.rs](../apps/web/src/jobs/webhook.rs) | `loan_email.v1` (SMTP) and `webhook.v1` (signed HTTP). |
+| [worker.rs](../apps/web/src/jobs/worker.rs), [ops_cli.rs](../apps/web/src/jobs/ops_cli.rs) | `library-web worker`, embedded mode, and `library-web jobs …`. |
 
-Settings are in `apps/web/src/jobs_config.rs`, compiled into every build; everything else is
-behind the `postgres` feature.
+Settings are in [jobs_config.rs](../apps/web/src/jobs_config.rs), compiled into every build;
+everything else is behind the `postgres` feature.
 
 ## Book search
 

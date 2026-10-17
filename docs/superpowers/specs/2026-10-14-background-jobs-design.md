@@ -620,7 +620,9 @@ clippy/fmt with and without the `postgres` feature.
 - Docs: `docs/JOBS.md` (concepts, guarantees, writing a job, operating), runbook entries,
   `docs/ARCHITECTURE.md` module map, a decision record `docs/decisions/0007-own-job-queue.md`.
 
-## 22. Changes made while planning
+## 22. Changes made while planning and implementing
+
+Decided while planning:
 
 - Recurring tasks run on a fixed interval (`every`, at least 1 s), not cron. A tick is a multiple
   of the interval since the epoch, in database time, still de-duplicated on `(task, run_at)`.
@@ -641,6 +643,81 @@ clippy/fmt with and without the `postgres` feature.
   CI.
 - Alerts `JobsQueueStalled`, `JobsFailing`, `JobsNoLeader` join `deploy/monitoring/alerts.yml`,
   with promtool tests, and the runbook gets matching sections.
+
+Decided while implementing (the code is the authority where §3 to §17 differ):
+
+Queue core (`crates/jobs`):
+
+- Enqueue with `replace: true` also updates `concurrency_key`. On a row waiting out a retry
+  (`attempt > 0`) it keeps the later `run_at` (`GREATEST`), so a replace cannot shorten a backoff.
+- A keyed claim takes `pg_try_advisory_xact_lock(hashtextextended('jobs.key.' || key, 0))` and
+  skips the key when the lock is taken; the unique-violation skip of §7.1 deadlocked. The unique
+  index `jobs_one_running_per_key` stays as a backstop. (§7.1 and §7.2 name `hashtext` and the
+  unique violation; that text is stale.)
+- Retry delays are capped at 7 days (`MAX_RETRY_DELAY`), so a remote `Retry-After` above the
+  backoff cap is honoured up to that. Stored error text has NUL replaced by U+FFFD and is cut to
+  2,000 characters.
+- `release` on shutdown gives the attempt back (`attempt - 1`), as §13 step 4 says; the line
+  "released with attempt unchanged" in the §20 test table is stale.
+- The executor builds the handler (custom `Deserialize`, the synchronous part of `perform`)
+  inside the isolating spawn, so a panic there is recorded as `panic`. A deadline always attempts
+  the fenced `deadline_exceeded` write, even after a beat marked the job lease-lost.
+- During a database outage the heartbeat cancels handlers at the last good beat plus (shortest
+  lease minus heartbeat), one beat before a lease can expire, and checks again at every beat
+  while beats fail. Each beat call times out after one heartbeat; progress flushes run in their
+  own task. An outage never fences and never exits the process; only a deleted registry row
+  self-fences. This replaces §8.2's "for longer than one lease".
+- A worker claims nothing while its heartbeat is stale (age above shortest lease minus
+  heartbeat). A finished attempt removes only its own entry from the running set. Shutdown
+  bounds: helpers join within 5 s, handlers within `JOBS_SHUTDOWN_TIMEOUT_S`, then `cancel_grace`;
+  registry writes are bounded to 5 s each.
+- The leader holds its lock on one dedicated connection (one beyond the pool) and checks it
+  every `leader_retry` with a timeout, so a half-open connection ends leadership. Every
+  maintenance statement is bounded to 30 s. Election is tried on a pooled connection, which is
+  detached only on a win; a cancelled attempt never returns a lock-holding connection to the pool.
+- The pruner removes silent processes only after the database has been healthy (no failing
+  maintenance step) for `prune_after`, counted from leadership start or the last failure; after
+  an outage longer than `prune_after` it no longer deletes every live process. A step that fails
+  for good starves pruning, with a warning after 3 × `prune_after`.
+- The reaper reports a job whose process froze past its deadline as `lease_expired` (§9.3), not
+  `deadline_exceeded` as counted in §8.4: the worker-side timeout covers cooperative handlers, so
+  only frozen processes reach the reaper.
+- Recurring ticks are enforced by the database: the tick is computed from `now()` in SQL, and the
+  claim row and the insert share one transaction. After an outage only the latest tick runs.
+- `/readyz` calls a heartbeat stale after 3 × heartbeat (§17.3 says "within one lease"; validation
+  keeps 3 × heartbeat at most the shortest lease).
+- `http::serve`'s graceful drain has no upper bound of its own; callers bound it (crate README,
+  "Bound the HTTP drain").
+- `ops::retry` returns false, and `retry_failed` skips the row, when another waiting or running
+  job holds the unique key; of several failed rows with one key only the newest moves.
+
+The web app (`apps/web`):
+
+- Worker pools (`jobs::connect`) set `statement_timeout = 30s` on each connection (§11.4). The
+  `worker` command runs the app's and the jobs migrations on that pool, so the deploy rule is: `serve`
+  first, the worker after it.
+- `JOBS_EMBEDDED=true` without `JOBS_ENABLED=true` is a configuration error (it used to be
+  ignored).
+- If the embedded worker fences itself or fails, `serve` shuts down and exits non-zero so the
+  supervisor restarts it. Embedded mode cannot promise a clean exit within a 40 s grace period
+  (HTTP drain, then the worker's stop of up to `JOBS_SHUTDOWN_TIMEOUT_S` + 5 s + 15 s).
+- The standalone worker's worst-case shutdown is about 50 s with the database dead, and about 35 s
+  with a stuck handler and a healthy database; the metrics server's drain is bounded to 5 s.
+- Webhook URLs never appear in configuration errors, `Debug` output, job arguments, unique keys or
+  job errors. A job carries `endpoint_id`: `scheme://host[:port]`, `#`, and 12 hex characters of
+  the URL's SHA-256. Changing an endpoint's URL makes its waiting jobs fail as "no longer
+  configured".
+- Loan email: lettre connection pooling is off (a send cancelled by the timeout must not leave a
+  desynchronised connection behind). The whole send is bounded by `JOBS_SMTP_TIMEOUT_S`, since
+  lettre's own timeout covers only the connect. Job errors carry no member address or name and no
+  SMTP URL, only the status code.
+- Known gap: a second signal does not skip to step 5 of §13; the worker keeps waiting out its
+  shutdown timeouts.
+
+Measured (§21):
+
+- Throughput smoke: about 16,700 no-op jobs/s with one worker, 64 slots and 2 cores (`taskset`
+  6,7), about 19,000 on 4 cores, with Postgres on the same 16-thread machine.
 
 ## 23. Using the crate from axum, tokio and other frameworks
 

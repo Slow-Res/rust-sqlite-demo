@@ -52,6 +52,10 @@ services:
       # The pool size; the runner exports it from DB_POOL only when that is set, so an
       # unset DB_POOL leaves the app's default (no value here: compose omits the variable).
       DATABASE_MAX_CONNECTIONS:
+      # Background jobs (Postgres only; see docs/JOBS.md). Off unless the runner's
+      # environment sets them; with the `jobs` profile the worker below runs too.
+      JOBS_ENABLED: ${JOBS_ENABLED:-false}
+      JOBS_SMTP_URL: ${JOBS_SMTP_URL:-}
     volumes: [data:/data]
     # The same 2 cores (4.4 GHz efficiency cores) as the whole node of the
     # full-node mode; 4096 MiB minus nginx's 256. It holds the app, the SQLite

@@ -559,8 +559,7 @@ What decides the exit code:
 
 ## Background jobs
 
-> **Draft:** for the Postgres deployment once `feat/jobs` merges ([docs/JOBS.md](JOBS.md)).
-> The SQLite nodes have no jobs.
+For the Postgres deployment ([docs/JOBS.md](JOBS.md)); the SQLite nodes have no jobs.
 
 Every `jobs` command below runs in the worker's container, with its environment:
 `docker compose exec worker library-web jobs <command>`. Nothing here needs the API to stop:
@@ -579,7 +578,7 @@ minutes), `JobsNoLeader`, or members report missing emails.
 **Steps**
 
 1. `jobs status`. Read the row of the queue and the warning lines under it.
-2. If the queue says `paused: yes`, someone paused it; the reason is in
+2. If the queue shows `yes` in the `paused` column, someone paused it; the reason is in
    `SELECT * FROM job_queue_pauses`. If the reason no longer holds: `jobs resume <queue>`.
 3. If a warning lists kinds that no live worker can run, the worker that runs them is missing
    or lacks its settings: `JOBS_SMTP_URL` for `loan_email.v1`, `JOBS_WEBHOOK_ENDPOINTS` for
@@ -590,8 +589,8 @@ minutes), `JobsNoLeader`, or members report missing emails.
    restarting it is the fix).
 5. If `running` equals the queue's slots and stays there, handlers are slow or stuck:
    `jobs list --state running --queue <queue>`, then `jobs show <id>` for their progress and
-   attempt. A stuck handler is stopped by its deadline (15 minutes by default, 2 for emails). To
-   stop one sooner: `jobs cancel <id>`. If the queue is simply too busy, raise its slots in
+   attempt. A stuck handler is stopped by its deadline (15 minutes by default, 2 for emails, 1 for
+   webhooks). To stop one sooner: `jobs cancel <id>`. If the queue is simply too busy, raise its slots in
    `JOBS_QUEUES` or run a second worker.
 6. `JobsNoLeader` alone: a leader election needs a worker and the database. Check that a worker
    runs and that its `/readyz` answers 200. Without a leader nothing reaps crashed jobs or deletes
@@ -607,19 +606,22 @@ minutes), `JobsNoLeader`, or members report missing emails.
 
 **When:** `JobsFailing`, or `jobs status` shows failures in the last 24 h.
 
-A job fails when its attempts run out (10, over about 3 to 4 hours), when its handler reports a
+A job fails when its attempts run out (10, over at most 43 minutes), when its handler reports a
 permanent error, or when its worker died twice while running it.
 
 **Steps**
 
 1. `jobs list --state failed` and `jobs show <id>` for a few of them. The last entry of `errors`
    says why: `cause` is `error`, `permanent`, `bad_args`, `deadline_exceeded`, `panic`,
-   `lease_expired` or `process_lost`.
+   `lease_expired` or `process_lost`. (Earlier entries can also be `cancelled` or
+   `released_on_shutdown`, which never fail a job.)
 2. By cause:
    - **SMTP or a receiver was down** (`error`, connection or timeout messages): fix or wait for
      the remote side, then replay what failed during the outage:
      `jobs retry --failed --kind loan_email.v1 --since 6h`. A resent email has the same
      `Message-ID`, and a resent webhook the same `webhook-id`, so receivers can drop duplicates.
+     A job whose unique key is held by another waiting or running job is skipped; the command
+     says so for a single id.
    - **`permanent`** (an invalid address, a 404 from a receiver): retrying gives the same answer.
      Fix the data or the endpoint first, or leave it.
    - **`bad_args`**: the job's arguments no longer match its kind. A deploy changed the job's

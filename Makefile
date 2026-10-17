@@ -27,8 +27,8 @@ user-dev: ## Staff account in the dev database
 	cargo run -p library-web -- create-user $(or $(NAME),admin)
 
 # The second run is the web app's optional Postgres backend (load-test comparison only).
-test: ## Rust tests, default build and web --features postgres; starts a throwaway Postgres (Docker)
-	url=$$(./scripts/test-postgres.sh) && \
+test: ## Rust tests, default build and web --features postgres; starts a throwaway Postgres and Mailpit (Docker)
+	url=$$(./scripts/test-postgres.sh) && eval "$$(./scripts/test-mailpit.sh)" && \
 	TEST_POSTGRES_URL=$$url cargo test --workspace && \
 	TEST_POSTGRES_URL=$$url cargo test -p library-web --features postgres
 

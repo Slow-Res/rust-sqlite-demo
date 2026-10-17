@@ -23,8 +23,15 @@ jobs:
         options: >-
           --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
           --health-interval 2s --health-timeout 5s --health-retries 30
+      mailpit:
+        image: axllent/mailpit:v1.31.2
+        env:
+          MP_ENABLE_CHAOS: "true"
+        ports: ["55025:1025", "58025:8025"]
     env:
       TEST_POSTGRES_URL: postgres://postgres:test@127.0.0.1:55432/postgres
+      TEST_SMTP_URL: smtp://127.0.0.1:55025
+      TEST_MAILPIT_URL: http://127.0.0.1:58025
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,6 +41,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo clippy -p library-web --all-targets --features postgres -- -D warnings
+      - run: cargo test -p library-web --features postgres
+      - name: library-jobs builds without axum
+        run: cargo build -p library-jobs --no-default-features && test -z "$(cargo tree -q -p library-jobs --no-default-features -e normal,build -i axum 2>/dev/null)"
       - run: cargo build -p library-web -p sync-worker
       - name: The web app has no Postgres driver
         run: test -z "$(cargo tree -q -p library-web -i sqlx-postgres 2>/dev/null)"

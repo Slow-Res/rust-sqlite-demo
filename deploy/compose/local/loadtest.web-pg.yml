@@ -71,5 +71,39 @@ services:
       postgres:
         condition: service_healthy
 
+  # Background jobs: `COMPOSE_PROFILES=jobs JOBS_ENABLED=true JOBS_SMTP_URL=smtp://mailpit:1025`.
+  # For functional checks (the contract test with jobs on); its memory is outside
+  # the box's 4096 MiB split, so measured rounds leave the profile off.
+  worker:
+    profiles: [jobs]
+    image: ${WEB_IMAGE:-sqlite-production/web:lt}
+    command: ["worker"]
+    environment:
+      DATABASE_URL: postgres://library:library@postgres:5432/library # local only
+      JOBS_ENABLED: "true"
+      JOBS_SMTP_URL: ${JOBS_SMTP_URL:-}
+      JOBS_METRICS_ADDR: 0.0.0.0:9300
+      RUST_LOG: info
+    cpuset: "${NODE_CPUS:-6,7}"
+    mem_limit: 256m
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9300/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+      start_interval: 1s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mailpit:
+    profiles: [jobs]
+    image: axllent/mailpit:v1.31.2
+    mem_limit: 128m
+    restart: unless-stopped
+
 volumes:
   pgdata: {}

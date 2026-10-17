@@ -126,3 +126,64 @@ tests:
       - eval_time: 90m
         alertname: SyncResync
         exp_alerts: []
+
+  - name: jobs, a stalled queue fires and a busy but moving one does not
+    interval: 1m
+    input_series:
+      - series: 'jobs_oldest_available_seconds{instance="w1:9300", queue="email"}'
+        values: "0+60x20"
+      - series: 'jobs_oldest_available_seconds{instance="w1:9300", queue="webhooks"}'
+        values: "30x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: JobsQueueStalled
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: JobsQueueStalled
+        exp_alerts:
+          - exp_labels:
+              queue: email
+            exp_annotations:
+              summary: "jobs queue email: the oldest ready job has waited 16m 0s"
+              runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
+
+  - name: jobs, a failure fires once and clears
+    interval: 1m
+    input_series:
+      - series: 'jobs_completed_total{instance="w1:9300", kind="webhook.v1", outcome="failed"}'
+        values: "0x5 1x30"
+      - series: 'jobs_completed_total{instance="w1:9300", kind="loan_email.v1", outcome="succeeded"}'
+        values: "0+5x35"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: JobsFailing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: JobsFailing
+        exp_alerts:
+          - exp_labels:
+              kind: webhook.v1
+            exp_annotations:
+              summary: "jobs of kind webhook.v1 failed in the last 15 minutes"
+              runbook: "docs/RUNBOOK.md#jobs-failed-jobs"
+      - eval_time: 30m
+        alertname: JobsFailing
+        exp_alerts: []
+
+  - name: jobs, no leader among scraped workers
+    interval: 1m
+    input_series:
+      - series: 'jobs_leader{instance="w1:9300"}'
+        values: "1x5 0x10"
+      - series: 'jobs_leader{instance="w2:9300"}'
+        values: "0x15"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: JobsNoLeader
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: JobsNoLeader
+        exp_alerts:
+          - exp_annotations:
+              summary: "no jobs worker is the maintenance leader"
+              runbook: "docs/RUNBOOK.md#jobs-a-queue-is-not-moving"
